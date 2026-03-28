@@ -1,5 +1,5 @@
 #!/bin/bash
-# Event Mill v0.2.0 - Cloud Run Deployment with Secret Manager
+# Event Mill v0.1.0 - Cloud Run Deployment with Secret Manager
 # Uses pre-created secrets for production-grade security
 #
 # Prerequisites:
@@ -18,7 +18,7 @@ set -e
 PROJECT_ID="${GOOGLE_CLOUD_PROJECT:-your-project-id}"
 REGION="${CLOUD_RUN_REGION:-northamerica-northeast2}"
 SERVICE_NAME="event-mill"
-IMAGE_NAME="gcr.io/${PROJECT_ID}/${SERVICE_NAME}"
+IMAGE_NAME="${REGION}-docker.pkg.dev/${PROJECT_ID}/eventmill/${SERVICE_NAME}"
 
 # GCS bucket for log artifact storage
 GCS_LOG_BUCKET="${GCS_LOG_BUCKET:-digevtrecintake}"
@@ -29,7 +29,7 @@ SECRET_GCS_SA="${EVENTMILL_SECRET_GCS_SA:-eventmill-gcs-sa}"
 SECRET_TTYD_USER="${EVENTMILL_SECRET_TTYD_USER:-eventmill-ttyd-user}"
 SECRET_TTYD_CRED="${EVENTMILL_SECRET_TTYD_CRED:-eventmill-ttyd-cred}"
 
-echo "⚙ Event Mill v0.2.0 - Cloud Run Deployment (Secret Manager)"
+echo "⚙ Event Mill v0.1.0 - Cloud Run Deployment (Secret Manager)"
 echo "============================================================="
 echo "Project:  ${PROJECT_ID}"
 echo "Region:   ${REGION}"

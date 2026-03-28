@@ -1,5 +1,5 @@
 #!/bin/bash
-# Event Mill v0.2.0 - Deploy Server Bootstrap
+# Event Mill v0.1.0 - Deploy Server Bootstrap
 # Run once on the dedicated Linux deploy server to set up prerequisites.
 #
 # What this does:
@@ -17,7 +17,7 @@ REPO_URL="https://github.com/dleecefft/eventmill_v01.git"
 INSTALL_DIR="${EVENTMILL_INSTALL_DIR:-${HOME}/eventmill_v01}"
 CONFIG_DIR="${HOME}/.eventmill"
 
-echo "⚙ Event Mill v0.2.0 — Deploy Server Setup"
+echo "⚙ Event Mill v0.1.0 — Deploy Server Setup"
 echo "============================================"
 echo "Repo:       ${REPO_URL}"
 echo "Install to: ${INSTALL_DIR}"

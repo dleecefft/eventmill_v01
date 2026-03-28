@@ -1,4 +1,4 @@
-# Event Mill v0.2.0 - Cloud Run Deployment with ttyd web terminal
+# Event Mill v0.1.0 - Cloud Run Deployment with ttyd web terminal
 # Cloud Run provides HTTPS on port 443 automatically, routing to container PORT (8080)
 #
 # Multi-stage build:

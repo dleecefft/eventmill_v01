@@ -1,4 +1,4 @@
-# Event Mill v0.2.0 — Cloud Installation Guide
+# Event Mill v0.1.0 — Cloud Installation Guide
 
 Deployment scripts for running Event Mill on Google Cloud Run with a
 [ttyd](https://github.com/tsl0922/ttyd) web terminal frontend.
@@ -101,12 +101,30 @@ gcloud builds submit \
 
 | File | Purpose |
 |------|---------|
+| `provision-gcp-project.sh` | **Run first** — enables APIs, creates SA, bucket, secrets |
+| `provision-secrets.sh` | Interactive — sets real values for Secret Manager entries |
 | `setup-deploy-server.sh` | One-time bootstrap for the Linux deploy server |
 | `Dockerfile.cloudrun` | Multi-stage container image with ttyd + eventmill |
 | `deploy-cloudrun.sh` | Basic Cloud Run deploy (env var secrets) |
 | `deploy-cloudrun-secrets.sh` | Production deploy with GCP Secret Manager |
 | `cloudbuild.yaml` | Cloud Build CI/CD pipeline |
 | `docker-compose.cloudrun.yml` | Local testing of the Cloud Run image |
+
+## GCP Project Provisioning (first time only)
+
+```bash
+export GOOGLE_CLOUD_PROJECT="your-project-id"
+
+# 1. Provision APIs, service account, bucket, and secret entries
+bash cloud_install/provision-gcp-project.sh
+
+# 2. Set real secret values (interactive prompts, nothing in shell history)
+bash cloud_install/provision-secrets.sh
+```
+
+This creates everything the project needs: 6 APIs enabled, a dedicated
+service account with least-privilege IAM roles, a GCS bucket with lifecycle
+rules, and 4 Secret Manager entries.
 
 ## Secret Manager Setup
 

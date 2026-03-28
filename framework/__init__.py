@@ -6,7 +6,7 @@ It contains CLI interface, session management, LLM orchestration,
 artifact registry, plugin lifecycle, and cloud abstraction.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.1.0"
 
 from .plugins import (
     ArtifactRef,

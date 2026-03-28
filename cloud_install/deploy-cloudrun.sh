@@ -1,5 +1,5 @@
 #!/bin/bash
-# Event Mill v0.2.0 - Cloud Run Deployment Script
+# Event Mill v0.1.0 - Cloud Run Deployment Script
 # Deploys ttyd web terminal accessible via HTTPS on port 443
 #
 # Usage:
@@ -15,9 +15,9 @@ set -e
 PROJECT_ID="${GOOGLE_CLOUD_PROJECT:-your-project-id}"
 REGION="${CLOUD_RUN_REGION:-northamerica-northeast2}"
 SERVICE_NAME="event-mill"
-IMAGE_NAME="gcr.io/${PROJECT_ID}/${SERVICE_NAME}"
+IMAGE_NAME="${REGION}-docker.pkg.dev/${PROJECT_ID}/eventmill/${SERVICE_NAME}"
 
-echo "⚙ Event Mill v0.2.0 — Cloud Run Deployment"
+echo "⚙ Event Mill v0.1.0 — Cloud Run Deployment"
 echo "============================================="
 echo "Project:  ${PROJECT_ID}"
 echo "Region:   ${REGION}"

@@ -35,7 +35,7 @@ class EventMillShell(cmd.Cmd):
     intro = (
         "\n"
         "  ╔═══════════════════════════════════════════════╗\n"
-        "  ║           Event Mill v0.2.0                   ║\n"
+        "  ║           Event Mill v0.1.0                   ║\n"
         "  ║   Event Record Analysis Platform              ║\n"
         "  ║   Type 'help' for available commands          ║\n"
         "  ╚═══════════════════════════════════════════════╝\n"

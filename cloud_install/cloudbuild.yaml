@@ -1,4 +1,4 @@
-# Event Mill v0.2.0 - Cloud Build CI/CD Pipeline
+# Event Mill v0.1.0 - Cloud Build CI/CD Pipeline
 # Builds and deploys to Cloud Run with ttyd web terminal
 #
 # Usage:
@@ -8,28 +8,29 @@
 
 steps:
   # Build the container image (commit-tagged + latest)
+  # Uses Artifact Registry (gcr.io is deprecated)
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
       - '-t'
-      - 'gcr.io/$PROJECT_ID/event-mill:$COMMIT_SHA'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/eventmill/event-mill:$COMMIT_SHA'
       - '-t'
-      - 'gcr.io/$PROJECT_ID/event-mill:latest'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/eventmill/event-mill:latest'
       - '-f'
       - 'cloud_install/Dockerfile.cloudrun'
       - '.'
 
-  # Push commit-tagged image
+  # Push commit-tagged image to Artifact Registry
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'push'
-      - 'gcr.io/$PROJECT_ID/event-mill:$COMMIT_SHA'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/eventmill/event-mill:$COMMIT_SHA'
 
-  # Push latest image
+  # Push latest image to Artifact Registry
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'push'
-      - 'gcr.io/$PROJECT_ID/event-mill:latest'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/eventmill/event-mill:latest'
 
   # Deploy to Cloud Run
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
@@ -39,7 +40,7 @@ steps:
       - 'deploy'
       - 'event-mill'
       - '--image'
-      - 'gcr.io/$PROJECT_ID/event-mill:$COMMIT_SHA'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/eventmill/event-mill:$COMMIT_SHA'
       - '--region'
       - '${_REGION}'
       - '--platform'
@@ -63,8 +64,8 @@ steps:
       - '--allow-unauthenticated'
 
 images:
-  - 'gcr.io/$PROJECT_ID/event-mill:$COMMIT_SHA'
-  - 'gcr.io/$PROJECT_ID/event-mill:latest'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/eventmill/event-mill:$COMMIT_SHA'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/eventmill/event-mill:latest'
 
 substitutions:
   _REGION: northamerica-northeast2

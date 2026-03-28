@@ -1,4 +1,4 @@
-# Event Mill v0.2.0 - Local testing of Cloud Run image
+# Event Mill v0.1.0 - Local testing of Cloud Run image
 # Simulates the Cloud Run environment locally via Docker Compose
 #
 # Usage:
