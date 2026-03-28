@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "file_path": {
+      "type": "string",
+      "description": "Path to the log file to search."
+    },
+    "query": {
+      "type": "string",
+      "description": "Text or regex pattern to search for."
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["text", "regex"],
+      "default": "text",
+      "description": "Search mode: 'text' for case-insensitive substring, 'regex' for regular expression."
+    },
+    "max_results": {
+      "type": "integer",
+      "default": 50,
+      "minimum": 1,
+      "maximum": 500,
+      "description": "Maximum number of matching lines to return."
+    },
+    "context_lines": {
+      "type": "integer",
+      "default": 0,
+      "minimum": 0,
+      "maximum": 10,
+      "description": "Number of surrounding context lines to include with each match."
+    },
+    "invert": {
+      "type": "boolean",
+      "default": false,
+      "description": "If true, return lines that do NOT match the query."
+    }
+  },
+  "required": ["file_path", "query"]
+}

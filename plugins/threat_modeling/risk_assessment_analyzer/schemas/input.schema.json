@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": ["analyze", "list_attack_types", "validate_stages"],
+      "description": "Action: 'analyze' document, 'list_attack_types' with stage requirements, 'validate_stages' against attack type."
+    },
+    "document_content": {
+      "type": "string",
+      "description": "Text content of the risk assessment document (analyze action)."
+    },
+    "attack_type": {
+      "type": "string",
+      "enum": ["ddos", "ransomware", "data_theft", "apt", "insider_threat", "web_attack", "generic"],
+      "default": "generic",
+      "description": "Type of attack for stage relevance mapping."
+    },
+    "stages": {
+      "type": "array",
+      "description": "Stages to validate (validate_stages action).",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "technique_claimed": { "type": "string" },
+          "mitre_technique_id": { "type": "string" },
+          "stage_present": { "type": "boolean" },
+          "controls": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "control_name": { "type": "string" },
+                "control_type": { "type": "string", "enum": ["preventive", "detective", "responsive"] },
+                "effectiveness_rating": { "type": "string", "enum": ["strong", "moderate", "weak", "nominal"] },
+                "evidence_basis": { "type": "string", "enum": ["tested", "benchmark", "vendor_claim", "assumption"] },
+                "independence_flag": { "type": "boolean", "default": false }
+              }
+            }
+          },
+          "assumptions": { "type": "array", "items": { "type": "string" } },
+          "gaps_detected": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    }
+  },
+  "required": ["action"]
+}

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": ["list", "read", "metadata"],
+      "description": "Action to perform: 'list' directory contents, 'read' file segment, 'metadata' for file info."
+    },
+    "path": {
+      "type": "string",
+      "description": "Directory path for 'list', file path for 'read' and 'metadata'."
+    },
+    "prefix": {
+      "type": "string",
+      "default": "",
+      "description": "Optional subdirectory prefix filter for 'list' action."
+    },
+    "max_results": {
+      "type": "integer",
+      "default": 50,
+      "minimum": 1,
+      "maximum": 500,
+      "description": "Maximum number of items to return for 'list' action."
+    },
+    "offset_lines": {
+      "type": "integer",
+      "default": 0,
+      "minimum": 0,
+      "description": "Number of lines to skip for 'read' action (pagination)."
+    },
+    "line_limit": {
+      "type": "integer",
+      "default": 100,
+      "minimum": 1,
+      "maximum": 1000,
+      "description": "Maximum number of lines to return for 'read' action."
+    }
+  },
+  "required": ["action", "path"]
+}

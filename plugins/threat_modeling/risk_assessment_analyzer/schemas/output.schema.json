@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "action": { "type": "string" },
+    "attack_type": { "type": "string" },
+    "attack_types": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "required_stages": { "type": "array", "items": { "type": "string" } },
+          "optional_stages": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "stages": { "type": "array", "items": { "type": "object" } },
+    "missing_required_stages": { "type": "array", "items": { "type": "string" } },
+    "cross_stage_flags": { "type": "object" },
+    "confidence_assessment": {
+      "type": "object",
+      "properties": {
+        "structural_completeness": { "type": "number" },
+        "evidence_strength": { "type": "number" },
+        "assumption_density": { "type": "number" }
+      }
+    },
+    "ai_analysis": { "type": "string" }
+  }
+}

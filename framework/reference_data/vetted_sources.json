@@ -1,0 +1,32 @@
+{
+  "threat_intelligence": [
+    "https://attack.mitre.org/",
+    "https://cve.mitre.org/",
+    "https://nvd.nist.gov/",
+    "https://www.cisa.gov/known-exploited-vulnerabilities-catalog",
+    "https://www.mandiant.com/resources/blog",
+    "https://unit42.paloaltonetworks.com/",
+    "https://www.crowdstrike.com/blog/",
+    "https://securelist.com/",
+    "https://blog.talosintelligence.com/"
+  ],
+  "security_research": [
+    "https://www.schneier.com/",
+    "https://krebsonsecurity.com/",
+    "https://www.darkreading.com/",
+    "https://thehackernews.com/",
+    "https://www.bleepingcomputer.com/"
+  ],
+  "regulatory": [
+    "https://www.nist.gov/cyberframework",
+    "https://www.iso.org/isoiec-27001-information-security.html",
+    "https://www.pcisecuritystandards.org/",
+    "https://gdpr.eu/"
+  ],
+  "vendor_advisories": [
+    "https://msrc.microsoft.com/update-guide/",
+    "https://cloud.google.com/support/bulletins",
+    "https://aws.amazon.com/security/security-bulletins/",
+    "https://www.cisco.com/c/en/us/support/web/tsd-cisco-worldwide-contacts.html"
+  ]
+}

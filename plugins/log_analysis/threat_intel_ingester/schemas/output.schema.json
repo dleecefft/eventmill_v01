@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eventmill.dev/plugins/threat_intel_ingester/output.schema.json",
+  "title": "Threat Intel Ingester Output",
+  "type": "object",
+  "required": ["ok"],
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "description": "True if ingestion completed successfully."
+    },
+    "result": {
+      "type": "object",
+      "description": "Ingestion results. Present only when ok=true.",
+      "required": ["report_metadata", "iocs", "mitre_mappings", "summary"],
+      "properties": {
+        "report_metadata": {
+          "type": "object",
+          "description": "Metadata extracted from the source report.",
+          "properties": {
+            "title": { "type": "string", "description": "Report title if identifiable." },
+            "source_organization": { "type": "string", "description": "Publishing organization." },
+            "publication_date": { "type": "string", "description": "Publication date if found (ISO 8601)." },
+            "page_count": { "type": "integer", "description": "Number of pages processed." },
+            "artifact_type": { "type": "string", "description": "Type of source artifact processed." },
+            "campaign_name": { "type": "string", "description": "Named campaign or operation if identified." },
+            "attributed_actor": { "type": "string", "description": "Threat actor attribution if stated." },
+            "attribution_confidence": {
+              "type": "string",
+              "enum": ["low", "medium", "high"],
+              "description": "Confidence level of actor attribution."
+            }
+          }
+        },
+        "iocs": {
+          "type": "array",
+          "description": "Extracted indicators of compromise.",
+          "items": {
+            "type": "object",
+            "required": ["ioc_type", "value", "confidence"],
+            "properties": {
+              "ioc_type": {
+                "type": "string",
+                "enum": ["ip", "domain", "hash_md5", "hash_sha1", "hash_sha256", "url", "email", "cve", "mitre_technique"]
+              },
+              "value": { "type": "string", "description": "The indicator value." },
+              "confidence": {
+                "type": "string",
+                "enum": ["low", "medium", "high"],
+                "description": "Extraction confidence. 'low'=regex match only, 'medium'=regex + structural context, 'high'=LLM-confirmed."
+              },
+              "context": {
+                "type": "string",
+                "description": "Surrounding text or context where the IOC was found.",
+                "maxLength": 300
+              },
+              "priority": {
+                "type": "string",
+                "enum": ["low", "medium", "high"],
+                "description": "Operational priority based on LLM assessment of the IOC's role in the described attack."
+              },
+              "related_mitre": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "MITRE ATT&CK technique IDs associated with this IOC."
+              },
+              "defanged": {
+                "type": "boolean",
+                "description": "True if the original value was defanged (e.g., hxxp://, [.]com) and has been re-fanged."
+              }
+            }
+          }
+        },
+        "mitre_mappings": {
+          "type": "array",
+          "description": "MITRE ATT&CK techniques identified in the report.",
+          "items": {
+            "type": "object",
+            "required": ["technique_id", "technique_name"],
+            "properties": {
+              "technique_id": { "type": "string", "description": "MITRE ATT&CK technique ID (e.g., T1566.001)." },
+              "technique_name": { "type": "string", "description": "Human-readable technique name." },
+              "tactic": { "type": "string", "description": "Parent tactic (e.g., Initial Access)." },
+              "confidence": {
+                "type": "string",
+                "enum": ["explicit", "inferred"],
+                "description": "'explicit' if the technique ID appears in the report text. 'inferred' if the LLM mapped described behavior to a technique."
+              },
+              "report_context": {
+                "type": "string",
+                "description": "Brief excerpt or description of the behavior mapped to this technique.",
+                "maxLength": 300
+              }
+            }
+          }
+        },
+        "summary": {
+          "type": "object",
+          "description": "Aggregated statistics for quick reference.",
+          "properties": {
+            "total_iocs": { "type": "integer" },
+            "ioc_breakdown": {
+              "type": "object",
+              "additionalProperties": { "type": "integer" },
+              "description": "Count of IOCs by type, e.g., {\"ip\": 23, \"domain\": 12}."
+            },
+            "high_priority_count": { "type": "integer", "description": "Number of high-priority IOCs." },
+            "mitre_technique_count": { "type": "integer" },
+            "confidence_distribution": {
+              "type": "object",
+              "properties": {
+                "low": { "type": "integer" },
+                "medium": { "type": "integer" },
+                "high": { "type": "integer" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "output_artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "artifact_id": { "type": "string" },
+          "artifact_type": { "type": "string" },
+          "file_path": { "type": "string" },
+          "description": { "type": "string" }
+        }
+      },
+      "description": "Artifacts registered as output of this tool execution."
+    },
+    "error_code": { "type": "string" },
+    "message": { "type": "string" },
+    "details": { "type": "object" }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "tool_name": "attack_path_visualizer",
+  "version": "1.0.0",
+  "pillar": "threat_modeling",
+  "display_name": "Attack Path Visualizer",
+  "description_short": "Generate ASCII art, Mermaid diagrams, and compact flow visualizations of attack paths.",
+  "description_long": "Renders attack path data from risk assessments or threat models into visual formats: detailed ASCII art box-and-arrow diagrams with control effectiveness bars, Mermaid flowcharts for markdown/GitHub rendering with color-coded protection status, compact single-line flow diagrams, and control coverage matrices. Accepts structured stage data with controls, gaps, and MITRE ATT&CK technique IDs.",
+  "author": "Event Mill Contributors",
+  "entry_point": "tool.py",
+  "class_name": "AttackPathVisualizer",
+  "artifacts_consumed": ["json_events"],
+  "artifacts_produced": ["text"],
+  "capabilities": [
+    "threat_modeling:ascii_visualization",
+    "threat_modeling:mermaid_diagram",
+    "threat_modeling:compact_flow",
+    "threat_modeling:control_matrix"
+  ],
+  "input_schema": "schemas/input.schema.json",
+  "output_schema": "schemas/output.schema.json",
+  "timeout_class": "short",
+  "cost_hint": "low",
+  "safe_for_auto_invoke": true,
+  "requires_llm": false,
+  "dependencies": [],
+  "stability": "stable",
+  "tags": ["visualization", "ascii", "mermaid", "attack_path", "diagram", "controls"],
+  "chains_to": [],
+  "chains_from": ["threat_model_analyzer", "risk_assessment_analyzer"]
+}

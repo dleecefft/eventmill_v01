@@ -1,0 +1,23 @@
+{
+  "keyword_rules": {
+    "network_forensics": [
+      "pcap", "packet", "flow", "dns query", "tcp", "udp", "tls", "wireshark",
+      "firewall", "palo alto", "fortinet", "iptables", "blocked", "allowed"
+    ],
+    "cloud_investigation": [
+      "azure", "aws", "gcp", "blob", "s3", "cloudtrail", "audit log", "iam"
+    ],
+    "log_analysis": [
+      "log", "event", "syslog", "session", "alert", "parse", "field", "grok",
+      "threat intel", "ioc", "indicator", "stix", "cve", "advisory", "report",
+      "image", "photo", "camera", "physical", "badge", "serial number"
+    ],
+    "risk_assessment": [
+      "risk", "impact", "likelihood", "control", "residual", "compliance"
+    ],
+    "threat_modeling": [
+      "mitre", "attack path", "technique", "lateral movement", "exfiltration",
+      "threat model", "four questions", "shostack", "what can go wrong"
+    ]
+  }
+}

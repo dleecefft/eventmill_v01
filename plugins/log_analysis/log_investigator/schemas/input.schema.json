@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": ["investigate", "workflow"],
+      "description": "Mode: 'investigate' for targeted AI analysis, 'workflow' for predefined SOC workflows."
+    },
+    "file_path": {
+      "type": "string",
+      "description": "Path to the log file to investigate."
+    },
+    "search_term": {
+      "type": "string",
+      "description": "Term to investigate (IP, user, error, etc.). Required for investigate mode."
+    },
+    "workflow_type": {
+      "type": "string",
+      "enum": ["top_talkers", "investigate_ip", "security_events", "attack_patterns"],
+      "description": "Predefined SOC workflow to execute. Required for workflow mode."
+    },
+    "target": {
+      "type": "string",
+      "description": "Specific target for targeted workflows (e.g. IP for investigate_ip)."
+    },
+    "context_lines": {
+      "type": "integer",
+      "default": 100,
+      "minimum": 10,
+      "maximum": 500,
+      "description": "Max matching lines to analyze in investigate mode."
+    },
+    "full_log": {
+      "type": "boolean",
+      "default": false,
+      "description": "If true, scan entire file. Otherwise stop after context_lines matches."
+    }
+  },
+  "required": ["mode", "file_path"]
+}

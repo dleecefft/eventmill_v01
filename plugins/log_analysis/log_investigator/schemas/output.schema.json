@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": ["investigate", "workflow"]
+    },
+    "search_term": { "type": "string" },
+    "lines_scanned": { "type": "integer" },
+    "total_matches": { "type": "integer" },
+    "sample_matches": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "ai_analysis": {
+      "type": "string",
+      "description": "LLM-powered threat intelligence analysis."
+    },
+    "workflow_type": { "type": "string" },
+    "workflow_results": {
+      "type": "array",
+      "description": "Workflow section results.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "section": { "type": "string" },
+          "entries": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "value": { "type": "string" },
+                "count": { "type": "integer" },
+                "line": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

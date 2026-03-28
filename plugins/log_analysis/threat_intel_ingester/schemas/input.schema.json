@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eventmill.dev/plugins/threat_intel_ingester/input.schema.json",
+  "title": "Threat Intel Ingester Input",
+  "type": "object",
+  "required": ["artifact_id"],
+  "additionalProperties": false,
+  "properties": {
+    "artifact_id": {
+      "type": "string",
+      "description": "ID of the registered artifact to ingest. Must reference a pdf_report, html_report, or text artifact."
+    },
+    "source_context": {
+      "type": "string",
+      "description": "Optional analyst-provided context about the report source, e.g., 'Mandiant APT29 report from March 2026' or 'CISA advisory AA26-073A'. Improves LLM extraction quality.",
+      "maxLength": 500
+    },
+    "ioc_types": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["ip", "domain", "hash_md5", "hash_sha1", "hash_sha256", "url", "email", "cve", "mitre_technique"]
+      },
+      "uniqueItems": true,
+      "description": "IOC types to extract. If omitted, all supported types are extracted.",
+      "default": ["ip", "domain", "hash_sha256", "url", "cve", "mitre_technique"]
+    },
+    "confidence_threshold": {
+      "type": "string",
+      "enum": ["low", "medium", "high"],
+      "default": "low",
+      "description": "Minimum confidence for including an extracted IOC. 'low' includes regex-matched IOCs that may be false positives (e.g., version numbers misidentified as IPs). 'high' includes only IOCs confirmed by LLM contextual analysis."
+    },
+    "max_pages": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 200,
+      "default": 50,
+      "description": "Maximum pages to process from PDF reports. Limits cost for very large documents."
+    }
+  }
+}

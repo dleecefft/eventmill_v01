@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": ["grok", "regex", "discover"],
+      "description": "Analysis mode that was used."
+    },
+    "lines_processed": {
+      "type": "integer",
+      "description": "Number of lines processed."
+    },
+    "matches_found": {
+      "type": "integer",
+      "description": "Number of pattern matches found."
+    },
+    "scan_type": {
+      "type": "string",
+      "description": "Whether full scan or sample was used."
+    },
+    "top_results": {
+      "type": "array",
+      "description": "Top N frequency results (grok/regex modes).",
+      "items": {
+        "type": "object",
+        "properties": {
+          "value": { "type": "string" },
+          "count": { "type": "integer" },
+          "samples": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    },
+    "patterns": {
+      "type": "array",
+      "description": "Discovered patterns (discover mode).",
+      "items": {
+        "type": "object",
+        "properties": {
+          "signature": { "type": "string" },
+          "count": { "type": "integer" },
+          "percentage": { "type": "number" },
+          "example": { "type": "string" }
+        }
+      }
+    },
+    "ai_analysis": {
+      "type": "string",
+      "description": "AI interpretation of patterns, if requested and available."
+    },
+    "pattern_used": {
+      "type": "string",
+      "description": "The regex pattern that was applied (grok/regex modes)."
+    }
+  }
+}

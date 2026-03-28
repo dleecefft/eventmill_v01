@@ -1,0 +1,34 @@
+{
+  "ok": true,
+  "result": {
+    "mode": "grok",
+    "lines_processed": 50000,
+    "matches_found": 48723,
+    "scan_type": "sample(50000)",
+    "pattern_used": "IP → ((?:\\d{1,3}\\.){3}\\d{1,3})",
+    "top_results": [
+      {
+        "value": "192.168.1.100",
+        "count": 12453,
+        "samples": [
+          "192.168.1.100 - admin [15/Jan/2025:10:30:00 +0000] \"GET /api/users HTTP/1.1\" 200 1234",
+          "192.168.1.100 - admin [15/Jan/2025:10:30:01 +0000] \"POST /api/login HTTP/1.1\" 401 89"
+        ]
+      },
+      {
+        "value": "10.0.0.55",
+        "count": 8921,
+        "samples": [
+          "10.0.0.55 - - [15/Jan/2025:10:31:00 +0000] \"GET /index.html HTTP/1.1\" 200 5678"
+        ]
+      },
+      {
+        "value": "172.16.0.1",
+        "count": 3102,
+        "samples": [
+          "172.16.0.1 - scanner [15/Jan/2025:10:32:00 +0000] \"PROPFIND / HTTP/1.1\" 405 0"
+        ]
+      }
+    ]
+  }
+}

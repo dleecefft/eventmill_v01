@@ -1,0 +1,8 @@
+{
+  "mode": "grok",
+  "file_path": "/workspace/artifacts/access.log",
+  "pattern": "IP",
+  "limit": 10,
+  "sample_lines": 50000,
+  "full_log": false
+}

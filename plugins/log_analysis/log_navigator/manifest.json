@@ -1,0 +1,29 @@
+{
+  "tool_name": "log_navigator",
+  "version": "1.0.0",
+  "pillar": "log_analysis",
+  "display_name": "Log Navigator",
+  "description_short": "List, read, and inspect log files from local or cloud storage.",
+  "description_long": "Navigate log file collections by listing directories, reading file segments with pagination, and retrieving file metadata. Supports both local filesystem and cloud storage backends via the framework storage abstraction. Designed as the entry point for the analyst workflow — discover files, then hand off to pattern analyzer or searcher.",
+  "author": "Event Mill Contributors",
+  "entry_point": "tool.py",
+  "class_name": "LogNavigator",
+  "artifacts_consumed": [],
+  "artifacts_produced": ["text", "log_stream"],
+  "capabilities": [
+    "log_analysis:list_files",
+    "log_analysis:read_segment",
+    "log_analysis:file_metadata"
+  ],
+  "input_schema": "schemas/input.schema.json",
+  "output_schema": "schemas/output.schema.json",
+  "timeout_class": "short",
+  "cost_hint": "low",
+  "safe_for_auto_invoke": true,
+  "requires_llm": false,
+  "dependencies": [],
+  "stability": "stable",
+  "tags": ["navigation", "listing", "reading", "metadata", "pagination"],
+  "chains_to": ["log_pattern_analyzer", "log_searcher", "log_investigator"],
+  "chains_from": []
+}

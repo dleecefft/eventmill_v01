@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "action": { "type": "string" },
+    "scenario_id": { "type": "string" },
+    "ai_analysis": { "type": "string" },
+    "scenarios": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "scenario_id": { "type": "string" },
+          "name": { "type": "string" },
+          "controls_count": { "type": "integer" },
+          "events_count": { "type": "integer" },
+          "unprotected_count": { "type": "integer" }
+        }
+      }
+    },
+    "gap_analysis": {
+      "type": "object",
+      "properties": {
+        "unprotected_events": { "type": "array", "items": { "type": "object" } },
+        "weak_controls": { "type": "array", "items": { "type": "object" } },
+        "easy_bypass": { "type": "array", "items": { "type": "object" } },
+        "total_issues": { "type": "integer" }
+      }
+    },
+    "markdown": { "type": "string" },
+    "control_id": { "type": "string" },
+    "event_id": { "type": "string" }
+  }
+}

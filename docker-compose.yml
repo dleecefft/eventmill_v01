@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  eventmill:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./workspace:/app/workspace
+      - ./.env:/app/.env:ro
+    environment:
+      - EVENTMILL_MCP_TRANSPORT=${EVENTMILL_MCP_TRANSPORT:-stdio}
+      - EVENTMILL_MODEL_ID=${EVENTMILL_MODEL_ID:-gemini-2.5-flash}
+      - EVENTMILL_LOG_LEVEL=${EVENTMILL_LOG_LEVEL:-INFO}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    stdin_open: true
+    tty: true
+
+  # Development mode with hot reload
+  eventmill-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./framework:/app/framework
+      - ./plugins:/app/plugins
+      - ./workspace:/app/workspace
+      - ./.env:/app/.env:ro
+    environment:
+      - EVENTMILL_MCP_TRANSPORT=${EVENTMILL_MCP_TRANSPORT:-stdio}
+      - EVENTMILL_MODEL_ID=${EVENTMILL_MODEL_ID:-gemini-2.5-flash}
+      - EVENTMILL_LOG_LEVEL=DEBUG
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    stdin_open: true
+    tty: true
+    profiles:
+      - dev

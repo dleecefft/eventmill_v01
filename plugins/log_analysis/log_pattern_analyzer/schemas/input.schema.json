@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "mode": {
+      "type": "string",
+      "enum": ["grok", "regex", "discover"],
+      "description": "Analysis mode: 'grok' for named pattern analysis, 'regex' for custom regex, 'discover' for auto-detection."
+    },
+    "file_path": {
+      "type": "string",
+      "description": "Path to the log file to analyze."
+    },
+    "pattern": {
+      "type": "string",
+      "description": "GROK pattern name (e.g. 'IP', 'HTTPSTATUS') for grok mode, or regex with capture group for regex mode. Ignored in discover mode."
+    },
+    "limit": {
+      "type": "integer",
+      "default": 10,
+      "minimum": 1,
+      "maximum": 100,
+      "description": "Number of top results to return (grok/regex modes)."
+    },
+    "sample_lines": {
+      "type": "integer",
+      "default": 50000,
+      "minimum": 100,
+      "description": "Number of lines to sample. Ignored if full_log is true."
+    },
+    "full_log": {
+      "type": "boolean",
+      "default": false,
+      "description": "If true, process the entire log file instead of sampling."
+    },
+    "ai_analysis": {
+      "type": "boolean",
+      "default": false,
+      "description": "If true and LLM is available, request AI interpretation of discovered patterns (discover mode only)."
+    }
+  },
+  "required": ["mode", "file_path"]
+}

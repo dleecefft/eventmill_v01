@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "format": { "type": "string" },
+    "visualization": { "type": "string", "description": "Rendered visualization text." },
+    "stages_rendered": { "type": "integer" },
+    "missing_required": { "type": "integer" }
+  }
+}

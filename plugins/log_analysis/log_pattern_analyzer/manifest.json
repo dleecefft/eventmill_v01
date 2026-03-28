@@ -1,0 +1,31 @@
+{
+  "tool_name": "log_pattern_analyzer",
+  "version": "1.0.0",
+  "pillar": "log_analysis",
+  "display_name": "Log Pattern Analyzer",
+  "description_short": "Analyze log files using GROK/regex patterns and auto-discover log structures.",
+  "description_long": "Comprehensive log analysis tool that supports three modes: (1) GROK pattern analysis using named pattern aliases like IP, HTTPSTATUS, LOGLEVEL for user-friendly frequency analysis, (2) custom regex pattern analysis with capture groups for advanced extraction, and (3) automatic pattern discovery that abstracts variable data into structural signatures to identify unknown log types. Supports both local files and cloud storage. Optionally integrates with LLM for AI-powered pattern interpretation.",
+  "author": "Event Mill Contributors",
+  "entry_point": "tool.py",
+  "class_name": "LogPatternAnalyzer",
+  "artifacts_consumed": ["text", "log_stream"],
+  "artifacts_produced": ["json_events"],
+  "capabilities": [
+    "log_analysis:pattern_discovery",
+    "log_analysis:grok_analysis",
+    "log_analysis:regex_analysis",
+    "log_analysis:frequency_analysis",
+    "log_analysis:top_talkers"
+  ],
+  "input_schema": "schemas/input.schema.json",
+  "output_schema": "schemas/output.schema.json",
+  "timeout_class": "medium",
+  "cost_hint": "low",
+  "safe_for_auto_invoke": true,
+  "requires_llm": false,
+  "dependencies": [],
+  "stability": "stable",
+  "tags": ["parsing", "pattern", "grok", "regex", "discovery", "frequency"],
+  "chains_to": ["log_searcher", "log_investigator"],
+  "chains_from": ["log_navigator"]
+}

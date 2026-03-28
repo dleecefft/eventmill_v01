@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "format": {
+      "type": "string",
+      "enum": ["ascii", "mermaid", "compact", "both"],
+      "default": "ascii",
+      "description": "Output format: 'ascii' for terminal art, 'mermaid' for diagrams, 'compact' for single-line flow, 'both' for ascii + mermaid."
+    },
+    "attack_type": {
+      "type": "string",
+      "default": "unknown",
+      "description": "Name of the attack type for the header."
+    },
+    "attack_narrative": {
+      "type": "string",
+      "description": "Brief narrative of the attack path."
+    },
+    "stages": {
+      "type": "array",
+      "description": "Attack stages with controls and gaps.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "technique_claimed": { "type": "string" },
+          "mitre_technique_id": { "type": "string" },
+          "stage_present": { "type": "boolean", "default": true },
+          "relevance": { "type": "string", "enum": ["required", "optional", "not_applicable"] },
+          "controls": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "control_name": { "type": "string" },
+                "control_type": { "type": "string", "enum": ["preventive", "detective", "responsive"] },
+                "effectiveness_rating": { "type": "string", "enum": ["strong", "moderate", "weak", "nominal"] }
+              }
+            }
+          },
+          "gaps_detected": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "include_controls": {
+      "type": "boolean",
+      "default": true,
+      "description": "Include control coverage matrix in mermaid output."
+    }
+  },
+  "required": ["stages"]
+}

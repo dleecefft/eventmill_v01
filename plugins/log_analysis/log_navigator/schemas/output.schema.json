@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": ["list", "read", "metadata"]
+    },
+    "path": {
+      "type": "string"
+    },
+    "entries": {
+      "type": "array",
+      "description": "Directory listing results (list action).",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "type": { "type": "string", "enum": ["file", "directory"] },
+          "size": { "type": "integer" }
+        }
+      }
+    },
+    "file_count": { "type": "integer" },
+    "dir_count": { "type": "integer" },
+    "lines": {
+      "type": "array",
+      "description": "File content lines (read action).",
+      "items": { "type": "string" }
+    },
+    "offset": { "type": "integer" },
+    "lines_read": { "type": "integer" },
+    "has_more": { "type": "boolean" },
+    "metadata": {
+      "type": "object",
+      "description": "File metadata (metadata action).",
+      "properties": {
+        "name": { "type": "string" },
+        "size_bytes": { "type": "integer" },
+        "modified": { "type": "string" },
+        "line_count": { "type": "integer" }
+      }
+    }
+  }
+}

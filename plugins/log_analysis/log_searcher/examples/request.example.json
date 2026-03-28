@@ -1,0 +1,7 @@
+{
+  "file_path": "/workspace/artifacts/access.log",
+  "query": "401",
+  "mode": "text",
+  "max_results": 50,
+  "context_lines": 2
+}

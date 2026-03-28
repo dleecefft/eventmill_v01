@@ -1,0 +1,29 @@
+{
+  "tool_name": "log_searcher",
+  "version": "1.0.0",
+  "pillar": "log_analysis",
+  "display_name": "Log Searcher",
+  "description_short": "Search log files for text patterns with context and line numbers.",
+  "description_long": "Searches log files for matching lines using case-insensitive text or regex patterns. Returns matching lines with line numbers and optional surrounding context. Supports both simple text search and regex search modes. Designed for the analyst workflow of finding specific events, errors, or indicators in log data.",
+  "author": "Event Mill Contributors",
+  "entry_point": "tool.py",
+  "class_name": "LogSearcher",
+  "artifacts_consumed": ["text", "log_stream"],
+  "artifacts_produced": ["json_events"],
+  "capabilities": [
+    "log_analysis:search",
+    "log_analysis:grep",
+    "log_analysis:filter"
+  ],
+  "input_schema": "schemas/input.schema.json",
+  "output_schema": "schemas/output.schema.json",
+  "timeout_class": "medium",
+  "cost_hint": "low",
+  "safe_for_auto_invoke": true,
+  "requires_llm": false,
+  "dependencies": [],
+  "stability": "stable",
+  "tags": ["search", "grep", "filter", "keyword"],
+  "chains_to": ["log_pattern_analyzer", "log_investigator"],
+  "chains_from": ["log_navigator", "log_pattern_analyzer"]
+}

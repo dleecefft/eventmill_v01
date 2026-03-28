@@ -1,0 +1,29 @@
+{
+  "pillars": {
+    "log_analysis": {
+      "enabled": true,
+      "display_name": "Log and Digital Event Analysis",
+      "description": "Analyze unfamiliar digital event sources to determine security relevance"
+    },
+    "network_forensics": {
+      "enabled": true,
+      "display_name": "Network Traffic Analysis",
+      "description": "Triage network artifacts collected during an incident"
+    },
+    "cloud_investigation": {
+      "enabled": false,
+      "display_name": "Cloud Investigation",
+      "description": "Cloud audit log analysis and cloud resource investigation (post-MVP)"
+    },
+    "risk_assessment": {
+      "enabled": false,
+      "display_name": "Risk Assessment",
+      "description": "Risk scoring, control effectiveness, compliance gap analysis (post-MVP)"
+    },
+    "threat_modeling": {
+      "enabled": true,
+      "display_name": "Threat Modeling and Attack Path Visualization",
+      "description": "Shostack 4-question framework and attack path generation"
+    }
+  }
+}

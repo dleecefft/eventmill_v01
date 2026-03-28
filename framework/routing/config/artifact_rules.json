@@ -1,0 +1,44 @@
+{
+  "artifact_pillar_mapping": {
+    "pcap": {
+      "pillar": "network_forensics",
+      "strength": "strong"
+    },
+    "cloud_audit_log": {
+      "pillar": "cloud_investigation",
+      "strength": "strong"
+    },
+    "risk_model": {
+      "pillar": "risk_assessment",
+      "strength": "strong"
+    },
+    "json_events": {
+      "pillar": "log_analysis",
+      "strength": "moderate"
+    },
+    "log_stream": {
+      "pillar": "log_analysis",
+      "strength": "moderate"
+    },
+    "pdf_report": {
+      "pillar": "log_analysis",
+      "strength": "moderate",
+      "notes": "likely threat intel"
+    },
+    "html_report": {
+      "pillar": "log_analysis",
+      "strength": "moderate",
+      "notes": "likely threat intel"
+    },
+    "image": {
+      "pillar": "log_analysis",
+      "strength": "weak",
+      "notes": "could be physical intrusion or unrelated"
+    },
+    "text": {
+      "pillar": null,
+      "strength": "none",
+      "notes": "ambiguous - requires keyword or session context"
+    }
+  }
+}

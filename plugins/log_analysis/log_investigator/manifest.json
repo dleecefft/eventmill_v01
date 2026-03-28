@@ -1,0 +1,30 @@
+{
+  "tool_name": "log_investigator",
+  "version": "1.0.0",
+  "pillar": "log_analysis",
+  "display_name": "Log Investigator",
+  "description_short": "AI-powered threat investigation and SOC analyst workflows.",
+  "description_long": "Deep-dive security investigation tool that combines log evidence with LLM-powered threat intelligence analysis. Supports two modes: (1) investigate mode for targeted analysis of a search term (IP, user, error) with threat assessment, MITRE ATT&CK mapping, and recommended actions, and (2) workflow mode for predefined SOC analyst workflows like top_talkers, investigate_ip, security_events, and attack_patterns. Requires LLM connection for full investigation capabilities.",
+  "author": "Event Mill Contributors",
+  "entry_point": "tool.py",
+  "class_name": "LogInvestigator",
+  "artifacts_consumed": ["text", "log_stream"],
+  "artifacts_produced": ["json_events"],
+  "capabilities": [
+    "log_analysis:investigate",
+    "log_analysis:threat_intel",
+    "log_analysis:soc_workflow",
+    "log_analysis:security_events"
+  ],
+  "input_schema": "schemas/input.schema.json",
+  "output_schema": "schemas/output.schema.json",
+  "timeout_class": "long",
+  "cost_hint": "medium",
+  "safe_for_auto_invoke": false,
+  "requires_llm": true,
+  "dependencies": [],
+  "stability": "stable",
+  "tags": ["investigation", "threat_intel", "soc", "workflow", "ai", "mitre"],
+  "chains_to": [],
+  "chains_from": ["log_navigator", "log_searcher", "log_pattern_analyzer"]
+}

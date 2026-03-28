@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": [
+        "analyze_document",
+        "create_scenario",
+        "add_control",
+        "add_event",
+        "list_scenarios",
+        "gap_analysis",
+        "export"
+      ],
+      "description": "Action to perform."
+    },
+    "document_content": {
+      "type": "string",
+      "description": "Text content of threat model or tabletop minutes (analyze_document action)."
+    },
+    "source_type": {
+      "type": "string",
+      "enum": ["threat_model", "tabletop_exercise", "security_assessment", "red_team_report", "incident_review"],
+      "default": "threat_model"
+    },
+    "scenario_id": { "type": "string", "description": "Scenario ID for add_control, add_event, gap_analysis, export." },
+    "name": { "type": "string" },
+    "description": { "type": "string" },
+    "threat_actor": { "type": "string" },
+    "objective": { "type": "string" },
+    "target_assets": { "type": "array", "items": { "type": "string" } },
+    "entry_vectors": { "type": "array", "items": { "type": "string" } },
+    "control_type": {
+      "type": "string",
+      "enum": ["perimeter", "network", "endpoint", "application", "data", "identity", "monitoring"]
+    },
+    "implementation_status": {
+      "type": "string",
+      "enum": ["implemented", "partial", "planned", "missing"],
+      "default": "implemented"
+    },
+    "bypass_difficulty": {
+      "type": "string",
+      "enum": ["trivial", "low", "medium", "high", "very_high"],
+      "default": "medium"
+    },
+    "bypass_requirements": { "type": "array", "items": { "type": "string" } },
+    "detection_capability": {
+      "type": "string",
+      "enum": ["none", "low", "medium", "high"],
+      "default": "medium"
+    },
+    "sequence_order": { "type": "integer", "minimum": 1 },
+    "technique_name": { "type": "string", "description": "MITRE ATT&CK technique name." },
+    "technique_id": { "type": "string", "description": "MITRE ATT&CK ID (e.g. T1566)." },
+    "required_access": { "type": "string", "default": "none" },
+    "resulting_access": { "type": "string", "default": "none" },
+    "blocking_controls": { "type": "array", "items": { "type": "string" } },
+    "detecting_controls": { "type": "array", "items": { "type": "string" } },
+    "output_path": { "type": "string", "description": "File path for export action." }
+  },
+  "required": ["action"]
+}

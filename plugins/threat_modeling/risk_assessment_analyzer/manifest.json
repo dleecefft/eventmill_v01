@@ -1,0 +1,30 @@
+{
+  "tool_name": "risk_assessment_analyzer",
+  "version": "1.0.0",
+  "pillar": "threat_modeling",
+  "display_name": "Risk Assessment Analyzer",
+  "description_short": "Analyze risk assessment reports against MITRE ATT&CK stages with control effectiveness scoring.",
+  "description_long": "Validates attack path narratives in risk assessment documents against MITRE ATT&CK stages. Supports multiple attack types (ransomware, APT, data theft, DDoS, insider threat, web attack) with type-specific required/optional stage mappings. Assesses security control effectiveness, evidence basis, independence violations, and generates confidence scores. Outputs structured JSON or formatted text reports.",
+  "author": "Event Mill Contributors",
+  "entry_point": "tool.py",
+  "class_name": "RiskAssessmentAnalyzer",
+  "artifacts_consumed": ["text", "pdf"],
+  "artifacts_produced": ["json_events", "text"],
+  "capabilities": [
+    "threat_modeling:risk_assessment",
+    "threat_modeling:stage_validation",
+    "threat_modeling:control_effectiveness",
+    "threat_modeling:confidence_scoring"
+  ],
+  "input_schema": "schemas/input.schema.json",
+  "output_schema": "schemas/output.schema.json",
+  "timeout_class": "long",
+  "cost_hint": "medium",
+  "safe_for_auto_invoke": false,
+  "requires_llm": true,
+  "dependencies": [],
+  "stability": "stable",
+  "tags": ["risk_assessment", "mitre", "attack_stages", "controls", "confidence", "compliance"],
+  "chains_to": ["attack_path_visualizer"],
+  "chains_from": ["threat_model_analyzer"]
+}

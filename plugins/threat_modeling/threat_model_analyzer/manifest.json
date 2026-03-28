@@ -1,0 +1,32 @@
+{
+  "tool_name": "threat_model_analyzer",
+  "version": "1.0.0",
+  "pillar": "threat_modeling",
+  "display_name": "Threat Model Analyzer",
+  "description_short": "Analyze threat models, track scenarios, controls, attack events, and identify defense gaps.",
+  "description_long": "Comprehensive threat modeling tool that supports: (1) AI-powered analysis of threat model documents and tabletop exercise minutes, (2) threat scenario creation and tracking with security controls and attack sequence events, (3) defense-in-depth gap analysis identifying unprotected steps, weak controls, and easy bypasses, (4) markdown export of scenario reports. Integrates threat intelligence context for enriched analysis. Maps to MITRE ATT&CK techniques.",
+  "author": "Event Mill Contributors",
+  "entry_point": "tool.py",
+  "class_name": "ThreatModelAnalyzer",
+  "artifacts_consumed": ["text", "pdf"],
+  "artifacts_produced": ["json_events", "text"],
+  "capabilities": [
+    "threat_modeling:analyze_document",
+    "threat_modeling:scenario_tracking",
+    "threat_modeling:gap_analysis",
+    "threat_modeling:control_mapping",
+    "threat_modeling:attack_sequence",
+    "threat_modeling:export"
+  ],
+  "input_schema": "schemas/input.schema.json",
+  "output_schema": "schemas/output.schema.json",
+  "timeout_class": "long",
+  "cost_hint": "medium",
+  "safe_for_auto_invoke": false,
+  "requires_llm": true,
+  "dependencies": [],
+  "stability": "stable",
+  "tags": ["threat_model", "scenario", "controls", "mitre", "gap_analysis", "defense_in_depth"],
+  "chains_to": ["attack_path_visualizer"],
+  "chains_from": ["log_investigator"]
+}

@@ -1,0 +1,101 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eventmill"
+version = "0.2.0"
+description = "Event record analysis platform for Security Operations and Detection Engineering teams"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.11"
+authors = [
+    {name = "Event Mill Contributors"}
+]
+keywords = [
+    "security",
+    "soc",
+    "detection-engineering",
+    "log-analysis",
+    "threat-intelligence",
+    "mitre-attack",
+    "incident-response"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: System :: Logging",
+]
+
+dependencies = [
+    "mcp>=1.0.0",
+    "jsonschema>=4.20.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.5.0",
+]
+gcp = [
+    "google-cloud-storage>=2.10.0",
+    "google-cloud-secret-manager>=2.16.0",
+]
+plugins-log-analysis = [
+    "pdfplumber>=0.10.0",
+    "beautifulsoup4>=4.12.0",
+    "stix2>=3.0.0",
+]
+plugins-network-forensics = [
+    "scapy>=2.5.0",
+    "dpkt>=1.9.8",
+]
+all = [
+    "eventmill[dev,gcp,plugins-log-analysis,plugins-network-forensics]",
+]
+
+[project.urls]
+Homepage = "https://github.com/dleecefft/event_mill"
+Documentation = "https://github.com/dleecefft/event_mill/tree/main/docs"
+Repository = "https://github.com/dleecefft/event_mill"
+Issues = "https://github.com/dleecefft/event_mill/issues"
+
+[project.scripts]
+eventmill = "framework.cli.shell:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["framework*", "plugins*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "plugins"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+# asyncio_mode = "auto"  # Uncomment when pytest-asyncio is installed
+
+[tool.black]
+line-length = 88
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true

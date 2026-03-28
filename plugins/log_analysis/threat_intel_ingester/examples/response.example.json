@@ -1,0 +1,188 @@
+{
+  "ok": true,
+  "result": {
+    "report_metadata": {
+      "title": "APT41 Supply Chain Compromise Campaign Targeting Managed Service Providers",
+      "source_organization": "Mandiant",
+      "publication_date": "2026-02-15",
+      "page_count": 24,
+      "artifact_type": "pdf_report",
+      "campaign_name": "Operation DUSTBRIDGE",
+      "attributed_actor": "APT41",
+      "attribution_confidence": "high"
+    },
+    "iocs": [
+      {
+        "ioc_type": "ip",
+        "value": "198.51.100.47",
+        "confidence": "high",
+        "context": "C2 server used during initial access phase, active from January to February 2026.",
+        "priority": "high",
+        "related_mitre": ["T1071.001"],
+        "defanged": true
+      },
+      {
+        "ioc_type": "ip",
+        "value": "203.0.113.88",
+        "confidence": "high",
+        "context": "Secondary C2 endpoint for data staging prior to exfiltration.",
+        "priority": "high",
+        "related_mitre": ["T1071.001", "T1048.003"],
+        "defanged": true
+      },
+      {
+        "ioc_type": "domain",
+        "value": "update-service.mspmgmt.com",
+        "confidence": "high",
+        "context": "Masqueraded as a legitimate MSP management portal for credential harvesting.",
+        "priority": "high",
+        "related_mitre": ["T1566.002"],
+        "defanged": true
+      },
+      {
+        "ioc_type": "domain",
+        "value": "cdn-assets.cloudserviceprovider.net",
+        "confidence": "medium",
+        "context": "Used for hosting second-stage payloads disguised as software updates.",
+        "priority": "medium",
+        "related_mitre": ["T1195.002"],
+        "defanged": true
+      },
+      {
+        "ioc_type": "hash_sha256",
+        "value": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+        "confidence": "high",
+        "context": "DUSTLOADER first-stage implant, delivered via trojanized MSP update package.",
+        "priority": "high",
+        "related_mitre": ["T1195.002", "T1059.001"],
+        "defanged": false
+      },
+      {
+        "ioc_type": "hash_sha256",
+        "value": "f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5d4c3b2a1f6e5",
+        "confidence": "high",
+        "context": "DUSTBRIDGE backdoor, provides persistent remote access with encrypted C2 channel.",
+        "priority": "high",
+        "related_mitre": ["T1573.002", "T1053.005"],
+        "defanged": false
+      },
+      {
+        "ioc_type": "cve",
+        "value": "CVE-2025-21345",
+        "confidence": "high",
+        "context": "RMM platform vulnerability exploited for initial access to MSP infrastructure.",
+        "priority": "high",
+        "related_mitre": ["T1190"],
+        "defanged": false
+      },
+      {
+        "ioc_type": "cve",
+        "value": "CVE-2024-38094",
+        "confidence": "medium",
+        "context": "SharePoint deserialization flaw used for lateral movement to customer tenants.",
+        "priority": "medium",
+        "related_mitre": ["T1210"],
+        "defanged": false
+      },
+      {
+        "ioc_type": "mitre_technique",
+        "value": "T1195.002",
+        "confidence": "high",
+        "context": "Supply chain compromise via trojanized software updates distributed through MSP management platform.",
+        "priority": "high",
+        "related_mitre": ["T1195.002"],
+        "defanged": false
+      }
+    ],
+    "mitre_mappings": [
+      {
+        "technique_id": "T1190",
+        "technique_name": "Exploit Public-Facing Application",
+        "tactic": "Initial Access",
+        "confidence": "explicit",
+        "report_context": "Exploited CVE-2025-21345 in the RMM platform to gain initial foothold on MSP management servers."
+      },
+      {
+        "technique_id": "T1195.002",
+        "technique_name": "Compromise Software Supply Chain",
+        "tactic": "Initial Access",
+        "confidence": "explicit",
+        "report_context": "Trojanized legitimate MSP software update packages to distribute DUSTLOADER to downstream customers."
+      },
+      {
+        "technique_id": "T1566.002",
+        "technique_name": "Spearphishing Link",
+        "tactic": "Initial Access",
+        "confidence": "explicit",
+        "report_context": "Sent targeted phishing emails with links to credential harvesting site masquerading as MSP management portal."
+      },
+      {
+        "technique_id": "T1059.001",
+        "technique_name": "PowerShell",
+        "tactic": "Execution",
+        "confidence": "explicit",
+        "report_context": "DUSTLOADER executes obfuscated PowerShell commands to download and install the DUSTBRIDGE backdoor."
+      },
+      {
+        "technique_id": "T1053.005",
+        "technique_name": "Scheduled Task",
+        "tactic": "Persistence",
+        "confidence": "explicit",
+        "report_context": "DUSTBRIDGE establishes persistence via a scheduled task disguised as a system health monitor."
+      },
+      {
+        "technique_id": "T1210",
+        "technique_name": "Exploitation of Remote Services",
+        "tactic": "Lateral Movement",
+        "confidence": "inferred",
+        "report_context": "Used SharePoint vulnerability CVE-2024-38094 to pivot from MSP infrastructure to customer tenants."
+      },
+      {
+        "technique_id": "T1071.001",
+        "technique_name": "Web Protocols",
+        "tactic": "Command and Control",
+        "confidence": "explicit",
+        "report_context": "C2 communications over HTTPS to attacker-controlled infrastructure at 198.51.100.47."
+      },
+      {
+        "technique_id": "T1573.002",
+        "technique_name": "Asymmetric Cryptography",
+        "tactic": "Command and Control",
+        "confidence": "inferred",
+        "report_context": "DUSTBRIDGE uses RSA-encrypted C2 channel to evade network inspection."
+      },
+      {
+        "technique_id": "T1048.003",
+        "technique_name": "Exfiltration Over Unencrypted/Obfuscated Non-C2 Protocol",
+        "tactic": "Exfiltration",
+        "confidence": "explicit",
+        "report_context": "Data staged and exfiltrated via DNS tunneling to secondary C2 at 203.0.113.88."
+      }
+    ],
+    "summary": {
+      "total_iocs": 9,
+      "ioc_breakdown": {
+        "ip": 2,
+        "domain": 2,
+        "hash_sha256": 2,
+        "cve": 2,
+        "mitre_technique": 1
+      },
+      "high_priority_count": 6,
+      "mitre_technique_count": 9,
+      "confidence_distribution": {
+        "low": 0,
+        "medium": 2,
+        "high": 7
+      }
+    }
+  },
+  "output_artifacts": [
+    {
+      "artifact_id": "art_0002",
+      "artifact_type": "json_events",
+      "file_path": "/workspace/artifacts/art_0002_ti_iocs.json",
+      "description": "Structured IOC records extracted from APT41 supply chain report."
+    }
+  ]
+}

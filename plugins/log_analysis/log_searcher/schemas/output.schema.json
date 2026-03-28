@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "query": {
+      "type": "string",
+      "description": "The search query that was used."
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["text", "regex"]
+    },
+    "total_matches": {
+      "type": "integer",
+      "description": "Total number of matching lines found."
+    },
+    "lines_scanned": {
+      "type": "integer",
+      "description": "Total lines scanned in the file."
+    },
+    "truncated": {
+      "type": "boolean",
+      "description": "Whether results were truncated due to max_results limit."
+    },
+    "matches": {
+      "type": "array",
+      "description": "Matching lines with line numbers.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "line_number": { "type": "integer" },
+          "text": { "type": "string" },
+          "context_before": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "context_after": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}
