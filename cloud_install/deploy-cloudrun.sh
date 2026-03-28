@@ -4,7 +4,8 @@
 #
 # Usage:
 #   export GOOGLE_CLOUD_PROJECT="your-project-id"
-#   export GEMINI_API_KEY="your-key"       # optional
+#   export GEMINI_FLASH_API_KEY="your-key"  # light tier (optional)
+#   export GEMINI_PRO_API_KEY="your-key"    # heavy tier (optional)
 #   bash cloud_install/deploy-cloudrun.sh
 
 set -e
@@ -64,7 +65,8 @@ gcloud run deploy "${SERVICE_NAME}" \
     --max-instances=3 \
     --timeout=3600 \
     --concurrency=10 \
-    --set-env-vars="GEMINI_API_KEY=${GEMINI_API_KEY:-}" \
+    --set-env-vars="GEMINI_FLASH_API_KEY=${GEMINI_FLASH_API_KEY:-}" \
+    --set-env-vars="GEMINI_PRO_API_KEY=${GEMINI_PRO_API_KEY:-}" \
     --set-env-vars="ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}" \
     --set-env-vars="GCS_LOG_BUCKET=${GCS_LOG_BUCKET:-}" \
     --set-env-vars="EVENTMILL_LOG_LEVEL=${EVENTMILL_LOG_LEVEL:-INFO}" \

@@ -119,6 +119,10 @@ gcloud services enable secretmanager.googleapis.com --project="${PROJECT_ID}" --
 echo "   Enabling Generative Language API (generativelanguage.googleapis.com)..."
 gcloud services enable generativelanguage.googleapis.com --project="${PROJECT_ID}" --quiet
 
+# API Keys — required for programmatic API key creation and restriction
+echo "   Enabling API Keys API (apikeys.googleapis.com)..."
+gcloud services enable apikeys.googleapis.com --project="${PROJECT_ID}" --quiet
+
 # IAM — needed for service account and policy management
 echo "   Enabling IAM API (iam.googleapis.com)..."
 gcloud services enable iam.googleapis.com --project="${PROJECT_ID}" --quiet
@@ -301,8 +305,11 @@ create_secret_if_missing() {
     fi
 }
 
-# Gemini API key — used by google-genai SDK for AI-powered analysis
-create_secret_if_missing "eventmill-gemini-api" "Gemini API key for AI analysis"
+# Gemini API keys — separate keys per model tier to isolate quota
+# Flash key handles high-volume light tasks (log scanning, pattern discovery)
+# Pro key handles deep reasoning tasks (threat modeling, attack paths)
+create_secret_if_missing "eventmill-gemini-flash-api" "Gemini Flash API key (light tier)"
+create_secret_if_missing "eventmill-gemini-pro-api" "Gemini Pro API key (heavy tier)"
 
 # GCS service account key — JSON key file for GCS bucket access
 # NOTE: Only needed if NOT using workload identity or the default compute SA
@@ -334,7 +341,8 @@ bind_secret_to_sa() {
     echo "   ✓ ${SA_NAME} can read ${secret_name}"
 }
 
-bind_secret_to_sa "eventmill-gemini-api"
+bind_secret_to_sa "eventmill-gemini-flash-api"
+bind_secret_to_sa "eventmill-gemini-pro-api"
 bind_secret_to_sa "eventmill-gcs-sa"
 bind_secret_to_sa "eventmill-ttyd-user"
 bind_secret_to_sa "eventmill-ttyd-cred"
@@ -352,7 +360,8 @@ bind_secret_to_default() {
     echo "   ✓ default-compute can read ${secret_name}"
 }
 
-bind_secret_to_default "eventmill-gemini-api"
+bind_secret_to_default "eventmill-gemini-flash-api"
+bind_secret_to_default "eventmill-gemini-pro-api"
 bind_secret_to_default "eventmill-gcs-sa"
 bind_secret_to_default "eventmill-ttyd-user"
 bind_secret_to_default "eventmill-ttyd-cred"
@@ -374,7 +383,8 @@ echo "GCS Bucket:       gs://${GCS_LOG_BUCKET}"
 echo "Artifact Reg:     ${REGION}-docker.pkg.dev/${PROJECT_ID}/eventmill"
 echo ""
 echo "Secrets created (placeholder values):"
-echo "   - eventmill-gemini-api"
+echo "   - eventmill-gemini-flash-api  (Flash / light tier)"
+echo "   - eventmill-gemini-pro-api    (Pro / heavy tier)"
 echo "   - eventmill-gcs-sa"
 echo "   - eventmill-ttyd-user"
 echo "   - eventmill-ttyd-cred"

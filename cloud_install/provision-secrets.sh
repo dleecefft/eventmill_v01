@@ -108,17 +108,113 @@ add_secret_version() {
 }
 
 # =============================================================================
-# Section 1: Gemini API Key
+# Section 1: Gemini API Keys (dual-tier, restricted)
 # =============================================================================
-# The google-genai SDK uses this key for AI-powered analysis features
-# (threat investigation, log pattern identification, SOC workflows).
+# Event Mill uses two separate API keys to isolate quota between model tiers.
+# This prevents high-volume Flash calls (log scanning, pattern discovery)
+# from consuming Pro quota (threat modeling, attack path reasoning).
 #
-# Get your key from: https://aistudio.google.com/apikey
+# Keys are created via gcloud and restricted to generativelanguage.googleapis.com
+# only. Display names match the OS environment variable names for traceability.
+#
+# Prerequisites:
+#   - apikeys.googleapis.com enabled (provision-gcp-project.sh handles this)
+#   - generativelanguage.googleapis.com enabled
 # =============================================================================
 
-add_secret_version \
-    "eventmill-gemini-api" \
-    "Gemini API key (get from https://aistudio.google.com/apikey)"
+create_restricted_gemini_key() {
+    local display_name=$1   # matches the env var name for traceability
+    local secret_name=$2    # Secret Manager entry to store the key string
+    local description=$3    # human-readable purpose
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "API Key:  ${display_name}"
+    echo "Secret:   ${secret_name}"
+    echo "Purpose:  ${description}"
+    echo ""
+
+    # Check if a key with this display name already exists
+    local existing_key
+    existing_key=$(gcloud services api-keys list \
+        --project="${PROJECT_ID}" \
+        --filter="displayName='${display_name}'" \
+        --format="value(uid)" 2>/dev/null | head -n1)
+
+    if [ -n "${existing_key}" ]; then
+        echo "   ✓ API key '${display_name}' already exists (uid: ${existing_key})"
+        read -r -p "   Recreate and rotate this key? [y/N]: " confirm
+        if [[ ! "${confirm}" =~ ^[Yy]$ ]]; then
+            echo "   Skipped."
+            echo ""
+            return
+        fi
+        # Delete the old key before creating a new one
+        echo "   Deleting old key..."
+        gcloud services api-keys delete "${existing_key}" \
+            --project="${PROJECT_ID}" \
+            --quiet 2>/dev/null || true
+    fi
+
+    # Create a new API key restricted to Generative Language API only
+    echo "   Creating restricted API key '${display_name}'..."
+    local key_uid
+    key_uid=$(gcloud services api-keys create \
+        --project="${PROJECT_ID}" \
+        --display-name="${display_name}" \
+        --api-target=service=generativelanguage.googleapis.com \
+        --format="value(response.uid)" \
+        --quiet 2>&1)
+
+    if [ -z "${key_uid}" ]; then
+        echo "   ERROR: Failed to create API key. Check permissions."
+        echo ""
+        return
+    fi
+
+    echo "   ✓ API key created (uid: ${key_uid})"
+
+    # Retrieve the key string
+    local key_string
+    key_string=$(gcloud services api-keys get-key-string "${key_uid}" \
+        --project="${PROJECT_ID}" \
+        --format="value(keyString)" 2>/dev/null)
+
+    if [ -z "${key_string}" ]; then
+        echo "   ERROR: Failed to retrieve key string."
+        echo ""
+        return
+    fi
+
+    # Store the key string in Secret Manager
+    if ! gcloud secrets describe "${secret_name}" --project="${PROJECT_ID}" > /dev/null 2>&1; then
+        echo "   WARNING: Secret '${secret_name}' does not exist."
+        echo "   Run provision-gcp-project.sh first."
+        echo ""
+        return
+    fi
+
+    echo -n "${key_string}" | gcloud secrets versions add "${secret_name}" \
+        --project="${PROJECT_ID}" \
+        --data-file=- \
+        --quiet
+
+    echo "   ✓ Key string stored in secret '${secret_name}'"
+    echo ""
+}
+
+# GEMINI_FLASH_API_KEY — light tier
+# Used by plugins with model_tier: "light" (log scanning, pattern discovery, ingestion)
+create_restricted_gemini_key \
+    "GEMINI_FLASH_API_KEY" \
+    "eventmill-gemini-flash-api" \
+    "Light tier — log scanning, pattern discovery, bulk operations"
+
+# GEMINI_PRO_API_KEY — heavy tier
+# Used by plugins with model_tier: "heavy" (threat modeling, attack paths, risk assessment)
+create_restricted_gemini_key \
+    "GEMINI_PRO_API_KEY" \
+    "eventmill-gemini-pro-api" \
+    "Heavy tier — threat modeling, attack path reasoning, risk assessment"
 
 # =============================================================================
 # Section 2: GCS Service Account Key
@@ -164,8 +260,9 @@ echo "=================================================="
 echo "✅ Secret provisioning complete."
 echo ""
 echo "To verify secrets have valid values:"
-echo "  gcloud secrets versions list eventmill-gemini-api --project=${PROJECT_ID}"
-echo "  gcloud secrets versions list eventmill-ttyd-user  --project=${PROJECT_ID}"
+echo "  gcloud secrets versions list eventmill-gemini-flash-api --project=${PROJECT_ID}"
+echo "  gcloud secrets versions list eventmill-gemini-pro-api   --project=${PROJECT_ID}"
+echo "  gcloud secrets versions list eventmill-ttyd-user        --project=${PROJECT_ID}"
 echo ""
 echo "To deploy Event Mill:"
 echo "  bash cloud_install/deploy-cloudrun-secrets.sh"
