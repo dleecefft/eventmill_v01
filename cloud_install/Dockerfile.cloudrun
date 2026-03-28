@@ -1,0 +1,84 @@
+# Event Mill v0.2.0 - Cloud Run Deployment with ttyd web terminal
+# Cloud Run provides HTTPS on port 443 automatically, routing to container PORT (8080)
+#
+# Multi-stage build:
+#   Stage 1 (builder): Install Python dependencies
+#   Stage 2 (runtime): Minimal image with ttyd + eventmill
+
+# ---------------------------------------------------------------------------
+# Stage 1: Builder
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim-bookworm AS builder
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy dependency manifest and install
+COPY pyproject.toml README.md ./
+RUN pip install --no-cache-dir build && \
+    pip install --no-cache-dir .
+
+# ---------------------------------------------------------------------------
+# Stage 2: Runtime
+# ---------------------------------------------------------------------------
+FROM python:3.12-slim-bookworm
+
+# Install ttyd from official release and minimal runtime deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget \
+    ca-certificates \
+    libmagic1 \
+    && wget -qO /usr/local/bin/ttyd \
+       https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 \
+    && chmod +x /usr/local/bin/ttyd \
+    && apt-get purge -y wget \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-privileged user
+RUN groupadd --gid 1000 eventmill \
+    && useradd --uid 1000 --gid eventmill --shell /bin/bash --create-home eventmill
+
+WORKDIR /app
+
+# Copy installed packages from builder
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Copy application code
+COPY --chown=eventmill:eventmill framework/ ./framework/
+COPY --chown=eventmill:eventmill plugins/ ./plugins/
+COPY --chown=eventmill:eventmill pyproject.toml README.md ./
+
+# Create workspace and credentials directories
+RUN mkdir -p /app/workspace/sessions /app/workspace/artifacts /app/workspace/logs \
+    && mkdir -p /app/credentials \
+    && chown -R eventmill:eventmill /app/workspace /app/credentials
+
+# Switch to non-privileged user
+USER eventmill
+
+# Cloud Run sets PORT env var (default 8080)
+# ttyd listens on this port, Cloud Run proxies HTTPS:443 -> container:PORT
+ENV PORT=8080
+ENV PYTHONUNBUFFERED=1
+ENV EVENTMILL_WORKSPACE=/app/workspace
+ENV EVENTMILL_LOG_LEVEL=INFO
+
+EXPOSE 8080
+
+# ttyd options:
+#   -W              = writable (allow input)
+#   -p $PORT        = listen on Cloud Run's PORT
+#   -t fontSize=16  = larger font for readability
+#   -c user:pass    = basic auth (optional, use with Secret Manager)
+#
+# For public access without auth (Cloud Run IAM handles access):
+# CMD ["sh", "-c", "ttyd -W -p ${PORT} -t fontSize=16 python -m framework.cli.shell"]
+#
+# For basic auth (set TTYD_USERNAME and TTYD_PASSWORD as secrets):
+CMD ["sh", "-c", "ttyd -W -p ${PORT} -c ${TTYD_USERNAME}:${TTYD_PASSWORD} -t fontSize=16 python -m framework.cli.shell"]

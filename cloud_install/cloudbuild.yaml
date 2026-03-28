@@ -1,0 +1,73 @@
+# Event Mill v0.2.0 - Cloud Build CI/CD Pipeline
+# Builds and deploys to Cloud Run with ttyd web terminal
+#
+# Usage:
+#   gcloud builds submit --project="your-project-id" --config=cloud_install/cloudbuild.yaml .
+#
+# Or connect to GitHub repo for automatic builds on push.
+
+steps:
+  # Build the container image (commit-tagged + latest)
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/event-mill:$COMMIT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/event-mill:latest'
+      - '-f'
+      - 'cloud_install/Dockerfile.cloudrun'
+      - '.'
+
+  # Push commit-tagged image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/event-mill:$COMMIT_SHA'
+
+  # Push latest image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/event-mill:latest'
+
+  # Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'event-mill'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/event-mill:$COMMIT_SHA'
+      - '--region'
+      - '${_REGION}'
+      - '--platform'
+      - 'managed'
+      - '--port'
+      - '8080'
+      - '--memory'
+      - '512Mi'
+      - '--cpu'
+      - '1'
+      - '--timeout'
+      - '3600'
+      - '--concurrency'
+      - '10'
+      - '--min-instances'
+      - '0'
+      - '--max-instances'
+      - '3'
+      - '--set-env-vars'
+      - 'EVENTMILL_LOG_LEVEL=INFO'
+      - '--allow-unauthenticated'
+
+images:
+  - 'gcr.io/$PROJECT_ID/event-mill:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/event-mill:latest'
+
+substitutions:
+  _REGION: northamerica-northeast2
+
+options:
+  logging: CLOUD_LOGGING_ONLY

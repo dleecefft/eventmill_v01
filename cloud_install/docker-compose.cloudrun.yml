@@ -1,0 +1,39 @@
+# Event Mill v0.2.0 - Local testing of Cloud Run image
+# Simulates the Cloud Run environment locally via Docker Compose
+#
+# Usage:
+#   docker compose -f cloud_install/docker-compose.cloudrun.yml up --build
+#   Open http://localhost:8080 in browser
+
+version: '3.8'
+
+services:
+  event-mill:
+    build:
+      context: ..
+      dockerfile: cloud_install/Dockerfile.cloudrun
+    container_name: eventmill-cloudrun-local
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GCS_LOG_BUCKET=${GCS_LOG_BUCKET:-}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/sa-key.json
+      - EVENTMILL_WORKSPACE=/app/workspace
+      - EVENTMILL_LOG_LEVEL=${EVENTMILL_LOG_LEVEL:-DEBUG}
+      - TTYD_USERNAME=${TTYD_USERNAME:-admin}
+      - TTYD_PASSWORD=${TTYD_PASSWORD:-changeme}
+    volumes:
+      # Mount workspace for persistence across restarts
+      - ../workspace:/app/workspace
+      # Mount GCS service account key if available (read-only)
+      # Uncomment and set GOOGLE_APPLICATION_CREDENTIALS in your shell:
+      # - ${GOOGLE_APPLICATION_CREDENTIALS}:/app/credentials/sa-key.json:ro
+    security_opt:
+      - no-new-privileges:true
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
