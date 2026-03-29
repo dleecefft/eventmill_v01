@@ -36,14 +36,29 @@ class JSONFormatter(logging.Formatter):
         "error",
     }
     
+    def __init__(self, cloud_logging: bool = False):
+        """Initialize JSON formatter.
+        
+        Args:
+            cloud_logging: If True, use 'severity' instead of 'level'
+                          for GCP Cloud Logging auto-parsing.
+        """
+        super().__init__()
+        self.cloud_logging = cloud_logging
+    
     def format(self, record: logging.LogRecord) -> str:
         """Format a log record as JSON."""
         log_entry: dict[str, Any] = {
             "timestamp": datetime.fromtimestamp(record.created).isoformat(),
-            "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
         }
+        
+        # Cloud Logging parses 'severity'; local tools expect 'level'
+        if self.cloud_logging:
+            log_entry["severity"] = record.levelname
+        else:
+            log_entry["level"] = record.levelname
         
         # Add extra fields if present
         for field in self.FIELDS:
@@ -99,14 +114,18 @@ def setup_logging(
     log_file: str | Path | None = None,
     console: bool = True,
     json_format: bool = True,
+    cloud_json: bool = False,
 ) -> logging.Logger:
     """Configure Event Mill logging.
     
     Args:
         log_level: Logging level (DEBUG, INFO, WARNING, ERROR).
         log_file: Path to log file (None for no file logging).
-        console: Whether to log to console.
+        console: Whether to log to console (stderr).
         json_format: Whether to use JSON format for file logging.
+        cloud_json: If True, use JSON format on stderr with 'severity'
+                    field for GCP Cloud Logging auto-parsing. Overrides
+                    the default ConsoleFormatter for console output.
     
     Returns:
         Root Event Mill logger.
@@ -120,7 +139,11 @@ def setup_logging(
     # Console handler
     if console:
         console_handler = logging.StreamHandler(sys.stderr)
-        console_handler.setFormatter(ConsoleFormatter())
+        if cloud_json:
+            # JSON to stderr — Cloud Logging auto-parses severity + fields
+            console_handler.setFormatter(JSONFormatter(cloud_logging=True))
+        else:
+            console_handler.setFormatter(ConsoleFormatter())
         root_logger.addHandler(console_handler)
     
     # File handler

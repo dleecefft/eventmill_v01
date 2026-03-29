@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import cmd
 import os
+import signal
 import sys
 from pathlib import Path
 from typing import Any
@@ -613,11 +614,21 @@ def main() -> None:
     )
     log_file = workspace / "logs" / "eventmill.log"
     
+    # Cloud Run sets K_SERVICE env var — use JSON logging for Cloud Logging
+    is_cloud_run = os.environ.get("K_SERVICE") is not None
+    
     setup_logging(
         log_level=log_level,
         log_file=log_file,
         console=True,
+        cloud_json=is_cloud_run,
     )
+    
+    # Gracefully handle SIGHUP (signal 1) — sent by ttyd when a browser
+    # tab closes or Cloud Run manages instance lifecycle. Without this,
+    # the Python process crashes with "Uncaught signal: 1".
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, lambda signum, frame: sys.exit(0))
     
     try:
         shell = EventMillShell()
