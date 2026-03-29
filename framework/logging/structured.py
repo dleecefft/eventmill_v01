@@ -204,26 +204,13 @@ def setup_logging(
         activity_handler.setFormatter(ActivityJSONFormatter(cloud_logging=False))
         _activity_logger.addHandler(activity_handler)
     
-    # In Cloud Run, use Google Cloud Logging client to send activity logs
-    # directly to Cloud Logging API (bypasses stdout/stderr)
+    # In Cloud Run, activity logs go to stdout as JSON for Cloud Logging
+    # Cloud Logging automatically parses JSON from stdout/stderr
+    # We use stdout to keep activity logs separate from error output
     if cloud_json:
-        try:
-            import google.cloud.logging
-            from google.cloud.logging.handlers import CloudLoggingHandler
-            
-            client = google.cloud.logging.Client()
-            cloud_handler = CloudLoggingHandler(
-                client,
-                name="eventmill-activity",
-            )
-            cloud_handler.setFormatter(ActivityJSONFormatter(cloud_logging=True))
-            _activity_logger.addHandler(cloud_handler)
-        except ImportError:
-            # Fallback: if google-cloud-logging not installed, use stdout
-            # (will appear on console but also in Cloud Logging)
-            activity_cloud = logging.StreamHandler(sys.stdout)
-            activity_cloud.setFormatter(ActivityJSONFormatter(cloud_logging=True))
-            _activity_logger.addHandler(activity_cloud)
+        activity_cloud = logging.StreamHandler(sys.stdout)
+        activity_cloud.setFormatter(ActivityJSONFormatter(cloud_logging=True))
+        _activity_logger.addHandler(activity_cloud)
     
     # Generate user ID for this session
     _user_id = os.environ.get("EVENTMILL_USER_ID", f"user_{uuid.uuid4().hex[:8]}")
