@@ -54,10 +54,10 @@ COPY --chown=eventmill:eventmill framework/ ./framework/
 COPY --chown=eventmill:eventmill plugins/ ./plugins/
 COPY --chown=eventmill:eventmill pyproject.toml README.md ./
 
-# Create workspace and credentials directories
+# Create workspace directory
+# Note: GCS access uses workload identity (no credentials file needed)
 RUN mkdir -p /app/workspace/sessions /app/workspace/artifacts /app/workspace/logs \
-    && mkdir -p /app/credentials \
-    && chown -R eventmill:eventmill /app/workspace /app/credentials
+    && chown -R eventmill:eventmill /app/workspace
 
 # Switch to non-privileged user
 USER eventmill

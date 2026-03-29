@@ -104,7 +104,6 @@ gcloud builds submit \
 |------|---------|
 | `provision-gcp-project.sh` | **Run first** — enables APIs, creates SA, bucket, secrets |
 | `provision-secrets.sh` | Interactive — sets real values for Secret Manager entries |
-| `create-gcs-sa-key.sh` | Generates and uploads GCS service account key to Secret Manager |
 | `setup-deploy-server.sh` | One-time bootstrap for the Linux deploy server |
 | `Dockerfile.cloudrun` | Multi-stage container image with ttyd + eventmill |
 | `deploy-cloudrun.sh` | Basic Cloud Run deploy (env var secrets) |
@@ -176,40 +175,20 @@ echo -n "analyst" | gcloud secrets versions add eventmill-ttyd-user --data-file=
 echo -n "strong-password" | gcloud secrets versions add eventmill-ttyd-cred --data-file=-
 ```
 
-### GCS Service Account Key
+### GCS Access (Workload Identity)
 
-The `eventmill-gcs-sa` secret stores a JSON key for the `eventmill-runner`
-service account. This key is mounted at `/app/credentials/sa-key.json` in
-Cloud Run and used for GCS bucket access.
+Cloud Run uses **workload identity** for GCS access — no service account key
+file is needed. The deploy script assigns the `eventmill-runner` service
+account to the Cloud Run service via `--service-account`, and GCP's metadata
+server provides credentials automatically.
 
-**Generate and upload the key using the helper script:**
+This approach:
+- Complies with org policies that disable SA key creation (`constraints/iam.disableServiceAccountKeyCreation`)
+- Eliminates the risk of leaked key files
+- Requires no secret rotation for GCS access
 
-```bash
-export GOOGLE_CLOUD_PROJECT="your-project-id"
-bash cloud_install/create-gcs-sa-key.sh
-```
-
-This script:
-1. Verifies the service account and secret exist
-2. Generates a new JSON key for `eventmill-runner@PROJECT.iam.gserviceaccount.com`
-3. Uploads the key to Secret Manager (`eventmill-gcs-sa`)
-4. Deletes the local key file (security best practice)
-
-**Or manually:**
-
-```bash
-# Generate key
-gcloud iam service-accounts keys create /tmp/sa-key.json \
-    --iam-account=eventmill-runner@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com
-
-# Upload to Secret Manager
-gcloud secrets versions add eventmill-gcs-sa \
-    --project=${GOOGLE_CLOUD_PROJECT} \
-    --data-file=/tmp/sa-key.json
-
-# Delete local copy
-rm /tmp/sa-key.json
-```
+The `eventmill-runner` service account is granted `roles/storage.objectUser`
+by `provision-gcp-project.sh`, which allows read/write access to the GCS bucket.
 
 ## Local Image Testing (on deploy server)
 
@@ -229,7 +208,6 @@ docker compose -f cloud_install/docker-compose.cloudrun.yml up --build
 | `GCS_LOG_BUCKET` | No | GCS bucket for log artifact storage |
 | `EVENTMILL_SECRET_GEMINI_FLASH` | No | Secret Manager name for Flash API key |
 | `EVENTMILL_SECRET_GEMINI_PRO` | No | Secret Manager name for Pro API key |
-| `EVENTMILL_SECRET_GCS_SA` | No | Secret Manager name for GCS SA key |
 | `EVENTMILL_SECRET_TTYD_USER` | No | Secret Manager name for ttyd username |
 | `EVENTMILL_SECRET_TTYD_CRED` | No | Secret Manager name for ttyd password |
 | `EVENTMILL_LOG_LEVEL` | No | Logging level (default: `INFO`) |
@@ -240,7 +218,7 @@ docker compose -f cloud_install/docker-compose.cloudrun.yml up --build
 |----------|-------------|
 | `GEMINI_FLASH_API_KEY` | Gemini Flash API key — light tier (injected from Secret Manager) |
 | `GEMINI_PRO_API_KEY` | Gemini Pro API key — heavy tier (injected from Secret Manager) |
-| `ANTHROPIC_API_KEY` | Anthropic API key (alternative LLM) |
+| `ANTHROPIC_API_KEY` | Anthropic API key (alternative LLM, optional) |
 | `TTYD_USERNAME` | ttyd basic auth username |
 | `TTYD_PASSWORD` | ttyd basic auth password |
-| `GOOGLE_APPLICATION_CREDENTIALS` | Path to GCS service account JSON |
+| `GCS_LOG_BUCKET` | GCS bucket name for log artifact storage |

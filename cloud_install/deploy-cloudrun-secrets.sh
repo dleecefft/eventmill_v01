@@ -27,9 +27,12 @@ GCS_LOG_BUCKET="${GCS_LOG_BUCKET:-digevtrecintake}"
 # Dual Gemini keys isolate quota between light (Flash) and heavy (Pro) tiers
 SECRET_GEMINI_FLASH="${EVENTMILL_SECRET_GEMINI_FLASH:-eventmill-gemini-flash-api}"
 SECRET_GEMINI_PRO="${EVENTMILL_SECRET_GEMINI_PRO:-eventmill-gemini-pro-api}"
-SECRET_GCS_SA="${EVENTMILL_SECRET_GCS_SA:-eventmill-gcs-sa}"
 SECRET_TTYD_USER="${EVENTMILL_SECRET_TTYD_USER:-eventmill-ttyd-user}"
 SECRET_TTYD_CRED="${EVENTMILL_SECRET_TTYD_CRED:-eventmill-ttyd-cred}"
+
+# Service account for Cloud Run (uses workload identity, no key file needed)
+SA_NAME="eventmill-runner"
+SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
 
 echo "⚙ Event Mill v0.1.0 - Cloud Run Deployment (Secret Manager)"
 echo "============================================================="
@@ -40,9 +43,11 @@ echo ""
 echo "🔐 Using secrets:"
 echo "   - ${SECRET_GEMINI_FLASH} (Gemini Flash API Key — light tier)"
 echo "   - ${SECRET_GEMINI_PRO} (Gemini Pro API Key — heavy tier)"
-echo "   - ${SECRET_GCS_SA} (GCS Service Account)"
 echo "   - ${SECRET_TTYD_USER} (ttyd username)"
 echo "   - ${SECRET_TTYD_CRED} (ttyd password)"
+echo ""
+echo "👤 Service Account: ${SA_EMAIL}"
+echo "   (GCS access via workload identity — no key file needed)"
 echo ""
 echo "📦 GCS Bucket: ${GCS_LOG_BUCKET}"
 echo ""
@@ -85,7 +90,6 @@ grant_secret_access() {
 
 grant_secret_access "${SECRET_GEMINI_FLASH}"
 grant_secret_access "${SECRET_GEMINI_PRO}"
-grant_secret_access "${SECRET_GCS_SA}"
 grant_secret_access "${SECRET_TTYD_USER}"
 grant_secret_access "${SECRET_TTYD_CRED}"
 
@@ -127,8 +131,9 @@ gcloud run deploy "${SERVICE_NAME}" \
     --max-instances=3 \
     --timeout=3600 \
     --concurrency=10 \
-    --set-secrets="GEMINI_FLASH_API_KEY=${SECRET_GEMINI_FLASH}:latest,GEMINI_PRO_API_KEY=${SECRET_GEMINI_PRO}:latest,/app/credentials/sa-key.json=${SECRET_GCS_SA}:latest,TTYD_USERNAME=${SECRET_TTYD_USER}:latest,TTYD_PASSWORD=${SECRET_TTYD_CRED}:latest" \
-    --set-env-vars="GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/sa-key.json,GCS_LOG_BUCKET=${GCS_LOG_BUCKET},EVENTMILL_LOG_LEVEL=${EVENTMILL_LOG_LEVEL:-INFO}" \
+    --service-account="${SA_EMAIL}" \
+    --set-secrets="GEMINI_FLASH_API_KEY=${SECRET_GEMINI_FLASH}:latest,GEMINI_PRO_API_KEY=${SECRET_GEMINI_PRO}:latest,TTYD_USERNAME=${SECRET_TTYD_USER}:latest,TTYD_PASSWORD=${SECRET_TTYD_CRED}:latest" \
+    --set-env-vars="GCS_LOG_BUCKET=${GCS_LOG_BUCKET},EVENTMILL_LOG_LEVEL=${EVENTMILL_LOG_LEVEL:-INFO}" \
     --allow-unauthenticated
 
 # Note: For authenticated access, replace --allow-unauthenticated with:
@@ -155,11 +160,13 @@ echo "🌐 Event Mill is available at:"
 echo "   ${SERVICE_URL}"
 echo ""
 echo "🔐 Secrets configured:"
-echo "   - GEMINI_FLASH_API_KEY         <- ${SECRET_GEMINI_FLASH}"
-echo "   - GEMINI_PRO_API_KEY           <- ${SECRET_GEMINI_PRO}"
-echo "   - /app/credentials/sa-key.json <- ${SECRET_GCS_SA}"
-echo "   - TTYD_USERNAME               <- ${SECRET_TTYD_USER}"
-echo "   - TTYD_PASSWORD               <- ${SECRET_TTYD_CRED}"
+echo "   - GEMINI_FLASH_API_KEY <- ${SECRET_GEMINI_FLASH}"
+echo "   - GEMINI_PRO_API_KEY   <- ${SECRET_GEMINI_PRO}"
+echo "   - TTYD_USERNAME        <- ${SECRET_TTYD_USER}"
+echo "   - TTYD_PASSWORD        <- ${SECRET_TTYD_CRED}"
+echo ""
+echo "👤 Service Account: ${SA_EMAIL}"
+echo "   (GCS access via workload identity — no key file needed)"
 echo ""
 echo "📦 Environment:"
 echo "   - GCS_LOG_BUCKET = ${GCS_LOG_BUCKET}"
@@ -168,4 +175,3 @@ echo ""
 echo "📋 To update a secret:"
 echo "   echo -n 'new-key' | gcloud secrets versions add ${SECRET_GEMINI_FLASH} --data-file=-"
 echo "   echo -n 'new-key' | gcloud secrets versions add ${SECRET_GEMINI_PRO} --data-file=-"
-echo "   gcloud secrets versions add ${SECRET_GCS_SA} --data-file=/path/to/new-sa.json"
