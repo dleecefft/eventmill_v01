@@ -39,9 +39,6 @@ REGION="${CLOUD_RUN_REGION:-northamerica-northeast2}"
 # Must be globally unique across all of GCP
 GCS_LOG_BUCKET="${GCS_LOG_BUCKET:-digevtrecintake}"
 
-# CHANGE THIS: GCS bucket location (should match or be near REGION)
-GCS_BUCKET_LOCATION="${GCS_BUCKET_LOCATION:-northamerica-northeast2}"
-
 # Service account name for Event Mill (usually no change needed)
 SA_NAME="eventmill-runner"
 SA_DISPLAY_NAME="Event Mill Cloud Run Service Account"
@@ -243,7 +240,7 @@ if gsutil ls -b "gs://${GCS_LOG_BUCKET}" > /dev/null 2>&1; then
 else
     gsutil mb \
         -p "${PROJECT_ID}" \
-        -l "${GCS_BUCKET_LOCATION}" \
+        -l "${REGION}" \
         -b on \
         "gs://${GCS_LOG_BUCKET}"
     echo "   ✓ Created bucket: gs://${GCS_LOG_BUCKET}"
