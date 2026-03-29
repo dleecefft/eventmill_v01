@@ -29,6 +29,7 @@ class Session:
     created_at: datetime
     updated_at: datetime
     active_pillar: str | None = None
+    workspace_folder: str | None = None
     description: str = ""
     
     def to_dict(self) -> dict[str, Any]:
@@ -37,6 +38,7 @@ class Session:
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "active_pillar": self.active_pillar,
+            "workspace_folder": self.workspace_folder,
             "description": self.description,
         }
     
@@ -47,6 +49,7 @@ class Session:
             created_at=datetime.fromisoformat(data["created_at"]),
             updated_at=datetime.fromisoformat(data["updated_at"]),
             active_pillar=data.get("active_pillar"),
+            workspace_folder=data.get("workspace_folder"),
             description=data.get("description", ""),
         )
 

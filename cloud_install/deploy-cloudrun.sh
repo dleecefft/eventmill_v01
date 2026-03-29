@@ -68,6 +68,7 @@ gcloud run deploy "${SERVICE_NAME}" \
     --set-env-vars="GEMINI_FLASH_API_KEY=${GEMINI_FLASH_API_KEY:-}" \
     --set-env-vars="GEMINI_PRO_API_KEY=${GEMINI_PRO_API_KEY:-}" \
     --set-env-vars="ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}" \
+    --set-env-vars="EVENTMILL_BUCKET_PREFIX=${EVENTMILL_BUCKET_PREFIX:-eventmill}" \
     --set-env-vars="GCS_LOG_BUCKET=${GCS_LOG_BUCKET:-}" \
     --set-env-vars="EVENTMILL_LOG_LEVEL=${EVENTMILL_LOG_LEVEL:-INFO}" \
     --set-env-vars="TTYD_USERNAME=${TTYD_USERNAME:-admin}" \

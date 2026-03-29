@@ -20,8 +20,11 @@ REGION="${CLOUD_RUN_REGION:-northamerica-northeast2}"
 SERVICE_NAME="event-mill"
 IMAGE_NAME="${REGION}-docker.pkg.dev/${PROJECT_ID}/eventmill/${SERVICE_NAME}"
 
-# GCS bucket for log artifact storage
-GCS_LOG_BUCKET="${GCS_LOG_BUCKET:-digevtrecintake}"
+# Storage bucket prefix (pillar-based isolation)
+BUCKET_PREFIX="${EVENTMILL_BUCKET_PREFIX:-eventmill}"
+
+# Legacy single-bucket override (backward compatibility)
+GCS_LOG_BUCKET="${GCS_LOG_BUCKET:-}"
 
 # Secret names (pre-created in GCP Console or via gcloud)
 # Dual Gemini keys isolate quota between light (Flash) and heavy (Pro) tiers
@@ -49,7 +52,7 @@ echo ""
 echo "👤 Service Account: ${SA_EMAIL}"
 echo "   (GCS access via workload identity — no key file needed)"
 echo ""
-echo "📦 GCS Bucket: ${GCS_LOG_BUCKET}"
+echo "📦 Bucket prefix: ${BUCKET_PREFIX}"
 echo ""
 
 if [ "${PROJECT_ID}" = "your-project-id" ]; then
@@ -133,7 +136,7 @@ gcloud run deploy "${SERVICE_NAME}" \
     --concurrency=10 \
     --service-account="${SA_EMAIL}" \
     --set-secrets="GEMINI_FLASH_API_KEY=${SECRET_GEMINI_FLASH}:latest,GEMINI_PRO_API_KEY=${SECRET_GEMINI_PRO}:latest,TTYD_USERNAME=${SECRET_TTYD_USER}:latest,TTYD_PASSWORD=${SECRET_TTYD_CRED}:latest" \
-    --set-env-vars="GCS_LOG_BUCKET=${GCS_LOG_BUCKET},EVENTMILL_LOG_LEVEL=${EVENTMILL_LOG_LEVEL:-INFO}" \
+    --set-env-vars="EVENTMILL_BUCKET_PREFIX=${BUCKET_PREFIX},GCS_LOG_BUCKET=${GCS_LOG_BUCKET},EVENTMILL_LOG_LEVEL=${EVENTMILL_LOG_LEVEL:-INFO}" \
     --allow-unauthenticated
 
 # Note: For authenticated access, replace --allow-unauthenticated with:
@@ -169,8 +172,14 @@ echo "👤 Service Account: ${SA_EMAIL}"
 echo "   (GCS access via workload identity — no key file needed)"
 echo ""
 echo "📦 Environment:"
-echo "   - GCS_LOG_BUCKET = ${GCS_LOG_BUCKET}"
+echo "   - EVENTMILL_BUCKET_PREFIX = ${BUCKET_PREFIX}"
 echo "   - Region = ${REGION}"
+echo ""
+echo "📂 Storage buckets:"
+echo "   gs://${BUCKET_PREFIX}-log-analysis"
+echo "   gs://${BUCKET_PREFIX}-network-forensics"
+echo "   gs://${BUCKET_PREFIX}-threat-modeling"
+echo "   gs://${BUCKET_PREFIX}-common"
 echo ""
 echo "📋 To update a secret:"
 echo "   echo -n 'new-key' | gcloud secrets versions add ${SECRET_GEMINI_FLASH} --data-file=-"

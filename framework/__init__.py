@@ -35,7 +35,14 @@ from .session import (
 )
 from .artifacts import ArtifactRegistry, create_artifact_registration_callback
 from .routing import Router, RouterConfig, RoutingResult, RoutingScore
-from .cloud import ConfigProvider, SecretProvider, StorageBackend
+from .cloud import (
+    ConfigProvider,
+    ResolvedPath,
+    SecretProvider,
+    StorageBackend,
+    StorageResolver,
+    StorageResolverConfig,
+)
 
 __all__ = [
     # Version
@@ -73,6 +80,9 @@ __all__ = [
     "RoutingScore",
     # Cloud
     "ConfigProvider",
+    "ResolvedPath",
     "SecretProvider",
     "StorageBackend",
+    "StorageResolver",
+    "StorageResolverConfig",
 ]

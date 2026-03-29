@@ -35,9 +35,13 @@ PROJECT_ID="${GOOGLE_CLOUD_PROJECT:-your-project-id}"
 # See https://cloud.google.com/run/docs/locations for available regions
 REGION="${CLOUD_RUN_REGION:-northamerica-northeast2}"
 
-# CHANGE THIS: GCS bucket name for log artifact storage
-# Must be globally unique across all of GCP
-GCS_LOG_BUCKET="${GCS_LOG_BUCKET:-digevtrecintake}"
+# CHANGE THIS: Bucket prefix for Event Mill storage
+# Convention: {prefix}-{pillar-slug} and {prefix}-common
+# All bucket names must be globally unique across all of GCP
+BUCKET_PREFIX="${EVENTMILL_BUCKET_PREFIX:-eventmill}"
+
+# Legacy single-bucket override (backward compatibility)
+GCS_LOG_BUCKET="${GCS_LOG_BUCKET:-}"
 
 # Service account name for Event Mill (usually no change needed)
 SA_NAME="eventmill-runner"
@@ -50,13 +54,22 @@ SERVICE_NAME="event-mill"
 # Preflight checks
 # ---------------------------------------------------------------------------
 
-echo "⚙ Event Mill v0.1.0 — GCP Project Provisioning"
+echo "⚙ Event Mill v0.2.0 — GCP Project Provisioning"
 echo "================================================="
 echo ""
-echo "Project:  ${PROJECT_ID}"
-echo "Region:   ${REGION}"
-echo "Bucket:   ${GCS_LOG_BUCKET}"
-echo "SA:       ${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+echo "Project:        ${PROJECT_ID}"
+echo "Region:         ${REGION}"
+echo "Bucket prefix:  ${BUCKET_PREFIX}"
+echo "SA:             ${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+echo ""
+echo "Buckets to create:"
+echo "   ${BUCKET_PREFIX}-log-analysis"
+echo "   ${BUCKET_PREFIX}-network-forensics"
+echo "   ${BUCKET_PREFIX}-threat-modeling"
+echo "   ${BUCKET_PREFIX}-common"
+if [ -n "${GCS_LOG_BUCKET}" ]; then
+    echo "   (legacy override: ${GCS_LOG_BUCKET} → log-analysis)"
+fi
 echo ""
 
 if [ "${PROJECT_ID}" = "your-project-id" ]; then
@@ -226,30 +239,31 @@ echo "   ✓ roles/iam.serviceAccountUser on ${SA_NAME}"
 echo ""
 
 # =============================================================================
-# Section 4: GCS Bucket for Log Artifacts
+# Section 4: GCS Buckets for Investigation Data
 # =============================================================================
-# Event Mill reads log files and investigation artifacts from GCS.
-# This bucket stores the exported event records that analysts investigate.
+# Event Mill uses per-pillar buckets for data isolation plus a shared
+# common bucket for cross-pillar reference data (e.g. vetted threat intel).
+#
+# Naming convention:
+#   {BUCKET_PREFIX}-log-analysis
+#   {BUCKET_PREFIX}-network-forensics
+#   {BUCKET_PREFIX}-threat-modeling
+#   {BUCKET_PREFIX}-common
+#
+# Disabled pillars (cloud_investigation, risk_assessment) do not get
+# buckets until they are enabled.  Add them here when ready.
+#
+# Automated ingestion systems write to the appropriate pillar bucket.
+# Which automations write to which buckets is site-specific and managed
+# by the implementation team outside of Event Mill.
 # =============================================================================
 
-echo "📦 Section 4: Creating GCS bucket for log artifacts..."
+echo "📦 Section 4: Creating GCS buckets for investigation data..."
 echo ""
 
-if gsutil ls -b "gs://${GCS_LOG_BUCKET}" > /dev/null 2>&1; then
-    echo "   ✓ Bucket already exists: gs://${GCS_LOG_BUCKET}"
-else
-    gsutil mb \
-        -p "${PROJECT_ID}" \
-        -l "${REGION}" \
-        -b on \
-        "gs://${GCS_LOG_BUCKET}"
-    echo "   ✓ Created bucket: gs://${GCS_LOG_BUCKET}"
-fi
-
-# Set lifecycle rule: auto-delete objects older than 90 days (optional)
-# CHANGE THIS: Adjust retention period or remove this block if not needed
-echo "   Setting 90-day lifecycle rule (auto-delete old artifacts)..."
-cat > /tmp/eventmill-lifecycle.json <<'LIFECYCLE'
+# Lifecycle rule JSON (shared across all pillar buckets)
+# CHANGE THIS: Adjust retention period per bucket if needed
+cat > /tmp/eventmill-lifecycle-90d.json <<'LIFECYCLE'
 {
   "rule": [
     {
@@ -259,8 +273,55 @@ cat > /tmp/eventmill-lifecycle.json <<'LIFECYCLE'
   ]
 }
 LIFECYCLE
-gsutil lifecycle set /tmp/eventmill-lifecycle.json "gs://${GCS_LOG_BUCKET}" > /dev/null 2>&1
-echo "   ✓ Lifecycle rule set (90-day auto-delete)"
+
+# Common bucket gets longer retention (reference data is curated)
+cat > /tmp/eventmill-lifecycle-365d.json <<'LIFECYCLE'
+{
+  "rule": [
+    {
+      "action": {"type": "Delete"},
+      "condition": {"age": 365}
+    }
+  ]
+}
+LIFECYCLE
+
+create_bucket_if_missing() {
+    local bucket_name=$1
+    local lifecycle_file=$2
+    local description=$3
+
+    if gsutil ls -b "gs://${bucket_name}" > /dev/null 2>&1; then
+        echo "   ✓ Bucket already exists: gs://${bucket_name}"
+    else
+        gsutil mb \
+            -p "${PROJECT_ID}" \
+            -l "${REGION}" \
+            -b on \
+            "gs://${bucket_name}"
+        echo "   ✓ Created bucket: gs://${bucket_name}  (${description})"
+    fi
+
+    # Apply lifecycle rule
+    gsutil lifecycle set "${lifecycle_file}" "gs://${bucket_name}" > /dev/null 2>&1
+}
+
+# Per-pillar buckets (MVP-enabled pillars only)
+create_bucket_if_missing "${BUCKET_PREFIX}-log-analysis"       /tmp/eventmill-lifecycle-90d.json  "log analysis artifacts"
+create_bucket_if_missing "${BUCKET_PREFIX}-network-forensics"  /tmp/eventmill-lifecycle-90d.json  "network forensics artifacts"
+create_bucket_if_missing "${BUCKET_PREFIX}-threat-modeling"    /tmp/eventmill-lifecycle-90d.json  "threat modeling artifacts"
+
+# Common/shared bucket (longer retention for curated reference data)
+create_bucket_if_missing "${BUCKET_PREFIX}-common"             /tmp/eventmill-lifecycle-365d.json "shared cross-pillar data"
+
+# Legacy single-bucket support: if GCS_LOG_BUCKET is set and different
+# from the new convention, create it too for backward compatibility
+if [ -n "${GCS_LOG_BUCKET}" ] && [ "${GCS_LOG_BUCKET}" != "${BUCKET_PREFIX}-log-analysis" ]; then
+    echo ""
+    echo "   Legacy bucket override detected: ${GCS_LOG_BUCKET}"
+    create_bucket_if_missing "${GCS_LOG_BUCKET}" /tmp/eventmill-lifecycle-90d.json "legacy log bucket"
+fi
+
 echo ""
 
 # =============================================================================
@@ -392,8 +453,14 @@ echo ""
 echo "Project:          ${PROJECT_ID}"
 echo "Region:           ${REGION}"
 echo "Service Account:  ${SA_EMAIL}"
-echo "GCS Bucket:       gs://${GCS_LOG_BUCKET}"
+echo "Bucket prefix:    ${BUCKET_PREFIX}"
 echo "Artifact Reg:     ${REGION}-docker.pkg.dev/${PROJECT_ID}/eventmill"
+echo ""
+echo "Storage buckets:"
+echo "   gs://${BUCKET_PREFIX}-log-analysis         (log analysis)"
+echo "   gs://${BUCKET_PREFIX}-network-forensics    (network forensics)"
+echo "   gs://${BUCKET_PREFIX}-threat-modeling       (threat modeling)"
+echo "   gs://${BUCKET_PREFIX}-common                (shared reference data)"
 echo ""
 echo "Secrets created (placeholder values):"
 echo "   - eventmill-gemini-flash-api  (Flash / light tier)"
@@ -410,9 +477,14 @@ echo "  1. Add real secret values:"
 echo "     bash cloud_install/provision-secrets.sh"
 echo ""
 echo "  2. Deploy Event Mill:"
-echo "     source ~/.eventmill/deploy.env"
+echo "     export EVENTMILL_BUCKET_PREFIX=${BUCKET_PREFIX}"
 echo "     bash cloud_install/deploy-cloudrun-secrets.sh"
 echo ""
-echo "  3. Upload log files for analysis:"
-echo "     gsutil cp /path/to/logs/*.log gs://${GCS_LOG_BUCKET}/"
+echo "  3. Upload files to the appropriate pillar bucket:"
+echo "     gsutil cp /path/to/logs/*.log gs://${BUCKET_PREFIX}-log-analysis/"
+echo "     gsutil cp /path/to/pcaps/*.pcap gs://${BUCKET_PREFIX}-network-forensics/"
+echo "     gsutil cp /path/to/threat-intel/*.json gs://${BUCKET_PREFIX}-common/"
+echo ""
+echo "  4. Use workspace folders to organize by incident:"
+echo "     gsutil cp /path/to/logs/*.log gs://${BUCKET_PREFIX}-log-analysis/incident-2024-03/"
 echo ""

@@ -22,6 +22,7 @@ from ..routing.router import Router, RouterConfig
 from ..artifacts.registry import ArtifactRegistry, create_artifact_registration_callback
 from ..llm.client import MCPLLMClient, ContextBuilder
 from ..plugins.protocol import ExecutionContext, ReferenceDataView
+from ..cloud.resolver import StorageResolver, StorageResolverConfig, create_local_resolver
 
 logger = get_logger("cli")
 
@@ -68,6 +69,19 @@ class EventMillShell(cmd.Cmd):
         self.router: Router | None = None
         self.artifact_registry: ArtifactRegistry | None = None
         self.context_builder = ContextBuilder()
+        
+        # Initialize storage resolver
+        # In Cloud Run (K_SERVICE set), use GCS resolver; otherwise local
+        if os.environ.get("K_SERVICE"):
+            try:
+                from ..cloud.resolver import create_gcs_resolver
+                self.storage_resolver: StorageResolver | None = create_gcs_resolver()
+            except Exception as e:
+                logger.warning("Failed to create GCS resolver: %s", e)
+                self.storage_resolver = None
+        else:
+            storage_base = self.workspace_path / "storage"
+            self.storage_resolver = create_local_resolver(base_path=storage_base)
         
         # Discover plugins and track stats for startup summary
         discovered = self.plugin_loader.discover_all()
@@ -136,7 +150,11 @@ class EventMillShell(cmd.Cmd):
         session = self.session_manager.get_current_session()
         if session:
             pillar = session.active_pillar or "no-pillar"
-            self.prompt = f"eventmill ({pillar}) > "
+            workspace = session.workspace_folder
+            if workspace:
+                self.prompt = f"eventmill ({pillar}:{workspace}) > "
+            else:
+                self.prompt = f"eventmill ({pillar}) > "
         else:
             self.prompt = "eventmill > "
     
@@ -345,13 +363,117 @@ class EventMillShell(cmd.Cmd):
         self._update_prompt()
     
     # -------------------------------------------------------------------
+    # Workspace Commands
+    # -------------------------------------------------------------------
+    
+    def do_workspace(self, arg: str) -> None:
+        """Set or show the active workspace folder.
+        
+        The workspace folder scopes file resolution to a subfolder within
+        each storage bucket (e.g. an incident identifier).
+        
+        Usage:
+            workspace                  — show current workspace
+            workspace <folder_name>    — set workspace folder
+            workspace clear            — clear workspace folder
+        """
+        if not self.session_manager.get_current_session():
+            print("  No active session. Use 'new' to create one.")
+            return
+        
+        folder = arg.strip()
+        
+        if not folder:
+            # Show current workspace
+            session = self.session_manager.get_current_session()
+            if session.workspace_folder:
+                print(f"  Workspace: {session.workspace_folder}")
+            else:
+                print("  No workspace folder set.")
+                print("  Usage: workspace <folder_name>  (e.g. workspace incident-2024-03)")
+            return
+        
+        if folder == "clear":
+            self.session_manager.set_workspace(None)
+            log_user_activity("clear_workspace")
+            print("  Workspace folder cleared.")
+        else:
+            self.session_manager.set_workspace(folder)
+            log_user_activity("set_workspace", {"workspace_folder": folder})
+            print(f"  Workspace set to: {folder}")
+        
+        self._update_prompt()
+    
+    def do_buckets(self, arg: str) -> None:
+        """Show configured storage buckets.
+        
+        Usage: buckets
+        """
+        if not self.storage_resolver:
+            print("  Storage resolver not initialized.")
+            return
+        
+        buckets = self.storage_resolver.describe_buckets()
+        
+        print(f"  {'Pillar':25s} {'Bucket':40s} Type")
+        print(f"  {'─' * 25} {'─' * 40} {'─' * 10}")
+        
+        for b in buckets:
+            print(f"  {b['pillar']:25s} {b['bucket']:40s} {b['type']}")
+    
+    def do_files(self, arg: str) -> None:
+        """List files available in the current pillar's storage.
+        
+        Shows files from both the pillar bucket and the common bucket.
+        If a workspace folder is set, lists files within that folder.
+        
+        Usage: files
+        """
+        session = self.session_manager.get_current_session()
+        if not session:
+            print("  No active session. Use 'new' to create one.")
+            return
+        
+        if not session.active_pillar:
+            print("  No pillar selected. Use 'pillar <name>' first.")
+            return
+        
+        if not self.storage_resolver:
+            print("  Storage resolver not initialized.")
+            return
+        
+        files = self.storage_resolver.list_workspace(
+            pillar=session.active_pillar,
+            workspace_folder=session.workspace_folder,
+        )
+        
+        if not files:
+            location = session.active_pillar
+            if session.workspace_folder:
+                location += f"/{session.workspace_folder}"
+            print(f"  No files found in {location} or common bucket.")
+            return
+        
+        print(f"  {'Filename':40s} {'Source':10s} Path")
+        print(f"  {'─' * 40} {'─' * 10} {'─' * 40}")
+        
+        for f in files:
+            print(f"  {f['filename']:40s} {f['source']:10s} {f['object_path']}")
+    
+    # -------------------------------------------------------------------
     # Artifact Commands
     # -------------------------------------------------------------------
     
     def do_load(self, arg: str) -> None:
         """Load an artifact file into the current session.
         
-        Usage: load <file_path> [artifact_type]
+        Usage: load <file_path_or_name> [artifact_type]
+        
+        Resolution order:
+          1. Local file path (if exists on disk)
+          2. Explicit gs:// URI
+          3. Pillar bucket (workspace folder, then root)
+          4. Common bucket (workspace folder, then root)
         
         Supported types: pcap, json_events, log_stream, risk_model,
         cloud_audit_log, pdf_report, html_report, image, text
@@ -362,17 +484,66 @@ class EventMillShell(cmd.Cmd):
         
         parts = arg.strip().split(maxsplit=1)
         if not parts:
-            print("  Usage: load <file_path> [artifact_type]")
+            print("  Usage: load <file_path_or_name> [artifact_type]")
             return
         
-        file_path = Path(parts[0])
-        if not file_path.exists():
-            print(f"  File not found: {file_path}")
+        file_ref = parts[0]
+        file_path = Path(file_ref)
+        
+        # Try local file first
+        if file_path.exists():
+            artifact_type = parts[1] if len(parts) > 1 else self._infer_artifact_type(file_path)
+            self._register_local_artifact(file_path, artifact_type)
             return
         
-        # Infer or use specified artifact type
-        artifact_type = parts[1] if len(parts) > 1 else self._infer_artifact_type(file_path)
+        # Try storage resolver (gs:// URI or filename lookup in buckets)
+        session = self.session_manager.get_current_session()
+        if self.storage_resolver and session.active_pillar:
+            explicit = file_ref if file_ref.startswith("gs://") else None
+            filename = file_ref if not explicit else None
+            
+            resolved = self.storage_resolver.resolve(
+                filename=filename or "",
+                pillar=session.active_pillar,
+                workspace_folder=session.workspace_folder,
+                explicit_path=explicit,
+            )
+            
+            if resolved:
+                # Download to local workspace for tool access
+                local_dest = (
+                    self.workspace_path / "artifacts"
+                    / session.session_id
+                    / (resolved.object_path.rsplit("/", 1)[-1] if "/" in resolved.object_path else resolved.object_path)
+                )
+                local_dest.parent.mkdir(parents=True, exist_ok=True)
+                
+                try:
+                    self.storage_resolver.download(resolved, local_dest)
+                except Exception as e:
+                    print(f"  Failed to download from {resolved.display}: {e}")
+                    return
+                
+                artifact_type = parts[1] if len(parts) > 1 else self._infer_artifact_type(local_dest)
+                self._register_local_artifact(local_dest, artifact_type, source_info=resolved.display)
+                return
         
+        # Nothing found
+        print(f"  File not found: {file_ref}")
+        if session.active_pillar and self.storage_resolver:
+            print(f"  Searched: local path, {session.active_pillar} bucket, common bucket")
+            if session.workspace_folder:
+                print(f"  Workspace: {session.workspace_folder}")
+        else:
+            print("  Tip: set a pillar to enable bucket-based file resolution.")
+    
+    def _register_local_artifact(
+        self,
+        file_path: Path,
+        artifact_type: str,
+        source_info: str | None = None,
+    ) -> None:
+        """Register a local file as an artifact in the current session."""
         artifact = self.session_manager.register_artifact(
             artifact_type=artifact_type,
             file_path=str(file_path.resolve()),
@@ -397,6 +568,8 @@ class EventMillShell(cmd.Cmd):
         print(f"  Loaded artifact: {artifact.artifact_id}")
         print(f"  Type: {artifact_type}")
         print(f"  File: {file_path.name}")
+        if source_info:
+            print(f"  Source: {source_info}")
     
     def do_artifacts(self, arg: str) -> None:
         """List loaded artifacts in the current session.
@@ -654,6 +827,7 @@ class EventMillShell(cmd.Cmd):
         
         print(f"  Session:    {session.session_id}")
         print(f"  Pillar:     {session.active_pillar or '—'}")
+        print(f"  Workspace:  {session.workspace_folder or '—'}")
         print(f"  Artifacts:  {len(artifacts)}")
         print(f"  Executions: {len(executions)} ({completed} completed)")
         print(f"  Created:    {session.created_at.strftime('%Y-%m-%d %H:%M')}")

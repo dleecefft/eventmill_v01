@@ -1,4 +1,4 @@
-# Event Mill v0.1.0 — Cloud Installation Guide
+# Event Mill v0.2.0 — Cloud Installation Guide
 
 Deployment scripts for running Event Mill on Google Cloud Run with a
 [ttyd](https://github.com/tsl0922/ttyd) web terminal frontend.
@@ -125,8 +125,71 @@ bash cloud_install/provision-secrets.sh
 
 This creates everything the project needs: APIs enabled (including
 `apikeys.googleapis.com` for key creation), a dedicated service account
-with least-privilege IAM roles, a GCS bucket with lifecycle rules,
-Artifact Registry, and Secret Manager entries for dual Gemini API keys.
+with least-privilege IAM roles, GCS buckets (per-pillar + common) with
+lifecycle rules, Artifact Registry, and Secret Manager entries for dual
+Gemini API keys.
+
+## Storage Architecture
+
+Event Mill uses **per-pillar GCS buckets** for data isolation plus a shared
+**common bucket** for cross-pillar reference data (e.g. vetted threat intel).
+
+### Naming Convention
+
+```
+{EVENTMILL_BUCKET_PREFIX}-log-analysis         ← log analysis artifacts
+{EVENTMILL_BUCKET_PREFIX}-network-forensics    ← network forensics artifacts
+{EVENTMILL_BUCKET_PREFIX}-threat-modeling       ← threat modeling artifacts
+{EVENTMILL_BUCKET_PREFIX}-common               ← shared reference data
+```
+
+Default prefix: `eventmill`. Set `EVENTMILL_BUCKET_PREFIX` to customise.
+
+### Workspace Folders
+
+Buckets can contain **workspace folders** to separate incidents:
+
+```
+gs://eventmill-log-analysis/
+├── incident-2024-03/
+│   ├── auth.log
+│   └── syslog.log
+├── incident-2024-04/
+│   └── firewall.log
+└── standalone-file.log        ← bucket root (no workspace)
+```
+
+In the CLI, use `workspace incident-2024-03` to scope file resolution.
+The `load` command checks both the pillar bucket and the common bucket.
+
+### File Resolution Order
+
+When a user runs `load auth.log`:
+
+1. Local file path (if exists on disk)
+2. Pillar bucket + workspace folder
+3. Pillar bucket root
+4. Common bucket + workspace folder
+5. Common bucket root
+
+If both pillar and common have the file, **pillar wins** (investigation-specific
+data takes precedence over shared reference data).
+
+### Automated Ingestion
+
+External automations write directly to the appropriate pillar bucket.
+Which automations write to which buckets is **site-specific** and managed
+by the implementation team outside of Event Mill. The common bucket is
+for curated reference data shared across all investigations.
+
+### Per-Pillar Overrides
+
+Override any pillar bucket name via environment variable:
+
+```bash
+export EVENTMILL_BUCKET_LOG_ANALYSIS="my-custom-log-bucket"
+export EVENTMILL_BUCKET_COMMON="my-shared-data"
+```
 
 ### Cloud Build Permissions (default compute SA)
 
@@ -188,7 +251,8 @@ This approach:
 - Requires no secret rotation for GCS access
 
 The `eventmill-runner` service account is granted `roles/storage.objectUser`
-by `provision-gcp-project.sh`, which allows read/write access to the GCS bucket.
+at the project level by `provision-gcp-project.sh`, which allows read/write
+access to all Event Mill GCS buckets (per-pillar and common).
 
 ### Audit Logging (Cloud Logging)
 
@@ -232,7 +296,8 @@ docker compose -f cloud_install/docker-compose.cloudrun.yml up --build
 |----------|----------|-------------|
 | `GOOGLE_CLOUD_PROJECT` | Yes | GCP project ID |
 | `CLOUD_RUN_REGION` | No | Deploy region (default: `northamerica-northeast2`) |
-| `GCS_LOG_BUCKET` | No | GCS bucket for log artifact storage |
+| `EVENTMILL_BUCKET_PREFIX` | No | Bucket naming prefix (default: `eventmill`) |
+| `GCS_LOG_BUCKET` | No | Legacy single-bucket override (backward compat) |
 | `EVENTMILL_SECRET_GEMINI_FLASH` | No | Secret Manager name for Flash API key |
 | `EVENTMILL_SECRET_GEMINI_PRO` | No | Secret Manager name for Pro API key |
 | `EVENTMILL_SECRET_TTYD_USER` | No | Secret Manager name for ttyd username |
@@ -248,4 +313,5 @@ docker compose -f cloud_install/docker-compose.cloudrun.yml up --build
 | `ANTHROPIC_API_KEY` | Anthropic API key (alternative LLM, optional) |
 | `TTYD_USERNAME` | ttyd basic auth username |
 | `TTYD_PASSWORD` | ttyd basic auth password |
-| `GCS_LOG_BUCKET` | GCS bucket name for log artifact storage |
+| `EVENTMILL_BUCKET_PREFIX` | Bucket prefix for pillar-based storage resolution |
+| `GCS_LOG_BUCKET` | Legacy bucket override for log_analysis pillar |
