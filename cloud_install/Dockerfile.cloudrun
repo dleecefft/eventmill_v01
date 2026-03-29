@@ -17,10 +17,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy dependency manifest and install
+# Copy dependency manifest and install with GCP extras
 COPY pyproject.toml README.md ./
 RUN pip install --no-cache-dir build && \
-    pip install --no-cache-dir .
+    pip install --no-cache-dir ".[gcp]"
 
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime
@@ -68,6 +68,11 @@ ENV PORT=8080
 ENV PYTHONUNBUFFERED=1
 ENV EVENTMILL_WORKSPACE=/app/workspace
 ENV EVENTMILL_LOG_LEVEL=INFO
+
+# LLM API keys are injected via Cloud Run secrets (--set-secrets in deploy script):
+#   GEMINI_FLASH_API_KEY - Gemini Flash (light tier, fast/cheap)
+#   GEMINI_PRO_API_KEY   - Gemini Pro (heavy tier, powerful)
+# The shell auto-detects available models from these environment variables.
 
 EXPOSE 8080
 

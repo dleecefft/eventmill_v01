@@ -132,10 +132,10 @@ def setup_logging(
         console: Whether to log to console (stderr).
         json_format: Whether to use JSON format for file logging.
         cloud_json: If True, use JSON format on stderr with 'severity'
-                    field for GCP Cloud Logging auto-parsing. Overrides
-                    the default ConsoleFormatter for console output.
-        console_level: Separate log level for console (defaults to WARNING
-                       in interactive mode to reduce noise).
+                    field for GCP Cloud Logging auto-parsing. User activity
+                    logs always go to stderr in this mode.
+        console_level: Separate log level for console. Defaults to WARNING
+                       to suppress noisy INFO logs from framework internals.
     
     Returns:
         Root Event Mill logger.
@@ -148,18 +148,16 @@ def setup_logging(
     # Remove existing handlers
     root_logger.handlers.clear()
     
-    # Determine console level - suppress INFO logs in interactive mode
-    # unless cloud_json is True (Cloud Run deployment)
+    # Console level for framework logs - always suppress INFO by default
+    # to avoid noisy plugin loading messages. User can override with console_level.
     if console_level:
         effective_console_level = getattr(logging, console_level.upper(), logging.WARNING)
-    elif cloud_json:
-        # Cloud Run: show all logs as JSON
-        effective_console_level = getattr(logging, log_level.upper(), logging.INFO)
     else:
-        # Interactive: suppress INFO, show only WARNING+
+        # Default: suppress INFO, show only WARNING+ on console
+        # (INFO still goes to file for debugging)
         effective_console_level = logging.WARNING
     
-    # Console handler
+    # Console handler for framework logs
     if console:
         console_handler = logging.StreamHandler(sys.stderr)
         console_handler.setLevel(effective_console_level)
@@ -170,7 +168,7 @@ def setup_logging(
             console_handler.setFormatter(ConsoleFormatter())
         root_logger.addHandler(console_handler)
     
-    # File handler - always logs at configured level
+    # File handler - always logs at configured level (captures INFO for debugging)
     if log_file:
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -190,24 +188,42 @@ def setup_logging(
         root_logger.addHandler(file_handler)
     
     # Setup user activity logger (separate from main logger)
-    # This always logs to cloud/file but never to interactive console
+    # Activity logs go to:
+    # - activity.log file (always, for local debugging)
+    # - Google Cloud Logging API directly (in cloud_json mode)
+    #   This bypasses stdout/stderr so activity logs don't clutter the console
     _activity_logger = logging.getLogger("eventmill.activity")
     _activity_logger.setLevel(logging.INFO)
     _activity_logger.handlers.clear()
     _activity_logger.propagate = False  # Don't propagate to root
     
-    # Activity logger goes to file (if configured)
+    # Activity logger goes to file (always, if log_file configured)
     if log_file:
         activity_file = Path(log_file).parent / "activity.log"
         activity_handler = logging.FileHandler(str(activity_file))
         activity_handler.setFormatter(ActivityJSONFormatter(cloud_logging=False))
         _activity_logger.addHandler(activity_handler)
     
-    # In Cloud Run, activity logs go to stderr as JSON
+    # In Cloud Run, use Google Cloud Logging client to send activity logs
+    # directly to Cloud Logging API (bypasses stdout/stderr)
     if cloud_json:
-        activity_console = logging.StreamHandler(sys.stderr)
-        activity_console.setFormatter(ActivityJSONFormatter(cloud_logging=True))
-        _activity_logger.addHandler(activity_console)
+        try:
+            import google.cloud.logging
+            from google.cloud.logging.handlers import CloudLoggingHandler
+            
+            client = google.cloud.logging.Client()
+            cloud_handler = CloudLoggingHandler(
+                client,
+                name="eventmill-activity",
+            )
+            cloud_handler.setFormatter(ActivityJSONFormatter(cloud_logging=True))
+            _activity_logger.addHandler(cloud_handler)
+        except ImportError:
+            # Fallback: if google-cloud-logging not installed, use stdout
+            # (will appear on console but also in Cloud Logging)
+            activity_cloud = logging.StreamHandler(sys.stdout)
+            activity_cloud.setFormatter(ActivityJSONFormatter(cloud_logging=True))
+            _activity_logger.addHandler(activity_cloud)
     
     # Generate user ID for this session
     _user_id = os.environ.get("EVENTMILL_USER_ID", f"user_{uuid.uuid4().hex[:8]}")

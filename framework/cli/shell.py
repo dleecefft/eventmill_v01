@@ -90,12 +90,44 @@ class EventMillShell(cmd.Cmd):
                 self._load_errors.append(f"Router: {e}")
                 logger.warning("Failed to initialize router: %s", e)
         
-        # LLM availability (check environment)
-        self._llm_available = bool(
-            os.environ.get("EVENTMILL_MODEL_ID") or
-            os.environ.get("GEMINI_API_KEY") or
-            os.environ.get("ANTHROPIC_API_KEY")
-        )
+        # LLM availability - check for dual Gemini keys or legacy single key
+        self._available_models: list[dict[str, str]] = []
+        
+        # Check for dual Gemini API keys (production setup)
+        if os.environ.get("GEMINI_FLASH_API_KEY"):
+            self._available_models.append({
+                "id": "gemini-2.0-flash",
+                "name": "Gemini Flash",
+                "tier": "light",
+                "env_var": "GEMINI_FLASH_API_KEY",
+            })
+        if os.environ.get("GEMINI_PRO_API_KEY"):
+            self._available_models.append({
+                "id": "gemini-2.5-pro",
+                "name": "Gemini Pro",
+                "tier": "heavy",
+                "env_var": "GEMINI_PRO_API_KEY",
+            })
+        
+        # Fallback: legacy single GEMINI_API_KEY
+        if not self._available_models and os.environ.get("GEMINI_API_KEY"):
+            self._available_models.append({
+                "id": "gemini-2.0-flash",
+                "name": "Gemini (default)",
+                "tier": "default",
+                "env_var": "GEMINI_API_KEY",
+            })
+        
+        # Check for Anthropic
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            self._available_models.append({
+                "id": "claude-sonnet-4-20250514",
+                "name": "Claude Sonnet",
+                "tier": "heavy",
+                "env_var": "ANTHROPIC_API_KEY",
+            })
+        
+        self._llm_available = len(self._available_models) > 0
         
         self._update_prompt()
     
@@ -130,10 +162,10 @@ class EventMillShell(cmd.Cmd):
         
         # LLM availability
         if self._llm_available:
-            model_id = os.environ.get("EVENTMILL_MODEL_ID", "gemini-2.5-flash")
-            lines.append(f"  ✓ LLM available: {model_id}")
+            model_names = [m["name"] for m in self._available_models]
+            lines.append(f"  ✓ LLM models available: {', '.join(model_names)}")
         else:
-            lines.append("  ○ No LLM configured (set EVENTMILL_MODEL_ID or API keys)")
+            lines.append("  ○ No LLM configured (set GEMINI_FLASH_API_KEY or GEMINI_PRO_API_KEY)")
         
         lines.append("")
         lines.append("  Type 'help' for available commands, 'new' to start a session.")
@@ -639,29 +671,82 @@ class EventMillShell(cmd.Cmd):
                 display = s[:100] + "..." if len(s) > 100 else s
                 print(f"    {display}")
     
+    def do_models(self, arg: str) -> None:
+        """List available LLM models.
+        
+        Usage: models
+        """
+        if not self._available_models:
+            print("  No LLM models configured.")
+            print("  Set GEMINI_FLASH_API_KEY and/or GEMINI_PRO_API_KEY environment variables.")
+            return
+        
+        print(f"  {'Model':20s} {'Tier':10s} {'ID':30s}")
+        print(f"  {'─' * 20} {'─' * 10} {'─' * 30}")
+        
+        for model in self._available_models:
+            print(f"  {model['name']:20s} {model['tier']:10s} {model['id']:30s}")
+        
+        print("")
+        print("  Use 'connect <model_id>' to connect to a specific model.")
+        print("  Tier 'light' = fast/cheap, 'heavy' = powerful/expensive")
+    
     def do_connect(self, arg: str) -> None:
-        """Connect to LLM via MCP.
+        """Connect to LLM.
         
         Usage: connect [model_id]
+        
+        If no model_id specified, uses the first available model.
+        Use 'models' command to see available models.
         """
-        model_id = arg.strip() or os.environ.get(
-            "EVENTMILL_MODEL_ID", "gemini-2.5-flash"
-        )
+        if not self._available_models:
+            print("  No LLM models configured.")
+            print("  Set GEMINI_FLASH_API_KEY and/or GEMINI_PRO_API_KEY environment variables.")
+            return
+        
+        model_id = arg.strip()
+        
+        # Find the model configuration
+        selected_model = None
+        if model_id:
+            # Match by ID or name
+            for m in self._available_models:
+                if m["id"] == model_id or m["name"].lower() == model_id.lower():
+                    selected_model = m
+                    break
+            if not selected_model:
+                print(f"  Model not found: {model_id}")
+                print("  Use 'models' to see available models.")
+                return
+        else:
+            # Default to first available (prefer Flash for light operations)
+            selected_model = self._available_models[0]
+        
+        # Get the API key from environment
+        api_key = os.environ.get(selected_model["env_var"])
+        if not api_key:
+            print(f"  API key not found in {selected_model['env_var']}")
+            return
+        
         transport = os.environ.get("EVENTMILL_MCP_TRANSPORT", "stdio")
         
         self.llm_client = MCPLLMClient(
-            model_id=model_id,
+            model_id=selected_model["id"],
             transport=transport,
         )
         
+        # Store the API key reference for the client to use
+        self.llm_client._api_key_env_var = selected_model["env_var"]
+        
         # Log activity
         log_user_activity("connect_llm", {
-            "model_id": model_id,
-            "transport": transport,
+            "model_id": selected_model["id"],
+            "model_name": selected_model["name"],
+            "tier": selected_model["tier"],
         })
         
-        print(f"  LLM client configured: {model_id} ({transport})")
-        print("  Note: MCP transport integration pending implementation.")
+        print(f"  ✓ Connected to {selected_model['name']} ({selected_model['id']})")
+        print(f"    Tier: {selected_model['tier']}")
     
     def do_exit(self, arg: str) -> bool:
         """Exit Event Mill.
