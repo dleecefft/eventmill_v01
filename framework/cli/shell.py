@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ..logging.structured import get_logger, setup_logging
+from ..logging.structured import get_logger, setup_logging, log_user_activity, set_user_context
 from ..session.manager import SessionManager
 from ..session.models import Pillar, ToolExecutionStatus
 from ..plugins.loader import PluginLoader
@@ -33,14 +33,8 @@ class EventMillShell(cmd.Cmd):
     sessions, loading artifacts, selecting pillars, and running tools.
     """
     
-    intro = (
-        "\n"
-        "  ╔═══════════════════════════════════════════════╗\n"
-        "  ║           Event Mill v0.1.0                   ║\n"
-        "  ║   Event Record Analysis Platform              ║\n"
-        "  ║   Type 'help' for available commands          ║\n"
-        "  ╚═══════════════════════════════════════════════╝\n"
-    )
+    # Intro is set dynamically in preloop() to include startup stats
+    intro = ""
     
     def __init__(
         self,
@@ -75,8 +69,12 @@ class EventMillShell(cmd.Cmd):
         self.artifact_registry: ArtifactRegistry | None = None
         self.context_builder = ContextBuilder()
         
-        # Discover plugins
+        # Discover plugins and track stats for startup summary
         discovered = self.plugin_loader.discover_all()
+        self._plugin_count = len(discovered)
+        # Each plugin is one tool in Event Mill's architecture
+        self._tool_count = self._plugin_count
+        self._load_errors: list[str] = []
         logger.info("Discovered %d plugins", len(discovered))
         
         # Load routing config
@@ -89,7 +87,15 @@ class EventMillShell(cmd.Cmd):
                 self.router = Router(self.plugin_loader, config)
                 logger.info("Router initialized")
             except Exception as e:
+                self._load_errors.append(f"Router: {e}")
                 logger.warning("Failed to initialize router: %s", e)
+        
+        # LLM availability (check environment)
+        self._llm_available = bool(
+            os.environ.get("EVENTMILL_MODEL_ID") or
+            os.environ.get("GEMINI_API_KEY") or
+            os.environ.get("ANTHROPIC_API_KEY")
+        )
         
         self._update_prompt()
     
@@ -101,6 +107,47 @@ class EventMillShell(cmd.Cmd):
             self.prompt = f"eventmill ({pillar}) > "
         else:
             self.prompt = "eventmill > "
+    
+    def preloop(self) -> None:
+        """Display startup banner with summary stats."""
+        # Build startup summary
+        lines = [
+            "",
+            "  ╔═══════════════════════════════════════════════╗",
+            "  ║           Event Mill v0.1.0                   ║",
+            "  ║   Event Record Analysis Platform              ║",
+            "  ╚═══════════════════════════════════════════════╝",
+            "",
+        ]
+        
+        # Plugin/tool summary
+        if self._load_errors:
+            lines.append(f"  ⚠ Loaded {self._plugin_count} plugins, {self._tool_count} tools ({len(self._load_errors)} errors)")
+            for err in self._load_errors:
+                lines.append(f"    - {err}")
+        else:
+            lines.append(f"  ✓ Loaded {self._plugin_count} plugins, {self._tool_count} tools")
+        
+        # LLM availability
+        if self._llm_available:
+            model_id = os.environ.get("EVENTMILL_MODEL_ID", "gemini-2.5-flash")
+            lines.append(f"  ✓ LLM available: {model_id}")
+        else:
+            lines.append("  ○ No LLM configured (set EVENTMILL_MODEL_ID or API keys)")
+        
+        lines.append("")
+        lines.append("  Type 'help' for available commands, 'new' to start a session.")
+        lines.append("")
+        
+        print("\n".join(lines))
+        
+        # Log startup activity
+        log_user_activity("shell_started", {
+            "plugins_loaded": self._plugin_count,
+            "tools_loaded": self._tool_count,
+            "errors": len(self._load_errors),
+            "llm_available": self._llm_available,
+        })
     
     # -------------------------------------------------------------------
     # Session Commands
@@ -119,6 +166,15 @@ class EventMillShell(cmd.Cmd):
             artifacts_path=self.workspace_path / "artifacts",
             session_id=session.session_id,
         )
+        
+        # Update user context for activity logging
+        set_user_context(session_id=session.session_id)
+        
+        # Log activity
+        log_user_activity("new_session", {
+            "session_id": session.session_id,
+            "description": description or None,
+        })
         
         print(f"  Created session: {session.session_id}")
         if description:
@@ -145,6 +201,15 @@ class EventMillShell(cmd.Cmd):
             # Load existing artifacts from database
             artifacts = self.session_manager.list_artifacts()
             self.artifact_registry.load_from_database(artifacts)
+            
+            # Update user context for activity logging
+            set_user_context(session_id=session.session_id)
+            
+            # Log activity
+            log_user_activity("load_session", {
+                "session_id": session.session_id,
+                "pillar": session.active_pillar,
+            })
             
             print(f"  Loaded session: {session.session_id}")
             print(f"  Pillar: {session.active_pillar or 'none'}")
@@ -184,6 +249,10 @@ class EventMillShell(cmd.Cmd):
             return
         
         self.session_manager.delete_session(session_id)
+        
+        # Log activity
+        log_user_activity("delete_session", {"session_id": session_id})
+        
         print(f"  Deleted session: {session_id}")
         self._update_prompt()
     
@@ -233,6 +302,13 @@ class EventMillShell(cmd.Cmd):
         
         self.session_manager.set_pillar(pillar)
         tools = self.plugin_loader.get_by_pillar(pillar)
+        
+        # Log activity
+        log_user_activity("set_pillar", {
+            "pillar": pillar,
+            "tools_available": len(tools),
+        })
+        
         print(f"  Pillar set to: {pillar} ({len(tools)} tools available)")
         self._update_prompt()
     
@@ -278,6 +354,13 @@ class EventMillShell(cmd.Cmd):
                 metadata={"original_filename": file_path.name},
                 copy_file=False,
             )
+        
+        # Log activity
+        log_user_activity("load_artifact", {
+            "artifact_id": artifact.artifact_id,
+            "artifact_type": artifact_type,
+            "filename": file_path.name,
+        })
         
         print(f"  Loaded artifact: {artifact.artifact_id}")
         print(f"  Type: {artifact_type}")
@@ -412,6 +495,14 @@ class EventMillShell(cmd.Cmd):
                     status=ToolExecutionStatus.COMPLETED,
                     summary=summary,
                 )
+                
+                # Log activity
+                log_user_activity("run_tool", {
+                    "tool_name": tool_name,
+                    "execution_id": execution.execution_id,
+                    "status": "completed",
+                })
+                
                 print(f"  ✓ Completed successfully")
                 print(f"\n  Summary:\n  {summary}")
             else:
@@ -420,6 +511,15 @@ class EventMillShell(cmd.Cmd):
                     status=ToolExecutionStatus.FAILED,
                     summary=result.message or "",
                 )
+                
+                # Log activity
+                log_user_activity("run_tool", {
+                    "tool_name": tool_name,
+                    "execution_id": execution.execution_id,
+                    "status": "failed",
+                    "error_code": str(result.error_code),
+                })
+                
                 print(f"  ✗ Failed: {result.error_code}")
                 if result.message:
                     print(f"    {result.message}")
@@ -430,6 +530,15 @@ class EventMillShell(cmd.Cmd):
                 status=ToolExecutionStatus.FAILED,
                 summary=str(e),
             )
+            
+            # Log activity
+            log_user_activity("run_tool", {
+                "tool_name": tool_name,
+                "execution_id": execution.execution_id,
+                "status": "error",
+                "error": str(e),
+            })
+            
             print(f"  ✗ Error: {e}")
             logger.exception("Tool execution failed: %s", tool_name)
     
@@ -545,6 +654,12 @@ class EventMillShell(cmd.Cmd):
             transport=transport,
         )
         
+        # Log activity
+        log_user_activity("connect_llm", {
+            "model_id": model_id,
+            "transport": transport,
+        })
+        
         print(f"  LLM client configured: {model_id} ({transport})")
         print("  Note: MCP transport integration pending implementation.")
     
@@ -553,6 +668,9 @@ class EventMillShell(cmd.Cmd):
         
         Usage: exit
         """
+        # Log activity
+        log_user_activity("shell_exit")
+        
         print("  Goodbye.")
         return True
     

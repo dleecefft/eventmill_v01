@@ -9,10 +9,17 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+# Module-level user activity logger (configured by setup_logging)
+_activity_logger: logging.Logger | None = None
+_user_id: str | None = None
+_session_id: str | None = None
 
 
 class JSONFormatter(logging.Formatter):
@@ -115,6 +122,7 @@ def setup_logging(
     console: bool = True,
     json_format: bool = True,
     cloud_json: bool = False,
+    console_level: str | None = None,
 ) -> logging.Logger:
     """Configure Event Mill logging.
     
@@ -126,19 +134,35 @@ def setup_logging(
         cloud_json: If True, use JSON format on stderr with 'severity'
                     field for GCP Cloud Logging auto-parsing. Overrides
                     the default ConsoleFormatter for console output.
+        console_level: Separate log level for console (defaults to WARNING
+                       in interactive mode to reduce noise).
     
     Returns:
         Root Event Mill logger.
     """
+    global _activity_logger, _user_id
+    
     root_logger = logging.getLogger("eventmill")
     root_logger.setLevel(getattr(logging, log_level.upper(), logging.INFO))
     
     # Remove existing handlers
     root_logger.handlers.clear()
     
+    # Determine console level - suppress INFO logs in interactive mode
+    # unless cloud_json is True (Cloud Run deployment)
+    if console_level:
+        effective_console_level = getattr(logging, console_level.upper(), logging.WARNING)
+    elif cloud_json:
+        # Cloud Run: show all logs as JSON
+        effective_console_level = getattr(logging, log_level.upper(), logging.INFO)
+    else:
+        # Interactive: suppress INFO, show only WARNING+
+        effective_console_level = logging.WARNING
+    
     # Console handler
     if console:
         console_handler = logging.StreamHandler(sys.stderr)
+        console_handler.setLevel(effective_console_level)
         if cloud_json:
             # JSON to stderr — Cloud Logging auto-parses severity + fields
             console_handler.setFormatter(JSONFormatter(cloud_logging=True))
@@ -146,12 +170,13 @@ def setup_logging(
             console_handler.setFormatter(ConsoleFormatter())
         root_logger.addHandler(console_handler)
     
-    # File handler
+    # File handler - always logs at configured level
     if log_file:
         log_path = Path(log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         
         file_handler = logging.FileHandler(str(log_path))
+        file_handler.setLevel(getattr(logging, log_level.upper(), logging.INFO))
         
         if json_format:
             file_handler.setFormatter(JSONFormatter())
@@ -163,6 +188,29 @@ def setup_logging(
             )
         
         root_logger.addHandler(file_handler)
+    
+    # Setup user activity logger (separate from main logger)
+    # This always logs to cloud/file but never to interactive console
+    _activity_logger = logging.getLogger("eventmill.activity")
+    _activity_logger.setLevel(logging.INFO)
+    _activity_logger.handlers.clear()
+    _activity_logger.propagate = False  # Don't propagate to root
+    
+    # Activity logger goes to file (if configured)
+    if log_file:
+        activity_file = Path(log_file).parent / "activity.log"
+        activity_handler = logging.FileHandler(str(activity_file))
+        activity_handler.setFormatter(ActivityJSONFormatter(cloud_logging=False))
+        _activity_logger.addHandler(activity_handler)
+    
+    # In Cloud Run, activity logs go to stderr as JSON
+    if cloud_json:
+        activity_console = logging.StreamHandler(sys.stderr)
+        activity_console.setFormatter(ActivityJSONFormatter(cloud_logging=True))
+        _activity_logger.addHandler(activity_console)
+    
+    # Generate user ID for this session
+    _user_id = os.environ.get("EVENTMILL_USER_ID", f"user_{uuid.uuid4().hex[:8]}")
     
     return root_logger
 
@@ -179,6 +227,86 @@ def get_logger(name: str) -> logging.Logger:
     if not name.startswith("eventmill."):
         name = f"eventmill.{name}"
     return logging.getLogger(name)
+
+
+def set_user_context(user_id: str | None = None, session_id: str | None = None) -> None:
+    """Set user context for activity logging.
+    
+    Args:
+        user_id: User identifier (updates only if provided).
+        session_id: Current session ID.
+    """
+    global _user_id, _session_id
+    if user_id is not None:
+        _user_id = user_id
+    if session_id is not None:
+        _session_id = session_id
+
+
+def log_user_activity(
+    action: str,
+    details: dict[str, Any] | None = None,
+    session_id: str | None = None,
+) -> None:
+    """Log user activity for audit trail.
+    
+    This logs to cloud/file but NOT to console.
+    
+    Args:
+        action: The action performed (e.g., 'new_session', 'set_pillar').
+        details: Optional details about the action.
+        session_id: Session ID (uses global if not provided).
+    """
+    if not _activity_logger:
+        return
+    
+    extra = {
+        "activity_type": "user_action",
+        "action": action,
+        "user_id": _user_id or "anonymous",
+        "session_id": session_id or _session_id,
+    }
+    if details:
+        extra["details"] = details
+    
+    _activity_logger.info(
+        "User action: %s",
+        action,
+        extra=extra,
+    )
+
+
+class ActivityJSONFormatter(logging.Formatter):
+    """JSON formatter for user activity logs.
+    
+    Includes all extra fields for comprehensive audit trail.
+    """
+    
+    def __init__(self, cloud_logging: bool = False):
+        super().__init__()
+        self.cloud_logging = cloud_logging
+    
+    def format(self, record: logging.LogRecord) -> str:
+        """Format activity log as JSON."""
+        log_entry: dict[str, Any] = {
+            "timestamp": datetime.fromtimestamp(record.created).isoformat(),
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        
+        if self.cloud_logging:
+            log_entry["severity"] = record.levelname
+        else:
+            log_entry["level"] = record.levelname
+        
+        # Include all extra fields
+        for key in ("activity_type", "action", "user_id", "session_id", "details"):
+            if hasattr(record, key):
+                value = getattr(record, key)
+                if value is not None:
+                    log_entry[key] = value
+        
+        return json.dumps(log_entry, default=str)
 
 
 class LogContext:
