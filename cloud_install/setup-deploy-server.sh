@@ -96,6 +96,10 @@ export EVENTMILL_SECRET_GCS_SA="eventmill-gcs-sa"
 export EVENTMILL_SECRET_TTYD_USER="eventmill-ttyd-user"
 export EVENTMILL_SECRET_TTYD_CRED="eventmill-ttyd-cred"
 
+# ttyd web terminal credentials (used by deploy-cloudrun.sh quick deploy)
+export TTYD_USERNAME="analyst"
+export TTYD_PASSWORD="changeme"
+
 # Log level for the deployed service
 export EVENTMILL_LOG_LEVEL="INFO"
 ENVEOF
