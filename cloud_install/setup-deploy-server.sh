@@ -89,7 +89,9 @@ export CLOUD_RUN_REGION="northamerica-northeast2"
 export GCS_LOG_BUCKET="digevtrecintake"
 
 # Secret names in GCP Secret Manager
-export EVENTMILL_SECRET_GEMINI="eventmill-gemini-api"
+# Dual Gemini keys — display names match the env vars for traceability
+export EVENTMILL_SECRET_GEMINI_FLASH="eventmill-gemini-flash-api"
+export EVENTMILL_SECRET_GEMINI_PRO="eventmill-gemini-pro-api"
 export EVENTMILL_SECRET_GCS_SA="eventmill-gcs-sa"
 export EVENTMILL_SECRET_TTYD_USER="eventmill-ttyd-user"
 export EVENTMILL_SECRET_TTYD_CRED="eventmill-ttyd-cred"

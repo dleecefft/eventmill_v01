@@ -157,33 +157,35 @@ create_restricted_gemini_key() {
 
     # Create a new API key restricted to Generative Language API only
     echo "   Creating restricted API key '${display_name}'..."
-    local key_uid
-    key_uid=$(gcloud services api-keys create \
+    local create_output
+    create_output=$(gcloud services api-keys create \
         --project="${PROJECT_ID}" \
         --display-name="${display_name}" \
         --api-target=service=generativelanguage.googleapis.com \
-        --format="value(response.uid)" \
         --quiet 2>&1)
 
-    if [ -z "${key_uid}" ]; then
+    if [ -z "${create_output}" ]; then
         echo "   ERROR: Failed to create API key. Check permissions."
         echo ""
         return
     fi
 
-    echo "   ✓ API key created (uid: ${key_uid})"
-
-    # Retrieve the key string
+    # Extract uid and keyString directly from the create response JSON
+    # (--format flags don't apply cleanly to the async operation wrapper)
+    local key_uid
+    key_uid=$(echo "${create_output}" | grep -o '"uid":"[^"]*"' | head -1 | cut -d'"' -f4)
     local key_string
-    key_string=$(gcloud services api-keys get-key-string "${key_uid}" \
-        --project="${PROJECT_ID}" \
-        --format="value(keyString)" 2>/dev/null)
+    key_string=$(echo "${create_output}" | grep -o '"keyString":"[^"]*"' | head -1 | cut -d'"' -f4)
 
     if [ -z "${key_string}" ]; then
-        echo "   ERROR: Failed to retrieve key string."
+        echo "   ERROR: Failed to extract key string from create output."
+        echo "   Raw output:"
+        echo "${create_output}"
         echo ""
         return
     fi
+
+    echo "   ✓ API key created (uid: ${key_uid})"
 
     # Store the key string in Secret Manager
     if ! gcloud secrets describe "${secret_name}" --project="${PROJECT_ID}" > /dev/null 2>&1; then
