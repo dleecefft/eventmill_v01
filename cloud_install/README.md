@@ -78,7 +78,8 @@ bash cloud_install/deploy-cloudrun-secrets.sh
 
 ```bash
 source ~/.eventmill/deploy.env
-export GEMINI_API_KEY="your-key"
+export GEMINI_FLASH_API_KEY="your-flash-key"
+export GEMINI_PRO_API_KEY="your-pro-key"
 export TTYD_USERNAME="admin"
 export TTYD_PASSWORD="changeme"
 cd ~/eventmill_v01
@@ -122,17 +123,52 @@ bash cloud_install/provision-gcp-project.sh
 bash cloud_install/provision-secrets.sh
 ```
 
-This creates everything the project needs: 6 APIs enabled, a dedicated
-service account with least-privilege IAM roles, a GCS bucket with lifecycle
-rules, and 4 Secret Manager entries.
+This creates everything the project needs: APIs enabled (including
+`apikeys.googleapis.com` for key creation), a dedicated service account
+with least-privilege IAM roles, a GCS bucket with lifecycle rules,
+Artifact Registry, and Secret Manager entries for dual Gemini API keys.
+
+### Cloud Build Permissions (default compute SA)
+
+Cloud Build uses the project's **default compute service account** to upload
+source tarballs to GCS. If you see a `storage.objects.get` permission error
+during `gcloud builds submit`, the default compute SA needs storage access.
+
+The `provision-gcp-project.sh` script handles this automatically. To fix
+manually or verify:
+
+```bash
+# 1. Find your project number
+PROJECT_NUMBER=$(gcloud projects describe ${GOOGLE_CLOUD_PROJECT} --format="value(projectNumber)")
+
+# 2. The default compute SA follows this pattern:
+#    {PROJECT_NUMBER}-compute@developer.gserviceaccount.com
+echo "Default compute SA: ${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+
+# 3. Grant storage access (source tarball upload)
+gcloud projects add-iam-policy-binding ${GOOGLE_CLOUD_PROJECT} \
+    --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+    --role="roles/storage.objectAdmin" \
+    --quiet
+
+# 4. Grant Artifact Registry access (Docker image push)
+gcloud projects add-iam-policy-binding ${GOOGLE_CLOUD_PROJECT} \
+    --member="serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+    --role="roles/artifactregistry.writer" \
+    --quiet
+```
 
 ## Secret Manager Setup
 
-Create these secrets on the deploy server before the first production deploy:
+`provision-secrets.sh` handles this automatically — it creates restricted
+Gemini API keys via `gcloud services api-keys create` and stores them in
+Secret Manager. To manage secrets manually:
 
 ```bash
-# Gemini API key
-echo -n "your-api-key" | gcloud secrets create eventmill-gemini-api --data-file=-
+# Dual Gemini API keys (restricted to generativelanguage.googleapis.com)
+# Display names match the OS env vars for traceability:
+#   GEMINI_FLASH_API_KEY  →  eventmill-gemini-flash-api
+#   GEMINI_PRO_API_KEY    →  eventmill-gemini-pro-api
 
 # ttyd basic auth credentials
 echo -n "analyst" | gcloud secrets create eventmill-ttyd-user --data-file=-
@@ -158,7 +194,8 @@ docker compose -f cloud_install/docker-compose.cloudrun.yml up --build
 | `GOOGLE_CLOUD_PROJECT` | Yes | GCP project ID |
 | `CLOUD_RUN_REGION` | No | Deploy region (default: `northamerica-northeast2`) |
 | `GCS_LOG_BUCKET` | No | GCS bucket for log artifact storage |
-| `EVENTMILL_SECRET_GEMINI` | No | Secret Manager name for Gemini key |
+| `EVENTMILL_SECRET_GEMINI_FLASH` | No | Secret Manager name for Flash API key |
+| `EVENTMILL_SECRET_GEMINI_PRO` | No | Secret Manager name for Pro API key |
 | `EVENTMILL_SECRET_GCS_SA` | No | Secret Manager name for GCS SA key |
 | `EVENTMILL_SECRET_TTYD_USER` | No | Secret Manager name for ttyd username |
 | `EVENTMILL_SECRET_TTYD_CRED` | No | Secret Manager name for ttyd password |
@@ -168,7 +205,8 @@ docker compose -f cloud_install/docker-compose.cloudrun.yml up --build
 
 | Variable | Description |
 |----------|-------------|
-| `GEMINI_API_KEY` | Gemini API key (injected from Secret Manager) |
+| `GEMINI_FLASH_API_KEY` | Gemini Flash API key — light tier (injected from Secret Manager) |
+| `GEMINI_PRO_API_KEY` | Gemini Pro API key — heavy tier (injected from Secret Manager) |
 | `ANTHROPIC_API_KEY` | Anthropic API key (alternative LLM) |
 | `TTYD_USERNAME` | ttyd basic auth username |
 | `TTYD_PASSWORD` | ttyd basic auth password |

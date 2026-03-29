@@ -195,6 +195,22 @@ echo "   ✓ roles/logging.logWriter"
 DEFAULT_COMPUTE_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
 CLOUDBUILD_SA="${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com"
 
+# Grant default compute SA access to GCS (Cloud Build uploads source tarballs)
+echo "   Granting default compute SA storage access (Cloud Build source upload)..."
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="serviceAccount:${DEFAULT_COMPUTE_SA}" \
+    --role="roles/storage.objectAdmin" \
+    --quiet > /dev/null 2>&1
+echo "   ✓ roles/storage.objectAdmin for default compute SA"
+
+# Grant default compute SA permission to push images to Artifact Registry
+echo "   Granting default compute SA Artifact Registry write access..."
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+    --member="serviceAccount:${DEFAULT_COMPUTE_SA}" \
+    --role="roles/artifactregistry.writer" \
+    --quiet > /dev/null 2>&1
+echo "   ✓ roles/artifactregistry.writer for default compute SA"
+
 echo "   Granting Cloud Build SA permission to deploy to Cloud Run..."
 gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
     --member="serviceAccount:${CLOUDBUILD_SA}" \
