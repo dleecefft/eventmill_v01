@@ -114,8 +114,11 @@ class StorageResolverConfig:
                 overrides[pillar] = val
 
         # Backward compatibility: GCS_LOG_BUCKET → log_analysis override
+        # Only apply when no explicit prefix has been set, so that a custom
+        # prefix (e.g. evtm_v01) isn't silently overridden by a stale legacy var.
+        prefix_explicitly_set = "EVENTMILL_BUCKET_PREFIX" in os.environ
         legacy = os.environ.get("GCS_LOG_BUCKET")
-        if legacy and Pillar.LOG_ANALYSIS not in overrides:
+        if legacy and Pillar.LOG_ANALYSIS not in overrides and not prefix_explicitly_set:
             overrides[Pillar.LOG_ANALYSIS] = legacy
 
         return cls(

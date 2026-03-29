@@ -110,6 +110,15 @@ class TestStorageResolverConfig:
         cfg = StorageResolverConfig.from_environment()
         assert cfg.bucket_for_pillar(Pillar.LOG_ANALYSIS) == "new-logs"
 
+    def test_legacy_ignored_when_prefix_set(self, monkeypatch):
+        """Regression: GCS_LOG_BUCKET must not override when a custom prefix is active."""
+        monkeypatch.setenv("EVENTMILL_BUCKET_PREFIX", "evtm_v01")
+        monkeypatch.setenv("GCS_LOG_BUCKET", "defaultevtintake2")
+        monkeypatch.delenv("EVENTMILL_BUCKET_LOG_ANALYSIS", raising=False)
+
+        cfg = StorageResolverConfig.from_environment()
+        assert cfg.bucket_for_pillar(Pillar.LOG_ANALYSIS) == "evtm_v01-log-analysis"
+
 
 # ---------------------------------------------------------------------------
 # Resolution logic
