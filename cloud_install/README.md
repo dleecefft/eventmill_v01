@@ -104,6 +104,7 @@ gcloud builds submit \
 |------|---------|
 | `provision-gcp-project.sh` | **Run first** — enables APIs, creates SA, bucket, secrets |
 | `provision-secrets.sh` | Interactive — sets real values for Secret Manager entries |
+| `create-gcs-sa-key.sh` | Generates and uploads GCS service account key to Secret Manager |
 | `setup-deploy-server.sh` | One-time bootstrap for the Linux deploy server |
 | `Dockerfile.cloudrun` | Multi-stage container image with ttyd + eventmill |
 | `deploy-cloudrun.sh` | Basic Cloud Run deploy (env var secrets) |
@@ -171,11 +172,43 @@ Secret Manager. To manage secrets manually:
 #   GEMINI_PRO_API_KEY    →  eventmill-gemini-pro-api
 
 # ttyd basic auth credentials
-echo -n "analyst" | gcloud secrets create eventmill-ttyd-user --data-file=-
-echo -n "strong-password" | gcloud secrets create eventmill-ttyd-cred --data-file=-
+echo -n "analyst" | gcloud secrets versions add eventmill-ttyd-user --data-file=-
+echo -n "strong-password" | gcloud secrets versions add eventmill-ttyd-cred --data-file=-
+```
 
-# (Optional) GCS service account key for artifact storage
-gcloud secrets create eventmill-gcs-sa --data-file=/path/to/sa-key.json
+### GCS Service Account Key
+
+The `eventmill-gcs-sa` secret stores a JSON key for the `eventmill-runner`
+service account. This key is mounted at `/app/credentials/sa-key.json` in
+Cloud Run and used for GCS bucket access.
+
+**Generate and upload the key using the helper script:**
+
+```bash
+export GOOGLE_CLOUD_PROJECT="your-project-id"
+bash cloud_install/create-gcs-sa-key.sh
+```
+
+This script:
+1. Verifies the service account and secret exist
+2. Generates a new JSON key for `eventmill-runner@PROJECT.iam.gserviceaccount.com`
+3. Uploads the key to Secret Manager (`eventmill-gcs-sa`)
+4. Deletes the local key file (security best practice)
+
+**Or manually:**
+
+```bash
+# Generate key
+gcloud iam service-accounts keys create /tmp/sa-key.json \
+    --iam-account=eventmill-runner@${GOOGLE_CLOUD_PROJECT}.iam.gserviceaccount.com
+
+# Upload to Secret Manager
+gcloud secrets versions add eventmill-gcs-sa \
+    --project=${GOOGLE_CLOUD_PROJECT} \
+    --data-file=/tmp/sa-key.json
+
+# Delete local copy
+rm /tmp/sa-key.json
 ```
 
 ## Local Image Testing (on deploy server)
