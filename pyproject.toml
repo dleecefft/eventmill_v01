@@ -52,6 +52,7 @@ dev = [
 gcp = [
     "google-cloud-storage>=2.10.0",
     "google-cloud-secret-manager>=2.16.0",
+    "google-cloud-logging>=3.8.0",
 ]
 plugins-log-analysis = [
     "pdfplumber>=0.10.0",

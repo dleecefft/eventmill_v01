@@ -190,6 +190,33 @@ This approach:
 The `eventmill-runner` service account is granted `roles/storage.objectUser`
 by `provision-gcp-project.sh`, which allows read/write access to the GCS bucket.
 
+### Audit Logging (Cloud Logging)
+
+User activity is logged to **Cloud Logging** via the `google-cloud-logging`
+library, not to the GCS artifact bucket. This provides:
+
+- **Immutability** — Users cannot delete or modify audit logs
+- **Separation** — Audit trail is separate from user-accessible artifact storage
+- **Retention** — Configurable retention policies independent of user actions
+- **Access control** — Separate IAM for log viewing vs. artifact access
+
+Activity logs appear in Cloud Logging under:
+```
+projects/PROJECT_ID/logs/eventmill-activity
+```
+
+To view activity logs:
+```bash
+gcloud logging read "logName=projects/${GOOGLE_CLOUD_PROJECT}/logs/eventmill-activity" \
+    --project=${GOOGLE_CLOUD_PROJECT} \
+    --limit=50 \
+    --format=json
+```
+
+The `eventmill-runner` service account is granted `roles/logging.logWriter`
+by `provision-gcp-project.sh`, which allows writing logs but not reading or
+deleting them.
+
 ## Local Image Testing (on deploy server)
 
 ```bash

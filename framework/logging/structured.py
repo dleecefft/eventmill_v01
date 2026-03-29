@@ -188,29 +188,45 @@ def setup_logging(
         root_logger.addHandler(file_handler)
     
     # Setup user activity logger (separate from main logger)
-    # Activity logs go to:
-    # - activity.log file (always, for local debugging)
-    # - Google Cloud Logging API directly (in cloud_json mode)
-    #   This bypasses stdout/stderr so activity logs don't clutter the console
+    # Activity logs are audit records — they go to:
+    # - Cloud Logging API (in cloud mode) for immutable, tamper-proof audit trail
+    # - Local file (in local mode) for debugging
+    # NEVER to console (stdout/stderr) to keep interactive shell clean
     _activity_logger = logging.getLogger("eventmill.activity")
     _activity_logger.setLevel(logging.INFO)
     _activity_logger.handlers.clear()
     _activity_logger.propagate = False  # Don't propagate to root
     
-    # Activity logger goes to file (always, if log_file configured)
-    if log_file:
+    if cloud_json:
+        # In Cloud Run: send activity logs directly to Cloud Logging API
+        # This bypasses stdout/stderr entirely, keeping console clean
+        # Audit logs are immutable and separate from user-accessible GCS bucket
+        try:
+            import google.cloud.logging
+            from google.cloud.logging.handlers import CloudLoggingHandler
+            
+            # Use workload identity credentials (no key file needed)
+            client = google.cloud.logging.Client()
+            cloud_handler = CloudLoggingHandler(
+                client,
+                name="eventmill-activity",  # Creates log: projects/PROJECT/logs/eventmill-activity
+            )
+            cloud_handler.setFormatter(ActivityJSONFormatter(cloud_logging=True))
+            _activity_logger.addHandler(cloud_handler)
+        except Exception as e:
+            # If Cloud Logging fails, fall back to file (but log the error)
+            root_logger.warning("Cloud Logging unavailable for activity logs: %s", e)
+            if log_file:
+                activity_file = Path(log_file).parent / "activity.log"
+                activity_handler = logging.FileHandler(str(activity_file))
+                activity_handler.setFormatter(ActivityJSONFormatter(cloud_logging=True))
+                _activity_logger.addHandler(activity_handler)
+    elif log_file:
+        # Local mode: activity logs go to file only
         activity_file = Path(log_file).parent / "activity.log"
         activity_handler = logging.FileHandler(str(activity_file))
         activity_handler.setFormatter(ActivityJSONFormatter(cloud_logging=False))
         _activity_logger.addHandler(activity_handler)
-    
-    # In Cloud Run, activity logs go to stdout as JSON for Cloud Logging
-    # Cloud Logging automatically parses JSON from stdout/stderr
-    # We use stdout to keep activity logs separate from error output
-    if cloud_json:
-        activity_cloud = logging.StreamHandler(sys.stdout)
-        activity_cloud.setFormatter(ActivityJSONFormatter(cloud_logging=True))
-        _activity_logger.addHandler(activity_cloud)
     
     # Generate user ID for this session
     _user_id = os.environ.get("EVENTMILL_USER_ID", f"user_{uuid.uuid4().hex[:8]}")
