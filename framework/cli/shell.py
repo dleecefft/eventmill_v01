@@ -150,6 +150,7 @@ class EventMillShell(cmd.Cmd):
         self.router: Router | None = None
         self.artifact_registry: ArtifactRegistry | None = None
         self.context_builder = ContextBuilder()
+        self._conversation_history: list[dict[str, str]] = []
         
         # Initialize storage resolver
         # In Cloud Run (K_SERVICE set), use GCS resolver; otherwise local
@@ -1016,6 +1017,187 @@ class EventMillShell(cmd.Cmd):
         print(f"  ✓ Connected to {selected_model['name']} ({selected_model['id']})")
         print(f"    Tier: {selected_model['tier']}")
     
+    def do_ask(self, arg: str) -> None:
+        """Ask a question about the current investigation using the connected LLM.
+        
+        Usage: ask: <question>
+        
+        The colon after 'ask' is required — it signals conscious intent
+        to invoke the LLM (which costs tokens and time).
+        
+        The LLM receives full context from your session: loaded artifacts,
+        all tool execution summaries, and prior conversation turns.
+        
+        Examples:
+          ask: what were the usernames targeted in this log file?
+          ask: summarize the threat findings so far
+          ask: root login is disabled on this server — re-evaluate the threat rating
+          ask: search the internet for CVEs related to this SSH pattern
+        """
+        # Require the colon prefix for conscious intent
+        if not arg.startswith(":"):
+            print("  Usage: ask: <question>")
+            print("  The colon is required to confirm LLM intent.")
+            return
+        
+        question = arg[1:].strip()
+        if not question:
+            print("  Usage: ask: <question>")
+            return
+        
+        self._query_llm(question)
+    
+    def _query_llm(self, question: str) -> None:
+        """Send a contextual question to the connected LLM and print the response."""
+        if not self.llm_client or not self.llm_client.connected:
+            print("  No LLM connected. Use 'connect <model_id>' first.")
+            print("  Use 'models' to see available models.")
+            return
+        
+        session = self.session_manager.get_current_session()
+        if not session:
+            print("  No active session. Use 'new' to create one.")
+            return
+        
+        # Build grounding context from session state
+        context_parts = self._build_conversation_context(session)
+        
+        # Include conversation history (last 10 turns)
+        history_text = ""
+        if self._conversation_history:
+            recent = self._conversation_history[-10:]
+            history_lines = []
+            for turn in recent:
+                history_lines.append(f"Analyst: {turn['question']}")
+                history_lines.append(f"AI: {turn['answer']}\n")
+            history_text = "\n".join(history_lines)
+        
+        system_context = (
+            "You are a Tier 3 SOC analyst assistant embedded in Event Mill, "
+            "an event record analysis platform. You have access to the "
+            "investigation context below including loaded artifacts and "
+            "prior tool execution results. Answer the analyst's questions "
+            "thoroughly and specifically based on the evidence available. "
+            "When the analyst provides new information (e.g. 'root login is "
+            "disabled'), incorporate it to refine your threat assessment. "
+            "Reference specific log patterns, IPs, usernames, and counts "
+            "from the execution summaries when available. "
+            "If asked to search for information or CVEs, use your training "
+            "knowledge to provide the most relevant known information."
+        )
+        
+        # Assemble the full prompt
+        prompt_parts = []
+        if context_parts:
+            prompt_parts.append("=== INVESTIGATION CONTEXT ===")
+            prompt_parts.append(context_parts)
+        if history_text:
+            prompt_parts.append("=== CONVERSATION HISTORY ===")
+            prompt_parts.append(history_text)
+        prompt_parts.append("=== ANALYST QUESTION ===")
+        prompt_parts.append(question)
+        
+        full_prompt = "\n\n".join(prompt_parts)
+        
+        print("  Thinking...")
+        
+        try:
+            response = self.llm_client.query_text(
+                prompt=full_prompt,
+                system_context=system_context,
+                max_tokens=4096,
+            )
+            
+            if response.ok and response.text:
+                # Store in conversation history
+                self._conversation_history.append({
+                    "question": question,
+                    "answer": response.text,
+                })
+                
+                # Print the response with indentation
+                print("")
+                for line in response.text.splitlines():
+                    print(f"  {line}")
+                print("")
+                
+                # Show token usage if available
+                if response.token_usage:
+                    total = response.token_usage.get("total_tokens", 0)
+                    if total:
+                        print(f"  [{total} tokens used]")
+                
+                # Log activity
+                log_user_activity("ask_llm", {
+                    "question_length": len(question),
+                    "response_length": len(response.text),
+                    "history_turns": len(self._conversation_history),
+                })
+            else:
+                error = response.error or "Unknown error"
+                print(f"  ✗ LLM query failed: {error}")
+                
+        except Exception as e:
+            print(f"  ✗ Error: {e}")
+            logger.error("LLM query error: %s", e, exc_info=True)
+    
+    def _build_conversation_context(self, session) -> str:
+        """Assemble investigation context from session state for LLM grounding."""
+        parts = []
+        
+        # Session info
+        pillar = session.active_pillar or "none"
+        workspace = session.workspace_folder or "default"
+        parts.append(f"Session: {session.session_id}")
+        parts.append(f"Pillar: {pillar}")
+        parts.append(f"Workspace: {workspace}")
+        
+        # Loaded artifacts
+        try:
+            artifacts = self.session_manager.list_artifacts()
+            if artifacts:
+                parts.append("\n--- Loaded Artifacts ---")
+                for art in artifacts:
+                    fname = art.metadata.get("original_filename", art.file_path)
+                    parts.append(f"  [{art.artifact_id}] {art.artifact_type}: {fname}")
+        except ValueError:
+            pass
+        
+        # All tool execution summaries (most important context)
+        try:
+            executions = self.session_manager.list_executions()
+            completed = [e for e in executions if e.summary]
+            if completed:
+                parts.append("\n--- Tool Execution Results ---")
+                for ex in completed:
+                    parts.append(f"\n[{ex.tool_name}] ({ex.started_at.strftime('%H:%M')}):")
+                    parts.append(ex.summary)
+        except ValueError:
+            pass
+        
+        return "\n".join(parts)
+    
+    def do_history(self, arg: str) -> None:
+        """Show conversation history with the LLM.
+        
+        Usage: history [clear]
+        """
+        if arg.strip() == "clear":
+            self._conversation_history.clear()
+            print("  Conversation history cleared.")
+            return
+        
+        if not self._conversation_history:
+            print("  No conversation history. Use 'ask <question>' to start.")
+            return
+        
+        for i, turn in enumerate(self._conversation_history, 1):
+            q = turn["question"]
+            a_preview = turn["answer"][:120] + "..." if len(turn["answer"]) > 120 else turn["answer"]
+            print(f"  [{i}] Q: {q}")
+            print(f"      A: {a_preview}")
+            print()
+    
     def do_exit(self, arg: str) -> bool:
         """Exit Event Mill.
         
@@ -1047,15 +1229,20 @@ class EventMillShell(cmd.Cmd):
         """Handle unknown commands."""
         print(f"  Unknown command: {line.split()[0]}")
         print("  Type 'help' for available commands.")
+        if self.llm_client and self.llm_client.connected:
+            print("  Tip: use 'ask: <question>' to query the LLM.")
     
     # -------------------------------------------------------------------
     # Helpers
     # -------------------------------------------------------------------
     
     def _infer_artifact_type(self, file_path: Path) -> str:
-        """Infer artifact type from file extension."""
-        ext = file_path.suffix.lower()
+        """Infer artifact type from file extension.
         
+        Handles rotated log files (e.g. auth.log.1, syslog.2.gz) by
+        walking the suffix chain from right to left until a known
+        extension is found.
+        """
         type_map = {
             ".pcap": "pcap",
             ".pcapng": "pcap",
@@ -1073,7 +1260,13 @@ class EventMillShell(cmd.Cmd):
             ".bmp": "image",
         }
         
-        return type_map.get(ext, "text")
+        # Walk suffixes right-to-left: .log.1 → try ".1" then ".log"
+        for ext in reversed(file_path.suffixes):
+            mapped = type_map.get(ext.lower())
+            if mapped:
+                return mapped
+        
+        return "text"
 
 
 def main() -> None:

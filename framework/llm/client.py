@@ -15,7 +15,8 @@ from typing import Any
 from ..plugins.protocol import LLMQueryInterface, LLMResponse
 
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types as genai_types
     _HAS_GENAI = True
 except ImportError:
     _HAS_GENAI = False
@@ -54,7 +55,7 @@ class MCPLLMClient:
         self.max_retries = max_retries
         self._connected = False
         self._mcp_session = None
-        self._model = None
+        self._genai_client = None
         self._api_key_env_var: str | None = None
         self._total_tokens_used = 0
     
@@ -90,11 +91,10 @@ class MCPLLMClient:
             return False
         
         try:
-            genai.configure(api_key=resolved_key)
-            self._model = genai.GenerativeModel(self.model_id)
+            self._genai_client = genai.Client(api_key=resolved_key)
             self._connected = True
             logger.info(
-                "Connected to %s via Gemini SDK", self.model_id,
+                "Connected to %s via Google GenAI SDK", self.model_id,
             )
             return True
         except Exception as e:
@@ -243,26 +243,24 @@ class MCPLLMClient:
         system_context: str | None,
         max_tokens: int,
     ) -> str:
-        """Execute a text query via Gemini SDK (MCP bridge).
+        """Execute a text query via Google GenAI SDK (MCP bridge).
         
-        Uses google-generativeai directly until full MCP transport
+        Uses google.genai directly until full MCP transport
         is integrated.
         """
-        if self._model is None:
-            raise RuntimeError("Model not initialised — call connect() first")
+        if self._genai_client is None:
+            raise RuntimeError("Client not initialised — call connect() first")
         
-        generation_config = genai.types.GenerationConfig(
+        config = genai_types.GenerateContentConfig(
             max_output_tokens=max_tokens,
         )
-        
-        parts = []
         if system_context:
-            parts.append(f"System: {system_context}\n")
-        parts.append(prompt)
+            config.system_instruction = system_context
         
-        response = self._model.generate_content(
-            "\n".join(parts),
-            generation_config=generation_config,
+        response = self._genai_client.models.generate_content(
+            model=self.model_id,
+            contents=prompt,
+            config=config,
         )
         
         text = response.text or ""
@@ -282,28 +280,28 @@ class MCPLLMClient:
         system_context: str | None,
         max_tokens: int,
     ) -> str:
-        """Execute a multimodal query via Gemini SDK (MCP bridge)."""
-        if self._model is None:
-            raise RuntimeError("Model not initialised — call connect() first")
+        """Execute a multimodal query via Google GenAI SDK (MCP bridge)."""
+        if self._genai_client is None:
+            raise RuntimeError("Client not initialised — call connect() first")
         
-        import io
-        from PIL import Image
+        mime_map = {"jpeg": "image/jpeg", "jpg": "image/jpeg", "png": "image/png"}
+        mime_type = mime_map.get(image_format.lower(), f"image/{image_format}")
         
-        image = Image.open(io.BytesIO(image_data))
-        
-        generation_config = genai.types.GenerationConfig(
+        config = genai_types.GenerateContentConfig(
             max_output_tokens=max_tokens,
         )
-        
-        parts = []
         if system_context:
-            parts.append(f"System: {system_context}\n")
-        parts.append(prompt)
-        parts.append(image)
+            config.system_instruction = system_context
         
-        response = self._model.generate_content(
-            parts,
-            generation_config=generation_config,
+        contents = [
+            prompt,
+            genai_types.Part.from_bytes(data=image_data, mime_type=mime_type),
+        ]
+        
+        response = self._genai_client.models.generate_content(
+            model=self.model_id,
+            contents=contents,
+            config=config,
         )
         
         return response.text or ""

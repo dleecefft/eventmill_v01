@@ -276,6 +276,43 @@ Run a predefined SOC workflow for top-talker analysis:
 eventmill (log_analysis:linuxdroplettest) > run log_investigator {"mode": "workflow", "artifact_id": "art_6e9d7524", "workflow_type": "top_talkers"}
 ```
 
+### 8g. Conversational Analysis (ask)
+
+Once an LLM is connected, you can ask questions in natural language
+about the investigation. The LLM receives full context: loaded
+artifacts, all prior tool execution summaries, and conversation
+history for multi-turn refinement.
+
+Use the `ask:` command to query the LLM (the colon signals conscious
+intent to invoke the LLM):
+
+```
+eventmill (log_analysis:linuxdroplettest) > ask: what were the usernames targeted in this log file?
+```
+
+```
+eventmill (log_analysis:linuxdroplettest) > ask: what IPs had the most failed login attempts?
+```
+
+Refine the threat assessment with new information:
+
+```
+eventmill (log_analysis:linuxdroplettest) > ask: root login is disabled on this server. Search for known instances of this SSH hardening being defeated, and if nothing is found, downgrade the threat rating.
+```
+
+Ask follow-up questions — the conversation carries context:
+
+```
+eventmill (log_analysis:linuxdroplettest) > ask: based on the patterns found, what SIEM detection rules would you recommend?
+```
+
+View or clear conversation history:
+
+```
+eventmill (log_analysis:linuxdroplettest) > history
+eventmill (log_analysis:linuxdroplettest) > history clear
+```
+
 ---
 
 ## 9. Review Execution History
