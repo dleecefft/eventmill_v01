@@ -652,6 +652,17 @@ class EventMillShell(cmd.Cmd):
                 print(f"  Invalid JSON payload: {e}")
                 return
         
+        # Resolve artifact_id → file_path for plugins that need a file
+        if "artifact_id" in payload:
+            art_path = self.session_manager.get_artifact_path(payload["artifact_id"])
+            if art_path is None:
+                print(f"  Artifact not found: {payload['artifact_id']}")
+                return
+            # Inject file_path (most plugins) and path (log_navigator)
+            payload.setdefault("file_path", str(art_path))
+            payload.setdefault("path", str(art_path))
+            del payload["artifact_id"]
+        
         # Get plugin instance
         instance = plugin.get_instance()
         
