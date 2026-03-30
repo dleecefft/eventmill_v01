@@ -9,9 +9,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any
 
 from ..plugins.protocol import LLMQueryInterface, LLMResponse
+
+try:
+    import google.generativeai as genai
+    _HAS_GENAI = True
+except ImportError:
+    _HAS_GENAI = False
 
 logger = logging.getLogger("eventmill.framework.llm")
 
@@ -47,6 +54,8 @@ class MCPLLMClient:
         self.max_retries = max_retries
         self._connected = False
         self._mcp_session = None
+        self._model = None
+        self._api_key_env_var: str | None = None
         self._total_tokens_used = 0
     
     @property
@@ -59,24 +68,37 @@ class MCPLLMClient:
         """Total tokens consumed across all queries in this session."""
         return self._total_tokens_used
     
-    async def connect(self) -> bool:
-        """Establish MCP connection.
+    def connect(self, api_key: str | None = None) -> bool:
+        """Establish connection to the LLM provider.
+        
+        Args:
+            api_key: API key for the provider. If None, uses the
+                     key from the environment variable set during init.
         
         Returns:
             True if connection succeeded.
         """
+        if not _HAS_GENAI:
+            logger.error("google-generativeai package not installed")
+            self._connected = False
+            return False
+        
+        resolved_key = api_key or os.environ.get(self._api_key_env_var or "", "")
+        if not resolved_key:
+            logger.error("No API key available for %s", self.model_id)
+            self._connected = False
+            return False
+        
         try:
-            # MCP connection initialization will be implemented
-            # when the mcp package is integrated
-            logger.info(
-                "Connecting to LLM via MCP (model=%s, transport=%s)",
-                self.model_id,
-                self.transport,
-            )
+            genai.configure(api_key=resolved_key)
+            self._model = genai.GenerativeModel(self.model_id)
             self._connected = True
+            logger.info(
+                "Connected to %s via Gemini SDK", self.model_id,
+            )
             return True
         except Exception as e:
-            logger.error("Failed to connect to MCP: %s", e)
+            logger.error("Failed to connect to %s: %s", self.model_id, e)
             self._connected = False
             return False
     
@@ -221,18 +243,36 @@ class MCPLLMClient:
         system_context: str | None,
         max_tokens: int,
     ) -> str:
-        """Execute a text query via MCP transport.
+        """Execute a text query via Gemini SDK (MCP bridge).
         
-        This is the integration point for the actual MCP SDK.
-        Currently a placeholder that will be replaced with real
-        MCP message passing when the transport is implemented.
+        Uses google-generativeai directly until full MCP transport
+        is integrated.
         """
-        # TODO: Implement actual MCP query via mcp package
-        # This will use self._mcp_session to send/receive messages
-        raise NotImplementedError(
-            "MCP transport not yet implemented. "
-            "Install and configure the mcp package to enable LLM queries."
+        if self._model is None:
+            raise RuntimeError("Model not initialised — call connect() first")
+        
+        generation_config = genai.types.GenerationConfig(
+            max_output_tokens=max_tokens,
         )
+        
+        parts = []
+        if system_context:
+            parts.append(f"System: {system_context}\n")
+        parts.append(prompt)
+        
+        response = self._model.generate_content(
+            "\n".join(parts),
+            generation_config=generation_config,
+        )
+        
+        text = response.text or ""
+        
+        # Track token usage if available
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
+            um = response.usage_metadata
+            self._total_tokens_used += getattr(um, "total_token_count", 0)
+        
+        return text
     
     def _execute_mcp_multimodal_query(
         self,
@@ -242,14 +282,31 @@ class MCPLLMClient:
         system_context: str | None,
         max_tokens: int,
     ) -> str:
-        """Execute a multimodal query via MCP transport.
+        """Execute a multimodal query via Gemini SDK (MCP bridge)."""
+        if self._model is None:
+            raise RuntimeError("Model not initialised — call connect() first")
         
-        Placeholder for MCP SDK integration.
-        """
-        # TODO: Implement actual MCP multimodal query
-        raise NotImplementedError(
-            "MCP multimodal transport not yet implemented."
+        import io
+        from PIL import Image
+        
+        image = Image.open(io.BytesIO(image_data))
+        
+        generation_config = genai.types.GenerationConfig(
+            max_output_tokens=max_tokens,
         )
+        
+        parts = []
+        if system_context:
+            parts.append(f"System: {system_context}\n")
+        parts.append(prompt)
+        parts.append(image)
+        
+        response = self._model.generate_content(
+            parts,
+            generation_config=generation_config,
+        )
+        
+        return response.text or ""
 
 
 class ContextBuilder:

@@ -216,9 +216,7 @@ class LogPatternAnalyzer:
 
             ai = data.get("ai_analysis")
             if ai:
-                # Truncate AI analysis to fit within budget
-                ai_truncated = ai[:500] + "..." if len(ai) > 500 else ai
-                parts.append(f"\nAI Insight: {ai_truncated}")
+                parts.append(f"\nAI Insight:\n{ai}")
 
             return "\n".join(parts)
 
@@ -432,13 +430,24 @@ class LogPatternAnalyzer:
                 + "\n\nProvide:\n"
                 "1. What technology/application generated these logs\n"
                 "2. Key security-relevant observations\n"
-                "3. Recommended next analysis steps with specific regex patterns\n"
-                "Keep response under 500 words."
+                "3. Threat assessment (severity, indicators of compromise)\n"
+                "4. Recommended next analysis steps with specific regex patterns "
+                "the analyst can use in Event Mill's log_pattern_analyzer (regex mode) "
+                "and log_searcher tools\n"
+                "Be thorough. This is a real investigation."
             )
 
-            llm_response = context.llm_query.query_text(prompt=prompt)
+            llm_response = context.llm_query.query_text(prompt=prompt, max_tokens=4096)
             if llm_response.ok:
                 return llm_response.text
+            import logging
+            logging.getLogger("eventmill.plugin.log_pattern_analyzer").warning(
+                "AI analysis request failed: %s", llm_response.error
+            )
             return None
-        except Exception:
+        except Exception as e:
+            import logging
+            logging.getLogger("eventmill.plugin.log_pattern_analyzer").warning(
+                "AI analysis error: %s", e
+            )
             return None

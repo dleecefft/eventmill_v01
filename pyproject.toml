@@ -39,6 +39,7 @@ dependencies = [
     "mcp>=1.0.0",
     "jsonschema>=4.20.0",
     "python-dotenv>=1.0.0",
+    "google-generativeai>=0.8.0",
 ]
 
 [project.optional-dependencies]

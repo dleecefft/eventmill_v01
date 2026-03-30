@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import cmd
 import os
+import random
 import signal
 import sys
 from pathlib import Path
@@ -25,6 +26,86 @@ from ..plugins.protocol import ExecutionContext, ReferenceDataView
 from ..cloud.resolver import StorageResolver, StorageResolverConfig, create_local_resolver
 
 logger = get_logger("cli")
+
+
+# ---------------------------------------------------------------------------
+# Metasploit-style random startup banners
+# ---------------------------------------------------------------------------
+
+_BANNERS = [
+    r"""
+     _____ _   _ _____ _   _ _____   __  __ ___ _     _
+    | ____| | | | ____| \ | |_   _| |  \/  |_ _| |   | |
+    |  _| | | | |  _| |  \| | | |   | |\/| || || |   | |
+    | |___| |_| | |___| |\  | | |   | |  | || || |___| |___
+    |_____|\___/|_____|_| \_| |_|   |_|  |_|___|_____|_____|
+""",
+    r"""
+    ╔══════════════════════════════════════════════════════╗
+    ║  ███████╗██╗   ██╗███████╗███╗   ██╗████████╗       ║
+    ║  ██╔════╝██║   ██║██╔════╝████╗  ██║╚══██╔══╝       ║
+    ║  █████╗  ██║   ██║█████╗  ██╔██╗ ██║   ██║          ║
+    ║  ██╔══╝  ╚██╗ ██╔╝██╔══╝  ██║╚██╗██║   ██║          ║
+    ║  ███████╗ ╚████╔╝ ███████╗██║ ╚████║   ██║          ║
+    ║  ╚══════╝  ╚═══╝  ╚══════╝╚═╝  ╚═══╝   ╚═╝          ║
+    ║              M  I  L  L                               ║
+    ╚══════════════════════════════════════════════════════╝
+""",
+    r"""
+               _             _
+     _____   _| |_     _ __ (_) | |
+    / _ \ \ / / __|   | '_ \| | | |
+   |  __/\ V /| |_    | | | | | | |
+    \___| \_/  \__|   |_| |_|_|_|_|
+      event           mill
+""",
+    r"""
+    ┌─────────────────────────────────────────┐
+    │  ╺━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸  │
+    │     E V E N T   M I L L   v0.1.0       │
+    │   event record analysis platform        │
+    │  ╺━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸  │
+    └─────────────────────────────────────────┘
+""",
+    r"""
+        ____                 __     __  ___ _  __  __
+       / __/ _  __ ___  ___ / /_   /  |/  /(_)/ / / /
+      / _/  | |/ // -_)/ _ / __/  / /|_/ // // / / /
+     /___/  |___/ \__//_//_\__/  /_/  /_//_//_/ /_/
+""",
+    r"""
+      .--.      .--.      .--.      .--.
+     /    \    /    \    /    \    /    \
+    | EVNT |--| MILL |--| v0.1|--| .0  |
+     \    /    \    /    \    /    \    /
+      `--'      `--'      `--'      `--'
+      upstream of the SIEM — analysis before commitment
+""",
+]
+
+# ANSI color codes — a random one is picked each launch
+_COLORS = [
+    "\033[1;31m",  # bold red
+    "\033[1;32m",  # bold green
+    "\033[1;33m",  # bold yellow
+    "\033[1;34m",  # bold blue
+    "\033[1;35m",  # bold magenta
+    "\033[1;36m",  # bold cyan
+    "\033[0;91m",  # light red
+    "\033[0;92m",  # light green
+    "\033[0;93m",  # light yellow
+    "\033[0;94m",  # light blue
+    "\033[0;95m",  # light magenta
+    "\033[0;96m",  # light cyan
+]
+_RESET = "\033[0m"
+
+
+def _random_banner() -> str:
+    """Return a randomly colored ASCII art banner."""
+    art = random.choice(_BANNERS)
+    color = random.choice(_COLORS)
+    return f"{color}{art}{_RESET}"
 
 
 class EventMillShell(cmd.Cmd):
@@ -110,7 +191,7 @@ class EventMillShell(cmd.Cmd):
         # Check for dual Gemini API keys (production setup)
         if os.environ.get("GEMINI_FLASH_API_KEY"):
             self._available_models.append({
-                "id": "gemini-2.0-flash",
+                "id": "gemini-2.5-flash",
                 "name": "Gemini Flash",
                 "tier": "light",
                 "env_var": "GEMINI_FLASH_API_KEY",
@@ -126,7 +207,7 @@ class EventMillShell(cmd.Cmd):
         # Fallback: legacy single GEMINI_API_KEY
         if not self._available_models and os.environ.get("GEMINI_API_KEY"):
             self._available_models.append({
-                "id": "gemini-2.0-flash",
+                "id": "gemini-2.5-flash",
                 "name": "Gemini (default)",
                 "tier": "default",
                 "env_var": "GEMINI_API_KEY",
@@ -160,15 +241,11 @@ class EventMillShell(cmd.Cmd):
     
     def preloop(self) -> None:
         """Display startup banner with summary stats."""
+        # Random colored ASCII art banner (Metasploit-style)
+        print(_random_banner())
+        
         # Build startup summary
-        lines = [
-            "",
-            "  ╔═══════════════════════════════════════════════╗",
-            "  ║           Event Mill v0.1.0                   ║",
-            "  ║   Event Record Analysis Platform              ║",
-            "  ╚═══════════════════════════════════════════════╝",
-            "",
-        ]
+        lines = []
         
         # Plugin/tool summary
         if self._load_errors:
@@ -920,8 +997,14 @@ class EventMillShell(cmd.Cmd):
             transport=transport,
         )
         
-        # Store the API key reference for the client to use
+        # Store the API key reference and connect
         self.llm_client._api_key_env_var = selected_model["env_var"]
+        
+        if not self.llm_client.connect(api_key=api_key):
+            print(f"  ✗ Failed to connect to {selected_model['name']}")
+            print("    Check that google-generativeai is installed and the API key is valid.")
+            self.llm_client = None
+            return
         
         # Log activity
         log_user_activity("connect_llm", {
