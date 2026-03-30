@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ..logging.structured import get_logger, setup_logging, log_user_activity, set_user_context
+from ..logging.structured import get_logger, setup_logging, log_user_activity, log_llm_interaction, set_user_context
 from ..session.manager import SessionManager
 from ..session.models import Pillar, ToolExecutionStatus
 from ..plugins.loader import PluginLoader
@@ -1127,19 +1127,34 @@ class EventMillShell(cmd.Cmd):
                     if total:
                         print(f"  [{total} tokens used]")
                 
-                # Log activity
-                log_user_activity("ask_llm", {
-                    "question_length": len(question),
-                    "response_length": len(response.text),
-                    "history_turns": len(self._conversation_history),
-                })
+                # Log LLM interaction
+                log_llm_interaction(
+                    prompt=question,
+                    response_text=response.text,
+                    model_id=self.llm_client.model_id,
+                    history_turns=len(self._conversation_history),
+                )
             else:
                 error = response.error or "Unknown error"
                 print(f"  ✗ LLM query failed: {error}")
+                log_llm_interaction(
+                    prompt=question,
+                    response_text=None,
+                    model_id=self.llm_client.model_id,
+                    history_turns=len(self._conversation_history),
+                    error=error,
+                )
                 
         except Exception as e:
             print(f"  ✗ Error: {e}")
             logger.error("LLM query error: %s", e, exc_info=True)
+            log_llm_interaction(
+                prompt=question,
+                response_text=None,
+                model_id=self.llm_client.model_id if self.llm_client else None,
+                history_turns=len(self._conversation_history),
+                error=str(e),
+            )
     
     def _build_conversation_context(self, session) -> str:
         """Assemble investigation context from session state for LLM grounding."""

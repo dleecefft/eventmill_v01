@@ -295,6 +295,61 @@ def log_user_activity(
     )
 
 
+def log_llm_interaction(
+    prompt: str,
+    response_text: str | None,
+    model_id: str | None = None,
+    history_turns: int = 0,
+    session_id: str | None = None,
+    error: str | None = None,
+) -> None:
+    """Log LLM conversational interaction for audit trail.
+    
+    Captures the analyst's prompt and a truncated LLM response.
+    Uses activity_type 'user_llm' to distinguish from regular
+    user actions in monitoring and cost tracking.
+    
+    Args:
+        prompt: The analyst's question/prompt (logged in full).
+        response_text: LLM response (truncated to 500 chars in log).
+        model_id: The LLM model used.
+        history_turns: Number of conversation turns so far.
+        session_id: Session ID (uses global if not provided).
+        error: Error message if the query failed.
+    """
+    if not _activity_logger:
+        return
+    
+    # Truncate response for log storage — full response lives in conversation history
+    truncated_response = None
+    if response_text:
+        truncated_response = (
+            response_text[:500] + "..." if len(response_text) > 500 else response_text
+        )
+    
+    extra: dict[str, Any] = {
+        "activity_type": "user_llm",
+        "action": "llm_query",
+        "user_id": _user_id or "anonymous",
+        "session_id": session_id or _session_id,
+        "details": {
+            "prompt": prompt,
+            "response_preview": truncated_response,
+            "response_length": len(response_text) if response_text else 0,
+            "model_id": model_id,
+            "history_turns": history_turns,
+        },
+    }
+    if error:
+        extra["details"]["error"] = error
+    
+    _activity_logger.info(
+        "LLM query: %s",
+        prompt[:80] + "..." if len(prompt) > 80 else prompt,
+        extra=extra,
+    )
+
+
 class ActivityJSONFormatter(logging.Formatter):
     """JSON formatter for user activity logs.
     
