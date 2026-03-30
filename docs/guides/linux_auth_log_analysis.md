@@ -168,20 +168,73 @@ eventmill (log_analysis:linuxdroplettest) > artifacts
 
 ## 8. Run Analysis Tools
 
-### Discover Log Patterns (Scan)
+### 8a. Discover Log Patterns (Recommended First Step)
 
 Identify the log format and structural patterns before writing any
-regex. This is the recommended first step when approaching unfamiliar
-logs:
+regex. Abstracts variable data (IPs, timestamps, numbers) into tokens
+to reveal the underlying log structure:
 
 ```
 eventmill (log_analysis:linuxdroplettest) > run log_pattern_analyzer {"mode": "discover", "artifact_id": "art_6e9d7524"}
 ```
 
-### Search for Specific Events
+To analyze the entire file instead of sampling (default samples 50,000
+lines):
+
+```
+eventmill (log_analysis:linuxdroplettest) > run log_pattern_analyzer {"mode": "discover", "artifact_id": "art_6e9d7524", "full_log": true}
+```
+
+Add AI interpretation of the discovered patterns (requires LLM
+connection via `connect`):
+
+```
+eventmill (log_analysis:linuxdroplettest) > run log_pattern_analyzer {"mode": "discover", "artifact_id": "art_6e9d7524", "full_log": true, "ai_analysis": true}
+```
+
+### 8b. GROK Pattern Analysis (Named Patterns)
+
+Use built-in named patterns for frequency analysis without writing
+regex. Available patterns include: `IP`, `USER`, `HTTPSTATUS`,
+`HTTPMETHOD`, `LOGLEVEL`, `PORT`, `PATH`, `URL`, `TIMESTAMP`,
+`EMAIL`, `UUID`, `HOSTNAME`, and more.
+
+Extract and count all source IPs:
+
+```
+eventmill (log_analysis:linuxdroplettest) > run log_pattern_analyzer {"mode": "grok", "artifact_id": "art_6e9d7524", "pattern": "IP"}
+```
+
+Extract usernames from auth logs:
+
+```
+eventmill (log_analysis:linuxdroplettest) > run log_pattern_analyzer {"mode": "grok", "artifact_id": "art_6e9d7524", "pattern": "USER"}
+```
+
+Control how many top results to return (default 10, max 100):
+
+```
+eventmill (log_analysis:linuxdroplettest) > run log_pattern_analyzer {"mode": "grok", "artifact_id": "art_6e9d7524", "pattern": "IP", "limit": 20}
+```
+
+### 8c. Custom Regex Analysis
+
+Use a custom regex with a capture group for targeted extraction:
+
+```
+eventmill (log_analysis:linuxdroplettest) > run log_pattern_analyzer {"mode": "regex", "artifact_id": "art_6e9d7524", "pattern": "Failed password for .* from (?P<src_ip>\\S+)"}
+```
+
+Analyze the full file instead of sampling:
+
+```
+eventmill (log_analysis:linuxdroplettest) > run log_pattern_analyzer {"mode": "regex", "artifact_id": "art_6e9d7524", "pattern": "Invalid user (\\S+)", "full_log": true}
+```
+
+### 8d. Search for Specific Events
 
 Search for authentication failures, brute-force indicators, or
-specific usernames:
+specific usernames using `log_searcher`:
 
 ```
 eventmill (log_analysis:linuxdroplettest) > run log_searcher {"artifact_id": "art_6e9d7524", "query": "Failed password"}
@@ -191,15 +244,13 @@ eventmill (log_analysis:linuxdroplettest) > run log_searcher {"artifact_id": "ar
 eventmill (log_analysis:linuxdroplettest) > run log_searcher {"artifact_id": "art_6e9d7524", "query": "Invalid user"}
 ```
 
-### Analyze with Regex/GROK Patterns
-
-Extract structured fields from auth log entries for frequency analysis:
+Use regex mode for more precise matching:
 
 ```
-eventmill (log_analysis:linuxdroplettest) > run log_pattern_analyzer {"mode": "regex", "artifact_id": "art_6e9d7524", "pattern": "Failed password for .* from (?P<src_ip>\\S+)"}
+eventmill (log_analysis:linuxdroplettest) > run log_searcher {"artifact_id": "art_6e9d7524", "query": "Failed password.*root", "mode": "regex"}
 ```
 
-### Read Log Segments
+### 8e. Read Log Segments
 
 Navigate to specific sections of the log for manual review:
 
@@ -207,7 +258,7 @@ Navigate to specific sections of the log for manual review:
 eventmill (log_analysis:linuxdroplettest) > run log_navigator {"action": "read", "artifact_id": "art_6e9d7524", "offset_lines": 0, "line_limit": 50}
 ```
 
-### AI-Powered Investigation
+### 8f. AI-Powered Investigation
 
 If an LLM is connected, run the investigator for automated threat
 assessment:
@@ -217,6 +268,12 @@ eventmill (log_analysis:linuxdroplettest) > connect
   ✓ Connected to Gemini Flash (gemini-2.0-flash)
 
 eventmill (log_analysis:linuxdroplettest) > run log_investigator {"mode": "investigate", "artifact_id": "art_6e9d7524", "search_term": "Failed password"}
+```
+
+Run a predefined SOC workflow for top-talker analysis:
+
+```
+eventmill (log_analysis:linuxdroplettest) > run log_investigator {"mode": "workflow", "artifact_id": "art_6e9d7524", "workflow_type": "top_talkers"}
 ```
 
 ---

@@ -211,7 +211,7 @@ class LogPatternAnalyzer:
 
             for p in patterns[:3]:
                 parts.append(
-                    f"  [{p['percentage']:.0f}%] {p['signature'][:80]}"
+                    f"  [{p['percentage']:.0f}%] {p['signature'][:160]}"
                 )
 
             ai = data.get("ai_analysis")
@@ -271,7 +271,7 @@ class LogPatternAnalyzer:
         self, file_path: Path, payload: dict[str, Any], context: Any
     ) -> ToolResult:
         """Auto-discover log structural patterns."""
-        sample_lines = payload.get("sample_lines", 500)
+        sample_lines = payload.get("sample_lines", 50000)
         full_log = payload.get("full_log", False)
         ai_analysis = payload.get("ai_analysis", False)
 
@@ -296,8 +296,8 @@ class LogPatternAnalyzer:
                 for pat, token in DISCOVER_ABSTRACTION_PATTERNS:
                     signature = re.sub(pat, token, signature)
 
-                if len(signature) > 200:
-                    signature = signature[:200] + "..."
+                if len(signature) > 300:
+                    signature = signature[:300] + "..."
 
                 signatures[signature] += 1
                 if signature not in examples:
