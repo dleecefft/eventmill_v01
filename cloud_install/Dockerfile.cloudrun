@@ -17,12 +17,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy dependency manifest and install with GCP + threat-modeling extras
-# gcp:                google-cloud-storage, secret-manager, logging
-# plugins-threat-modeling: pypdf (required for PDF report extraction)
+# Copy dependency manifest and install with GCP + plugin extras
+# gcp:                  google-cloud-storage, secret-manager, logging
+# plugins-threat-modeling: pypdf (PDF extraction for threat_report_analyzer)
+# plugins-log-analysis: pdfplumber, beautifulsoup4, python-docx, stix2 (for threat_intel_ingester)
 COPY pyproject.toml README.md ./
 RUN pip install --no-cache-dir build && \
-    pip install --no-cache-dir ".[gcp,plugins-threat-modeling]"
+    pip install --no-cache-dir ".[gcp,plugins-threat-modeling,plugins-log-analysis]"
 
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime
