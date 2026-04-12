@@ -23,7 +23,7 @@ from ..plugins.loader import PluginLoader, LoadedPlugin
 from ..routing.router import Router, RouterConfig
 from ..artifacts.registry import ArtifactRegistry, create_artifact_registration_callback
 from ..llm.client import MCPLLMClient, ContextBuilder, TieredLLMClient
-from ..plugins.protocol import ExecutionContext, ReferenceDataView
+from ..plugins.protocol import ExecutionContext, ReferenceDataView, ArtifactRef
 from ..cloud.resolver import StorageResolver, StorageResolverConfig, create_local_resolver
 
 logger = get_logger("cli")
@@ -865,9 +865,23 @@ class EventMillShell(cmd.Cmd):
         
         # Build execution context
         session = self.session_manager.get_current_session()
-        artifact_refs = []
+        # Session artifacts carry the user-visible IDs shown by 'artifacts' command
+        artifact_refs = [
+            ArtifactRef(
+                artifact_id=sa.artifact_id,
+                artifact_type=sa.artifact_type,
+                file_path=sa.file_path,
+                source_tool=getattr(sa, "source_tool", None),
+                metadata=getattr(sa, "metadata", None) or {},
+            )
+            for sa in self.session_manager.list_artifacts()
+        ]
+        # Append tool-produced artifacts from registry that aren't already present
         if self.artifact_registry:
-            artifact_refs = self.artifact_registry.list_all()
+            existing_ids = {a.artifact_id for a in artifact_refs}
+            for ra in self.artifact_registry.list_all():
+                if ra.artifact_id not in existing_ids:
+                    artifact_refs.append(ra)
         
         context = ExecutionContext(
             session_id=session.session_id,
