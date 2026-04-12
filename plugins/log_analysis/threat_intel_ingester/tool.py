@@ -266,6 +266,27 @@ Respond ONLY with a JSON object in this exact format:
 
 
 # ---------------------------------------------------------------------------
+# Protocol Types
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ToolResult:
+    ok: bool
+    result: dict[str, Any] | None = None
+    error_code: str | None = None
+    message: str | None = None
+    details: dict[str, Any] | None = None
+    output_artifacts: list[dict[str, Any]] | None = None
+
+
+@dataclass
+class ValidationResult:
+    ok: bool
+    errors: list[str] | None = None
+
+
+# ---------------------------------------------------------------------------
 # Tool Implementation
 # ---------------------------------------------------------------------------
 
@@ -305,7 +326,7 @@ class ThreatIntelIngester:
             "artifacts_produced": manifest["artifacts_produced"],
         }
 
-    def validate_inputs(self, payload: dict) -> dict:
+    def validate_inputs(self, payload: dict) -> ValidationResult:
         """Validate the input payload against the input schema."""
         errors = []
 
@@ -330,16 +351,25 @@ class ThreatIntelIngester:
             if not isinstance(mp, int) or mp < 1 or mp > 200:
                 errors.append("max_pages must be an integer between 1 and 200")
 
-        return {"ok": len(errors) == 0, "errors": errors}
+        return ValidationResult(ok=len(errors) == 0, errors=errors if errors else None)
 
-    def execute(self, payload: dict, context: Any) -> dict:
+    def execute(self, payload: dict, context: Any) -> ToolResult:
         """Ingest a threat intelligence report and extract structured IOC data.
 
         Two-pass extraction:
         1. Regex pass: identify IOC candidates from raw text
         2. LLM pass: refine confidence, filter false positives, map MITRE techniques
         """
-        artifact_id = payload["artifact_id"]
+        artifact_id = payload.get("artifact_id")
+        if not artifact_id:
+            return ToolResult(
+                ok=False,
+                error_code="INPUT_VALIDATION_FAILED",
+                message=(
+                    "artifact_id is required. "
+                    "Usage: run threat_intel_ingester {\"artifact_id\": \"<id>\"}"
+                ),
+            )
         source_context = payload.get("source_context", "")
         ioc_types = payload.get(
             "ioc_types",
@@ -356,21 +386,24 @@ class ThreatIntelIngester:
                 break
 
         if artifact is None:
-            return {
-                "ok": False,
-                "error_code": "ARTIFACT_NOT_FOUND",
-                "message": f"Artifact {artifact_id} not found in session.",
-            }
+            return ToolResult(
+                ok=False,
+                error_code="ARTIFACT_NOT_FOUND",
+                message=(
+                    f"Artifact {artifact_id!r} not found in session. "
+                    f"Use 'artifacts' to list loaded artifacts."
+                ),
+            )
 
         if artifact.artifact_type not in ("pdf_report", "html_report", "text", "docx_report"):
-            return {
-                "ok": False,
-                "error_code": "INPUT_VALIDATION_FAILED",
-                "message": (
+            return ToolResult(
+                ok=False,
+                error_code="INPUT_VALIDATION_FAILED",
+                message=(
                     f"Artifact type '{artifact.artifact_type}' is not supported. "
                     f"Expected pdf_report, html_report, text (including .md), or docx_report."
                 ),
-            }
+            )
 
         # --- Extract text ---
         logger.info(
@@ -386,11 +419,11 @@ class ThreatIntelIngester:
                 raw_text = extractor(str(artifact.file_path))
         except Exception as e:
             logger.error("Text extraction failed: %s", e)
-            return {
-                "ok": False,
-                "error_code": "ARTIFACT_UNREADABLE",
-                "message": f"Failed to extract text: {e}",
-            }
+            return ToolResult(
+                ok=False,
+                error_code="ARTIFACT_UNREADABLE",
+                message=f"Failed to extract text: {e}",
+            )
 
         page_count = raw_text.count("\n\n") + 1  # rough page estimate for non-PDF
 
@@ -563,9 +596,27 @@ class ThreatIntelIngester:
             output_artifact_id = art_ref.artifact_id
 
         # --- Build result ---
-        result = {
-            "ok": True,
-            "result": {
+        output_artifacts_list = None
+        if output_artifact_id:
+            output_artifacts_list = [
+                {
+                    "artifact_id": output_artifact_id,
+                    "artifact_type": "json_events",
+                    "file_path": output_artifact_path,
+                    "description": "Structured IOC records extracted from threat intel report.",
+                }
+            ]
+
+        logger.info(
+            "Ingestion complete: %d IOCs, %d MITRE techniques, %d high-priority",
+            len(filtered_iocs),
+            len(all_mitre),
+            high_priority_count,
+        )
+
+        return ToolResult(
+            ok=True,
+            result={
                 "report_metadata": {
                     "title": report_meta.get("title", ""),
                     "source_organization": report_meta.get("source_organization", ""),
@@ -588,34 +639,16 @@ class ThreatIntelIngester:
                     "confidence_distribution": confidence_dist,
                 },
             },
-        }
-
-        if output_artifact_id:
-            result["output_artifacts"] = [
-                {
-                    "artifact_id": output_artifact_id,
-                    "artifact_type": "json_events",
-                    "file_path": output_artifact_path,
-                    "description": "Structured IOC records extracted from threat intel report.",
-                }
-            ]
-
-        logger.info(
-            "Ingestion complete: %d IOCs, %d MITRE techniques, %d high-priority",
-            len(filtered_iocs),
-            len(all_mitre),
-            high_priority_count,
+            output_artifacts=output_artifacts_list,
         )
 
-        return result
-
-    def summarize_for_llm(self, result: dict) -> str:
+    def summarize_for_llm(self, result: Any) -> str:
         """Produce a compressed summary for LLM context window."""
-        if not result.get("ok"):
-            error = result.get("message", "Unknown error")
+        if not result.ok:
+            error = result.message or "Unknown error"
             return f"Threat intel ingestion failed: {error}"
 
-        r = result.get("result", {})
+        r = result.result or {}
         meta = r.get("report_metadata", {})
         summary = r.get("summary", {})
         mitre = r.get("mitre_mappings", [])
@@ -666,7 +699,7 @@ class ThreatIntelIngester:
                 parts.append(f"(and {tech_count - 6} more)")
 
         # Output artifact
-        artifacts = result.get("output_artifacts", [])
+        artifacts = result.output_artifacts or []
         if artifacts:
             art = artifacts[0]
             parts.append(

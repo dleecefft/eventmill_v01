@@ -844,9 +844,9 @@ class EventMillShell(cmd.Cmd):
                 print(f"  Artifact not found: {payload['artifact_id']}")
                 return
             # Inject file_path (most plugins) and path (log_navigator)
+            # Keep artifact_id — plugins using registry lookup still need it
             payload.setdefault("file_path", str(art_path))
             payload.setdefault("path", str(art_path))
-            del payload["artifact_id"]
         
         # Get plugin instance
         instance = plugin.get_instance()
