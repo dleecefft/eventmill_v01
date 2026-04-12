@@ -253,6 +253,15 @@ echo ""
 # Disabled pillars (cloud_investigation, risk_assessment) do not get
 # buckets until they are enabled.  Add them here when ready.
 #
+# Common bucket subdirectory layout (used by threat_report_analyzer):
+#   {BUCKET_PREFIX}-common/mitre/               MITRE ATT&CK JSON/STIX bundles
+#   {BUCKET_PREFIX}-common/capec/               CAPEC XML/JSON files
+#   {BUCKET_PREFIX}-common/cisa/                CISA KEV and advisory files
+#   {BUCKET_PREFIX}-common/vendor_advisories/   Vendor security bulletins
+#   {BUCKET_PREFIX}-common/threat_actors/       Threat actor profiles
+#   {BUCKET_PREFIX}-common/campaigns/           Threat campaign reports
+#   {BUCKET_PREFIX}-common/vulnerabilities/     CVE and vulnerability reports
+#
 # Automated ingestion systems write to the appropriate pillar bucket.
 # Which automations write to which buckets is site-specific and managed
 # by the implementation team outside of Event Mill.
@@ -321,6 +330,30 @@ if [ -n "${GCS_LOG_BUCKET}" ] && [ "${GCS_LOG_BUCKET}" != "${BUCKET_PREFIX}-log-
     echo "   Legacy bucket override detected: ${GCS_LOG_BUCKET}"
     create_bucket_if_missing "${GCS_LOG_BUCKET}" /tmp/eventmill-lifecycle-90d.json "legacy log bucket"
 fi
+
+# ---------------------------------------------------------------------------
+# Initialize common bucket folder structure for threat_report_analyzer
+# ---------------------------------------------------------------------------
+# Creates a .keep placeholder in each subdirectory so the folder hierarchy
+# is visible in the GCS console and operators know where to upload reports.
+# Each subdirectory maps to a source type in ThreatReportAnalyzer.REPORT_DIRECTORIES.
+# ---------------------------------------------------------------------------
+
+init_common_folder() {
+    local folder=$1
+    local dest="gs://${BUCKET_PREFIX}-common/${folder}/.keep"
+    if gsutil ls "${dest}" > /dev/null 2>&1; then
+        echo "   ✓ Folder already initialized: gs://${BUCKET_PREFIX}-common/${folder}/"
+    else
+        echo -n "" | gsutil cp - "${dest}" > /dev/null 2>&1
+        echo "   ✓ Initialized folder:         gs://${BUCKET_PREFIX}-common/${folder}/"
+    fi
+}
+
+echo "   Initializing threat intel folder structure in common bucket..."
+for folder in mitre capec cisa vendor_advisories threat_actors campaigns vulnerabilities; do
+    init_common_folder "${folder}"
+done
 
 echo ""
 
@@ -483,8 +516,16 @@ echo ""
 echo "  3. Upload files to the appropriate pillar bucket:"
 echo "     gsutil cp /path/to/logs/*.log gs://${BUCKET_PREFIX}-log-analysis/"
 echo "     gsutil cp /path/to/pcaps/*.pcap gs://${BUCKET_PREFIX}-network-forensics/"
-echo "     gsutil cp /path/to/threat-intel/*.json gs://${BUCKET_PREFIX}-common/"
 echo ""
-echo "  4. Use workspace folders to organize by incident:"
+echo "  4. Upload threat intelligence reports to common bucket (by source type):"
+echo "     gsutil cp /path/to/attack.json                   gs://${BUCKET_PREFIX}-common/mitre/"
+echo "     gsutil cp /path/to/capec.xml                    gs://${BUCKET_PREFIX}-common/capec/"
+echo "     gsutil cp /path/to/cisa-advisory.json           gs://${BUCKET_PREFIX}-common/cisa/"
+echo "     gsutil cp /path/to/vendor-bulletin.pdf          gs://${BUCKET_PREFIX}-common/vendor_advisories/"
+echo "     gsutil cp /path/to/actor-profile.json           gs://${BUCKET_PREFIX}-common/threat_actors/"
+echo "     gsutil cp /path/to/campaign-report.md           gs://${BUCKET_PREFIX}-common/campaigns/"
+echo "     gsutil cp /path/to/cve-report.json              gs://${BUCKET_PREFIX}-common/vulnerabilities/"
+echo ""
+echo "  5. Use workspace folders to organize by incident:"
 echo "     gsutil cp /path/to/logs/*.log gs://${BUCKET_PREFIX}-log-analysis/incident-2024-03/"
 echo ""
