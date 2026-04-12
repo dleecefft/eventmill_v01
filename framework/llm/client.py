@@ -307,6 +307,97 @@ class MCPLLMClient:
         return response.text or ""
 
 
+class TieredLLMClient:
+    """Routes LLM queries to Flash (light) or Pro (heavy) automatically.
+
+    When the user runs ``connect`` with no arguments, the shell creates one of
+    these wrapping all available models.  Plugins call ``query_text`` exactly
+    as before — the tier is selected transparently based on ``max_tokens``:
+
+        max_tokens <= LIGHT_THRESHOLD  →  light / Flash  (fast, cheap)
+        max_tokens >  LIGHT_THRESHOLD  →  heavy / Pro    (powerful, expensive)
+
+    If the preferred tier is not connected the other tier is used as fallback.
+    """
+
+    LIGHT_THRESHOLD: int = 3500
+
+    def __init__(self, clients: dict[str, MCPLLMClient]) -> None:
+        self._clients = clients
+
+    # --- Protocol compatibility -------------------------------------------------
+
+    @property
+    def connected(self) -> bool:
+        return any(c.connected for c in self._clients.values())
+
+    @property
+    def model_id(self) -> str:
+        parts = [c.model_id for tier in ("light", "heavy")
+                 if (c := self._clients.get(tier)) and c.connected]
+        return " + ".join(parts) if parts else "disconnected"
+
+    @property
+    def total_tokens_used(self) -> int:
+        return sum(c.total_tokens_used for c in self._clients.values())
+
+    def connected_models(self) -> list[dict[str, str]]:
+        return [{"tier": tier, "model_id": c.model_id}
+                for tier, c in self._clients.items() if c.connected]
+
+    # --- Routing ---------------------------------------------------------------
+
+    def _route(self, max_tokens: int) -> MCPLLMClient:
+        """Select the appropriate client for the given output token budget."""
+        prefer_heavy = max_tokens > self.LIGHT_THRESHOLD
+        order = ("heavy", "light") if prefer_heavy else ("light", "heavy")
+        for tier in order:
+            c = self._clients.get(tier)
+            if c and c.connected:
+                return c
+        raise RuntimeError("No LLM client connected — run 'connect' first")
+
+    # --- LLMQueryInterface methods ---------------------------------------------
+
+    def query_text(
+        self,
+        prompt: str,
+        system_context: str | None = None,
+        max_tokens: int = 4096,
+        grounding_data: list[str] | None = None,
+    ) -> LLMResponse:
+        try:
+            client = self._route(max_tokens)
+        except RuntimeError as e:
+            return LLMResponse(ok=False, error=str(e))
+        return client.query_text(
+            prompt=prompt,
+            system_context=system_context,
+            max_tokens=max_tokens,
+            grounding_data=grounding_data,
+        )
+
+    def query_multimodal(
+        self,
+        prompt: str,
+        image_data: bytes,
+        image_format: str,
+        system_context: str | None = None,
+        max_tokens: int = 4096,
+    ) -> LLMResponse:
+        try:
+            client = self._route(max_tokens)
+        except RuntimeError as e:
+            return LLMResponse(ok=False, error=str(e))
+        return client.query_multimodal(
+            prompt=prompt,
+            image_data=image_data,
+            image_format=image_format,
+            system_context=system_context,
+            max_tokens=max_tokens,
+        )
+
+
 class ContextBuilder:
     """Builds optimized LLM context from session state.
     

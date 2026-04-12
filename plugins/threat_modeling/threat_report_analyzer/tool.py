@@ -369,8 +369,12 @@ class ThreatReportAnalyzer:
         chunk_summaries: list[dict[str, Any]] = []
         chunk_artifacts: list[dict[str, Any]] = []
 
+        is_single_chunk = len(chunks) == 1
         for chunk in chunks:
-            cs = self._summarize_chunk(chunk, report_name, report_type, focus_areas, context)
+            cs = self._summarize_chunk(
+                chunk, report_name, report_type, focus_areas, context,
+                max_words=max_words if is_single_chunk else None,
+            )
             chunk_summaries.append(cs)
             if len(chunks) > 1:
                 artifact = self._write_chunk_artifact(cs, report_path, context)
@@ -604,10 +608,59 @@ class ThreatReportAnalyzer:
                     pages.append(page.extract_text() or "")
                 except Exception:
                     pages.append("")
-            return "\n\n".join(pages) if pages else None
+            raw = "\n\n".join(pages)
+            return self._normalize_pdf_text(raw) if raw else None
         except Exception as e:
             _log.error("PDF text extraction failed for %s: %s", file_path, e)
             return None
+
+    @staticmethod
+    def _normalize_pdf_text(text: str) -> str:
+        """Normalize fragmented PDF text where each word appears on its own line.
+
+        pypdf's extract_text() can produce one token per line for PDFs that lay
+        out text character-by-character or use certain composite fonts.  This
+        method detects that pattern and joins the fragments into readable prose,
+        preserving paragraph breaks, bullet points, and headings.
+        """
+
+        def join_fragments(frags: list[str]) -> str:
+            joined = " ".join(frags)
+            joined = re.sub(r"(\w)-\s(\w)", r"\1\2", joined)  # fix hyphenation
+            return re.sub(r"  +", " ", joined).strip()
+
+        result_blocks: list[str] = []
+        for block in re.split(r"\n{2,}", text):
+            lines = [l.strip() for l in block.split("\n") if l.strip()]
+            if not lines:
+                continue
+
+            avg_len = sum(len(l) for l in lines) / len(lines)
+            if avg_len >= 30:
+                result_blocks.append("\n".join(lines))
+                continue
+
+            # Fragmented — join intelligently preserving structure
+            buf: list[str] = []
+            out: list[str] = []
+
+            for line in lines:
+                if re.match(r"^\d{1,3}$", line):  # standalone page numbers
+                    continue
+                if re.match(r"^[•\-–*]\s|^\d+\.\s", line):  # bullet / numbered list
+                    if buf:
+                        out.append(join_fragments(buf))
+                        buf = []
+                    out.append(line)
+                else:
+                    buf.append(line)
+
+            if buf:
+                out.append(join_fragments(buf))
+
+            result_blocks.append("\n".join(out))
+
+        return "\n\n".join(result_blocks)
 
     def _split_pdf_into_chunks(
         self, file_path: Path, max_pages_per_chunk: int | None = None
@@ -636,7 +689,7 @@ class ThreatReportAnalyzer:
                         texts.append(reader.pages[i].extract_text() or "")
                     except Exception:
                         texts.append("")
-                content = "\n\n".join(texts)
+                content = self._normalize_pdf_text("\n\n".join(texts))
                 chunks.append(
                     Chunk(
                         index=len(chunks),
@@ -706,26 +759,42 @@ class ThreatReportAnalyzer:
         report_type: str,
         focus_areas: list[str],
         context: Any,
+        max_words: int | None = None,
     ) -> dict[str, Any]:
-        """Summarize one chunk using the Flash model (800-1500 words target)."""
+        """Summarize one chunk.  When max_words is supplied this is a single-chunk
+        report and the full SUMMARIZATION_PROMPT_TEMPLATE is used so the user's
+        word-count target is respected.  Multi-chunk reports use the section prompt.
+        """
         _log = logging.getLogger("eventmill.plugin.threat_report_analyzer")
         page_info = (
             f"pages {chunk.page_start}\u2013{chunk.page_end}"
             if chunk.page_start is not None
             else f"chunk {chunk.index + 1}"
         )
-        prompt = CHUNK_SUMMARIZATION_PROMPT_TEMPLATE.format(
-            report_name=report_name,
-            report_type=report_type,
-            page_info=page_info,
-            focus_areas=", ".join(focus_areas) if focus_areas else "General threat overview",
-            content=chunk.content,
-        )
+        if max_words is not None:
+            # Single-pass — use the full report prompt so word limit is respected
+            prompt = SUMMARIZATION_PROMPT_TEMPLATE.format(
+                report_name=report_name,
+                report_type=report_type,
+                max_words=max_words,
+                focus_areas=", ".join(focus_areas) if focus_areas else "General threat overview",
+                content=chunk.content,
+            )
+            out_tokens = max(2048, min(8192, max_words * 8))  # ~8 chars/token
+        else:
+            prompt = CHUNK_SUMMARIZATION_PROMPT_TEMPLATE.format(
+                report_name=report_name,
+                report_type=report_type,
+                page_info=page_info,
+                focus_areas=", ".join(focus_areas) if focus_areas else "General threat overview",
+                content=chunk.content,
+            )
+            out_tokens = 3072
         summary_text = chunk.content[:3000]
         techniques: list[str] = []
         if context and hasattr(context, "llm_query") and context.llm_query:
             try:
-                response = context.llm_query.query_text(prompt=prompt, max_tokens=2048)
+                response = context.llm_query.query_text(prompt=prompt, max_tokens=out_tokens)
                 if response.ok:
                     summary_text = response.text.strip()
                     techniques = self._extract_techniques(summary_text)

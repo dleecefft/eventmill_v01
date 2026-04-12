@@ -21,7 +21,7 @@ from ..session.models import Pillar, ToolExecutionStatus
 from ..plugins.loader import PluginLoader, LoadedPlugin
 from ..routing.router import Router, RouterConfig
 from ..artifacts.registry import ArtifactRegistry, create_artifact_registration_callback
-from ..llm.client import MCPLLMClient, ContextBuilder
+from ..llm.client import MCPLLMClient, ContextBuilder, TieredLLMClient
 from ..plugins.protocol import ExecutionContext, ReferenceDataView
 from ..cloud.resolver import StorageResolver, StorageResolverConfig, create_local_resolver
 
@@ -48,7 +48,7 @@ _BANNERS = [
     ║  ██╔══╝  ╚██╗ ██╔╝██╔══╝  ██║╚██╗██║   ██║          ║
     ║  ███████╗ ╚████╔╝ ███████╗██║ ╚████║   ██║          ║
     ║  ╚══════╝  ╚═══╝  ╚══════╝╚═╝  ╚═══╝   ╚═╝          ║
-    ║              M  I  L  L                               ║
+    ║              M  I  L  L                             ║
     ╚══════════════════════════════════════════════════════╝
 """,
     r"""
@@ -63,7 +63,7 @@ _BANNERS = [
     ┌─────────────────────────────────────────┐
     │  ╺━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸  │
     │     E V E N T   M I L L   v0.1.0       │
-    │   event record analysis platform        │
+    │   event record analysis platform       │
     │  ╺━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸  │
     └─────────────────────────────────────────┘
 """,
@@ -146,7 +146,7 @@ class EventMillShell(cmd.Cmd):
         # Initialize components
         self.session_manager = SessionManager(self.workspace_path)
         self.plugin_loader = PluginLoader(self.plugins_path)
-        self.llm_client: MCPLLMClient | None = None
+        self.llm_client: MCPLLMClient | TieredLLMClient | None = None
         self.router: Router | None = None
         self.artifact_registry: ArtifactRegistry | None = None
         self.context_builder = ContextBuilder()
@@ -1051,15 +1051,17 @@ class EventMillShell(cmd.Cmd):
             print("  Set GEMINI_FLASH_API_KEY and/or GEMINI_PRO_API_KEY environment variables.")
             return
         
-        print(f"  {'Model':20s} {'Tier':10s} {'ID':30s}")
-        print(f"  {'─' * 20} {'─' * 10} {'─' * 30}")
+        print(f"  {'Model':20s} {'Tier':10s} {'Status':14s} {'ID':30s}")
+        print(f"  {'─' * 20} {'─' * 10} {'─' * 14} {'─' * 30}")
         
         for model in self._available_models:
-            print(f"  {model['name']:20s} {model['tier']:10s} {model['id']:30s}")
+            status = self._model_connected_status(model)
+            print(f"  {model['name']:20s} {model['tier']:10s} {status:14s} {model['id']:30s}")
         
         print("")
-        print("  Use 'connect <model_id>' to connect to a specific model.")
-        print("  Tier 'light' = fast/cheap, 'heavy' = powerful/expensive")
+        print("  'connect'            — bind all models (tiered auto-routing)")
+        print("  'connect <model_id>' — bind a specific model only")
+        print(f"  Routing: max_tokens ≤ {TieredLLMClient.LIGHT_THRESHOLD} → light (Flash), > {TieredLLMClient.LIGHT_THRESHOLD} → heavy (Pro)")
     
     def do_connect(self, arg: str) -> None:
         """Connect to LLM.
@@ -1075,52 +1077,81 @@ class EventMillShell(cmd.Cmd):
             return
         
         model_id = arg.strip()
+        transport = os.environ.get("EVENTMILL_MCP_TRANSPORT", "stdio")
         
-        # Find the model configuration
-        selected_model = None
-        if model_id:
-            # Match by ID or name
+        if not model_id:
+            # No model specified — connect ALL available models as a tiered pair
+            connected_clients: dict[str, MCPLLMClient] = {}
+            failed: list[str] = []
+
             for m in self._available_models:
-                if m["id"] == model_id or m["name"].lower() == model_id.lower():
-                    selected_model = m
-                    break
-            if not selected_model:
-                print(f"  Model not found: {model_id}")
-                print("  Use 'models' to see available models.")
+                api_key = os.environ.get(m["env_var"])
+                if not api_key:
+                    failed.append(f"  ✗ {m['name']}: {m['env_var']} not set")
+                    continue
+                client = MCPLLMClient(model_id=m["id"], transport=transport)
+                client._api_key_env_var = m["env_var"]
+                if client.connect(api_key=api_key):
+                    connected_clients[m["tier"]] = client
+                    print(f"  ✓ {m['name']} ({m['id']})")
+                    print(f"    Tier: {m['tier']}")
+                else:
+                    failed.append(f"  ✗ {m['name']}: connection failed — check API key and google-generativeai install")
+
+            for msg in failed:
+                print(msg)
+
+            if not connected_clients:
+                print("  No models connected.")
                 return
-        else:
-            # Default to first available (prefer Flash for light operations)
-            selected_model = self._available_models[0]
-        
-        # Get the API key from environment
+
+            self.llm_client = TieredLLMClient(clients=connected_clients)
+
+            log_user_activity("connect_llm", {
+                "models": {tier: c.model_id for tier, c in connected_clients.items()},
+                "tiered": True,
+            })
+
+            if len(connected_clients) > 1:
+                print(f"")
+                print(f"  Auto-routing: max_tokens ≤ {TieredLLMClient.LIGHT_THRESHOLD} → light, "
+                      f"> {TieredLLMClient.LIGHT_THRESHOLD} → heavy")
+            return
+
+        # Specific model requested — single-client mode
+        selected_model = None
+        for m in self._available_models:
+            if m["id"] == model_id or m["name"].lower() == model_id.lower():
+                selected_model = m
+                break
+        if not selected_model:
+            print(f"  Model not found: {model_id}")
+            print("  Use 'models' to see available models.")
+            return
+
         api_key = os.environ.get(selected_model["env_var"])
         if not api_key:
             print(f"  API key not found in {selected_model['env_var']}")
             return
-        
-        transport = os.environ.get("EVENTMILL_MCP_TRANSPORT", "stdio")
-        
+
         self.llm_client = MCPLLMClient(
             model_id=selected_model["id"],
             transport=transport,
         )
-        
-        # Store the API key reference and connect
         self.llm_client._api_key_env_var = selected_model["env_var"]
-        
+
         if not self.llm_client.connect(api_key=api_key):
             print(f"  ✗ Failed to connect to {selected_model['name']}")
             print("    Check that google-generativeai is installed and the API key is valid.")
             self.llm_client = None
             return
-        
-        # Log activity
+
         log_user_activity("connect_llm", {
             "model_id": selected_model["id"],
             "model_name": selected_model["name"],
             "tier": selected_model["tier"],
         })
-        
+
         print(f"  ✓ Connected to {selected_model['name']} ({selected_model['id']})")
         print(f"    Tier: {selected_model['tier']}")
     
@@ -1358,6 +1389,17 @@ class EventMillShell(cmd.Cmd):
     # Helpers
     # -------------------------------------------------------------------
     
+    def _model_connected_status(self, model: dict) -> str:
+        """Return a short status string for a model entry in 'models' output."""
+        if self.llm_client is None:
+            return ""
+        if isinstance(self.llm_client, TieredLLMClient):
+            c = self.llm_client._clients.get(model["tier"])
+            return "✓ connected" if (c and c.connected) else ""
+        if isinstance(self.llm_client, MCPLLMClient):
+            return "✓ connected" if (self.llm_client.model_id == model["id"] and self.llm_client.connected) else ""
+        return ""
+
     def _infer_artifact_type(self, file_path: Path) -> str:
         """Infer artifact type from file extension.
         
