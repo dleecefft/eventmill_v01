@@ -883,17 +883,34 @@ class EventMillShell(cmd.Cmd):
                 if ra.artifact_id not in existing_ids:
                     artifact_refs.append(ra)
         
+        def _register_artifact(
+            artifact_type: str,
+            file_path: str,
+            source_tool: str,
+            metadata: dict,
+        ) -> ArtifactRef:
+            """Persist tool-produced artifacts in session_manager (visible in 'artifacts') and return a canonical ArtifactRef."""
+            session_art = self.session_manager.register_artifact(
+                artifact_type=artifact_type,
+                file_path=str(file_path),
+                source_tool=source_tool,
+                metadata=metadata or {},
+            )
+            return ArtifactRef(
+                artifact_id=session_art.artifact_id,
+                artifact_type=session_art.artifact_type,
+                file_path=str(file_path),
+                source_tool=source_tool,
+                metadata=metadata or {},
+            )
+
         context = ExecutionContext(
             session_id=session.session_id,
             selected_pillar=session.active_pillar or "",
             artifacts=artifact_refs,
             llm_enabled=self.llm_client is not None and self.llm_client.connected,
             llm_query=self.llm_client,
-            register_artifact=(
-                create_artifact_registration_callback(self.artifact_registry)
-                if self.artifact_registry
-                else None
-            ),
+            register_artifact=_register_artifact,
             reference_data=ReferenceDataView(),
         )
         

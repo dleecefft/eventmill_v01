@@ -425,7 +425,10 @@ class ThreatIntelIngester:
                 message=f"Failed to extract text: {e}",
             )
 
-        page_count = raw_text.count("\n\n") + 1  # rough page estimate for non-PDF
+        if artifact.artifact_type == "pdf_report":
+            page_count = raw_text.count("\n\n") + 1
+        else:
+            page_count = len(raw_text.splitlines())
 
         # --- Regex extraction pass ---
         logger.info("Running regex IOC extraction for types: %s", ioc_types)
@@ -659,7 +662,8 @@ class ThreatIntelIngester:
         title = meta.get("title", "Unknown report")
         artifact_type = meta.get("artifact_type", "unknown")
         pages = meta.get("page_count", "?")
-        parts.append(f"Ingested {artifact_type} ({pages} pages): {title}.")
+        size_label = "pages" if artifact_type == "pdf_report" else "lines"
+        parts.append(f"Ingested {artifact_type} ({pages} {size_label}): {title}.")
 
         # Attribution
         actor = meta.get("attributed_actor")
