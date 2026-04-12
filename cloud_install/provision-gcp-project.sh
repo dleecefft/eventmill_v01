@@ -355,6 +355,16 @@ for folder in mitre capec cisa vendor_advisories threat_actors campaigns vulnera
     init_common_folder "${folder}"
 done
 
+# Generated artifacts: tool-produced outputs stored back into the common bucket.
+# Convention: common/generated/{tool_name}/{source_relative_path}.summary.md
+# Tools read source data from the top-level subdirs above; they write processed
+# artifacts here.  Other tools (e.g. risk_assessment_analyzer, log_investigator)
+# discover pre-built summaries by scanning common/generated/ instead of re-running
+# the LLM.
+echo ""
+echo "   Initializing generated artifacts namespace in common bucket..."
+init_common_folder "generated/threat_report_analyzer"
+
 echo ""
 
 # =============================================================================
@@ -490,10 +500,12 @@ echo "Bucket prefix:    ${BUCKET_PREFIX}"
 echo "Artifact Reg:     ${REGION}-docker.pkg.dev/${PROJECT_ID}/eventmill"
 echo ""
 echo "Storage buckets:"
-echo "   gs://${BUCKET_PREFIX}-log-analysis         (log analysis)"
-echo "   gs://${BUCKET_PREFIX}-network-forensics    (network forensics)"
-echo "   gs://${BUCKET_PREFIX}-threat-modeling       (threat modeling)"
-echo "   gs://${BUCKET_PREFIX}-common                (shared reference data)"
+echo "   gs://${BUCKET_PREFIX}-log-analysis              (log analysis)"
+echo "   gs://${BUCKET_PREFIX}-network-forensics         (network forensics)"
+echo "   gs://${BUCKET_PREFIX}-threat-modeling           (threat modeling)"
+echo "   gs://${BUCKET_PREFIX}-common                    (shared reference data)"
+echo "   gs://${BUCKET_PREFIX}-common/generated/         (tool-generated artifacts)"
+echo "   gs://${BUCKET_PREFIX}-common/generated/threat_report_analyzer/"
 echo ""
 echo "Secrets created (placeholder values):"
 echo "   - eventmill-gemini-flash-api  (Flash / light tier)"

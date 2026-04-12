@@ -14,6 +14,7 @@ Conforms to EventMillToolProtocol with three actions:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass
@@ -35,6 +36,16 @@ class ToolResult:
 class ValidationResult:
     ok: bool
     errors: list[str] | None = None
+
+
+@dataclass
+class Chunk:
+    index: int
+    content: str
+    token_estimate: int
+    source_type: str
+    page_start: int | None = None
+    page_end: int | None = None
 
 
 SUMMARIZATION_PROMPT_TEMPLATE = """You are a Senior Threat Intelligence Analyst creating a concise reference document.
@@ -66,6 +77,62 @@ Generate a well-structured markdown summary with:
 Output ONLY the markdown summary, no preamble."""
 
 
+CHUNK_SUMMARIZATION_PROMPT_TEMPLATE = """You are a Senior Threat Intelligence Analyst summarizing one section of a larger threat report.
+
+SOURCE REPORT: {report_name}
+SOURCE TYPE: {report_type}
+SECTION: {page_info}
+WORD LIMIT: 800-1500 words
+
+INSTRUCTIONS:
+1. Summarize this section focusing on actionable threat intelligence
+2. Include specific MITRE ATT&CK technique IDs (Txxxx format) where present
+3. Note threat actors, malware families, and targeted industries
+4. Highlight detection opportunities and indicators of compromise
+
+FOCUS AREAS (if specified): {focus_areas}
+
+SECTION CONTENT:
+{content}
+
+Generate a structured markdown summary with:
+- Section Overview (1-2 sentences)
+- Key Techniques & Tactics (with ATT&CK IDs)
+- Threat Actors / Malware (if mentioned)
+- Detection Opportunities
+- Key Mitigations
+
+Output ONLY the markdown summary, no preamble."""
+
+
+SYNTHESIS_PROMPT_TEMPLATE = """You are a Senior Threat Intelligence Analyst synthesizing a complete threat report from section summaries.
+
+SOURCE REPORT: {report_name}
+TOTAL SECTIONS: {chunk_count}
+TARGET LENGTH: {max_words} words
+
+INSTRUCTIONS:
+1. Synthesize the section summaries into a single cohesive intelligence report
+2. Deduplicate and normalize all MITRE ATT&CK technique IDs
+3. Identify overarching threat patterns that span multiple sections
+4. Prioritize the most operationally relevant intelligence
+
+FOCUS AREAS (if specified): {focus_areas}
+
+SECTION SUMMARIES:
+{chunk_summaries}
+
+Generate a final markdown report with:
+- Executive Summary (2-3 sentences)
+- Key Threat Patterns
+- Relevant ATT&CK Techniques (normalized, deduplicated list with IDs)
+- Detection Opportunities
+- Recommended Security Controls
+- Sources and References
+
+Output ONLY the markdown report, no preamble."""
+
+
 class ThreatReportAnalyzer:
     """Analyze threat intelligence reports from common bucket.
 
@@ -87,7 +154,20 @@ class ThreatReportAnalyzer:
     ]
 
     # File extensions to look for
-    SUPPORTED_EXTENSIONS = {".json", ".xml", ".md", ".txt", ".csv", ".stix"}
+    SUPPORTED_EXTENSIONS = {".json", ".pdf", ".xml", ".md", ".txt", ".csv", ".stix"}
+
+    # Subdirectory within the common bucket where generated artifacts are written.
+    # Convention: {common_bucket}/generated/{tool_name}/{source_relative_path}.summary.md
+    # Other tools discover pre-built summaries by scanning common/generated/.
+    GENERATED_BASE = "generated"
+
+    # Intake and chunking limits
+    MAX_PDF_SIZE_BYTES = 50 * 1024 * 1024
+    MAX_PDF_PAGES = 1000
+    MAX_PAGES_PER_CHUNK = 100
+    MAX_TOKENS_PER_CHUNK = 100_000
+    MAX_TEXT_TOKENS_SINGLE_PASS = 150_000
+    CHARS_PER_TOKEN = 4
 
     def metadata(self) -> dict[str, Any]:
         return {
@@ -155,14 +235,18 @@ class ThreatReportAnalyzer:
 
         if action == "list_reports":
             reports = data.get("reports", [])
-            return f"Found {len(reports)} threat reports in common bucket: {', '.join(r['name'] for r in reports[:10])}"
+            return f"Found {len(reports)} threat reports in common bucket: {', '.join(r.get('relative_path', r['name']) for r in reports[:10])}"
 
         elif action == "summarize":
             summaries = data.get("summaries", [])
             if summaries:
                 s = summaries[0]
                 wc = s.get("word_count", 0)
-                return f"Summarized {s['report_path']} ({wc} words)"
+                chunks = s.get("chunk_count", 1)
+                stored = s.get("summary_path")
+                location = f" → {stored}" if stored else ""
+                chunk_info = f", {chunks} chunk(s)" if chunks > 1 else ""
+                return f"Summarized {s['report_path']} ({wc} words{chunk_info}){location}"
             return "Report summarized"
 
         elif action == "search_reports":
@@ -190,6 +274,19 @@ class ThreatReportAnalyzer:
             local_reports = self._scan_local_reference_data()
             reports.extend(local_reports)
 
+        for report in reports:
+            summary_path = self._summary_output_path(report["relative_path"], context)
+            report["has_summary"] = summary_path is not None and summary_path.exists()
+            if report["has_summary"]:
+                common_path = self._get_common_bucket_path(context)
+                if common_path:
+                    try:
+                        report["summary_relative_path"] = str(
+                            summary_path.relative_to(common_path)
+                        ).replace("\\", "/")
+                    except ValueError:
+                        pass
+
         return ToolResult(
             ok=True,
             result={
@@ -200,58 +297,118 @@ class ThreatReportAnalyzer:
         )
 
     def _summarize_report(self, payload: dict[str, Any], context: Any) -> ToolResult:
-        """Generate LLM-powered summary of a threat report."""
+        """Generate LLM-powered summary of a threat report, with chunking for large files."""
         report_path = payload["report_path"]
         max_words = payload.get("max_word_count", 2000)
         focus_areas = payload.get("focus_areas", [])
 
-        # Read report content
-        content = self._read_report_content(report_path, context)
-
-        if not content:
-            return ToolResult(
-                ok=False,
-                error_code="ARTIFACT_NOT_FOUND",
-                message=f"Report not found: {report_path}",
-            )
-
-        # Determine report type from extension
         report_type = self._get_report_type(report_path)
         report_name = report_path.rsplit("/", 1)[-1] if "/" in report_path else report_path
+        file_ext = Path(report_name).suffix.lower()
+        _log = logging.getLogger("eventmill.plugin.threat_report_analyzer")
 
-        summary_text = content
-        key_findings = []
-        relevant_techniques = []
+        # --- Build chunks based on file type ---
+        chunks: list[Chunk] = []
 
-        # Use LLM if available
-        if context and hasattr(context, "llm_query") and context.llm_query:
+        if file_ext == ".pdf":
+            file_obj = self._resolve_report_path(report_path, context)
+            if not file_obj:
+                return ToolResult(
+                    ok=False,
+                    error_code="ARTIFACT_NOT_FOUND",
+                    message=f"Report not found: {report_path}",
+                )
+            size_bytes = file_obj.stat().st_size
+            if size_bytes > self.MAX_PDF_SIZE_BYTES:
+                return ToolResult(
+                    ok=False,
+                    error_code="ARTIFACT_TOO_LARGE",
+                    message=(
+                        f"PDF exceeds 50 MB limit "
+                        f"({size_bytes // 1024 // 1024} MB): {report_path}"
+                    ),
+                )
+            chunks = self._split_pdf_into_chunks(file_obj)
+            if not chunks:
+                content = self._read_report_content(report_path, context)
+                if not content:
+                    return ToolResult(
+                        ok=False,
+                        error_code="PARSE_FAILED",
+                        message=f"PDF text extraction failed: {report_path}",
+                    )
+                chunks = self._split_text_into_chunks(content)
+        else:
+            content = self._read_report_content(report_path, context)
+            if not content:
+                return ToolResult(
+                    ok=False,
+                    error_code="ARTIFACT_NOT_FOUND",
+                    message=f"Report not found: {report_path}",
+                )
+            token_est = self.estimate_tokens(content)
+            _log.info("Estimated %d tokens for %s", token_est, report_name)
+            if token_est > self.MAX_TEXT_TOKENS_SINGLE_PASS:
+                return ToolResult(
+                    ok=False,
+                    error_code="INPUT_TOO_LARGE",
+                    message=(
+                        f"Text input (~{token_est:,} tokens) exceeds "
+                        f"{self.MAX_TEXT_TOKENS_SINGLE_PASS:,} token limit. "
+                        "Provide the report as a PDF for automatic chunking."
+                    ),
+                )
+            chunks = self._split_text_into_chunks(content)
+
+        # --- Summarize each chunk ---
+        chunk_summaries: list[dict[str, Any]] = []
+        chunk_artifacts: list[dict[str, Any]] = []
+
+        for chunk in chunks:
+            cs = self._summarize_chunk(chunk, report_name, report_type, focus_areas, context)
+            chunk_summaries.append(cs)
+            if len(chunks) > 1:
+                artifact = self._write_chunk_artifact(cs, report_path, context)
+                if artifact:
+                    chunk_artifacts.append(artifact)
+
+        # --- Synthesize ---
+        if len(chunk_summaries) == 1:
+            final_summary = chunk_summaries[0]["summary"]
+            relevant_techniques = chunk_summaries[0].get("techniques", [])
+        else:
+            final_summary = self._synthesize_summaries(
+                chunk_summaries, report_name, focus_areas, max_words, context
+            )
+            relevant_techniques = list(
+                {t for cs in chunk_summaries for t in cs.get("techniques", [])}
+            )
+
+        key_findings = self._extract_key_findings(final_summary)
+        word_count = len(final_summary.split())
+
+        # --- Persist final summary ---
+        output_artifacts: list[dict[str, Any]] = list(chunk_artifacts)
+        summary_relative = None
+        summary_path = self._summary_output_path(report_path, context)
+        if summary_path:
             try:
-                prompt = SUMMARIZATION_PROMPT_TEMPLATE.format(
-                    report_name=report_name,
-                    report_type=report_type,
-                    max_words=max_words,
-                    focus_areas=", ".join(focus_areas) if focus_areas else "General threat overview",
-                    content=content[:50000],  # Limit content size
+                summary_path.write_text(final_summary, encoding="utf-8")
+                common_path = self._get_common_bucket_path(context)
+                if common_path:
+                    summary_relative = str(
+                        summary_path.relative_to(common_path)
+                    ).replace("\\", "/")
+                output_artifacts.append(
+                    {
+                        "artifact_type": "text/markdown",
+                        "file_path": str(summary_path),
+                        "relative_path": summary_relative or str(summary_path),
+                        "source_tool": "threat_report_analyzer",
+                    }
                 )
-
-                response = context.llm_query.query_text(
-                    prompt=prompt,
-                    max_tokens=4096,
-                )
-
-                if response.ok:
-                    summary_text = response.text.strip()
-                    # Extract key findings and techniques from summary
-                    key_findings = self._extract_key_findings(summary_text)
-                    relevant_techniques = self._extract_techniques(summary_text)
             except Exception as e:
-                import logging
-
-                logging.getLogger("eventmill.plugin.threat_report_analyzer").warning(
-                    "LLM summarization failed: %s", e
-                )
-
-        word_count = len(summary_text.split())
+                _log.warning("Failed to persist final summary: %s", e)
 
         return ToolResult(
             ok=True,
@@ -260,14 +417,21 @@ class ThreatReportAnalyzer:
                 "summaries": [
                     {
                         "report_path": report_path,
+                        "summary_path": summary_relative,
+                        "chunk_count": len(chunks),
                         "word_count": word_count,
-                        "summary": summary_text,
+                        "summary": final_summary,
                         "key_findings": key_findings,
                         "relevant_techniques": relevant_techniques,
                     }
                 ],
+                "artifacts_created": [
+                    a.get("relative_path", a.get("file_path", ""))
+                    for a in chunk_artifacts
+                ],
             },
-            message=f"Summarized {report_path} ({word_count} words)",
+            output_artifacts=output_artifacts or None,
+            message=f"Summarized {report_path} ({len(chunks)} chunk(s), {word_count} words)",
         )
 
     def _search_reports(self, payload: dict[str, Any], context: Any) -> ToolResult:
@@ -284,28 +448,36 @@ class ThreatReportAnalyzer:
 
         # Search each report
         for report in reports:
-            report_file = report.get("path")
-            if not report_file:
+            local_file = report.get("local_path")
+            if not local_file:
                 continue
 
             try:
-                if Path(report_file).exists():
-                    with open(report_file, "r", encoding="utf-8", errors="replace") as f:
+                local_path_obj = Path(local_file)
+                if not local_path_obj.exists():
+                    continue
+                if local_path_obj.suffix.lower() == ".pdf":
+                    raw = self._extract_pdf_text(local_path_obj)
+                    content = raw.lower() if raw else ""
+                else:
+                    with open(local_file, "r", encoding="utf-8", errors="replace") as f:
                         content = f.read().lower()
 
-                    # Find matches
-                    matches = []
-                    for i, line in enumerate(content.split("\n"), 1):
-                        if query in line:
-                            matches.append(f"Line {i}: {line.strip()[:200]}")
+                # Find matches
+                matches = []
+                for i, line in enumerate(content.split("\n"), 1):
+                    if query in line:
+                        matches.append(f"Line {i}: {line.strip()[:200]}")
 
-                    if matches:
-                        search_results.append(
-                            {
-                                "report_path": report.get("path", ""),
-                                "matches": matches[:20],  # Limit matches per report
-                            }
-                        )
+                if matches:
+                    search_results.append(
+                        {
+                            "report_path": report.get("relative_path", report.get("name", "")),
+                            "name": report.get("name", ""),
+                            "subdirectory": report.get("subdirectory", ""),
+                            "matches": matches[:20],
+                        }
+                    )
             except Exception:
                 continue
 
@@ -322,6 +494,25 @@ class ThreatReportAnalyzer:
     # -------------------------------------------------------------------
     # Helpers
     # -------------------------------------------------------------------
+
+    def _get_generated_path(self, context: Any) -> Path | None:
+        """Return the generated artifacts directory for this tool within the common bucket."""
+        common_path = self._get_common_bucket_path(context)
+        if common_path is None:
+            return None
+        generated = common_path / self.GENERATED_BASE / "threat_report_analyzer"
+        generated.mkdir(parents=True, exist_ok=True)
+        return generated
+
+    def _summary_output_path(self, report_relative_path: str, context: Any) -> Path | None:
+        """Derive the .summary.md output path, mirroring the source directory structure."""
+        generated = self._get_generated_path(context)
+        if generated is None:
+            return None
+        normalized = report_relative_path.replace("\\", "/")
+        output = generated / (normalized + ".summary.md")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        return output
 
     def _get_common_bucket_path(self, context: Any) -> Path | None:
         """Get the common bucket path from context or environment."""
@@ -343,8 +534,255 @@ class ThreatReportAnalyzer:
             workspace_path = Path.cwd() / "workspace" / "storage" / common_bucket
             return workspace_path if workspace_path.exists() else None
 
+    def estimate_tokens(self, text: str) -> int:
+        """Estimate LLM token count (~4 characters per token)."""
+        return max(1, len(text) // self.CHARS_PER_TOKEN)
+
+    def _resolve_report_path(self, report_path: str, context: Any) -> Path | None:
+        """Resolve a report path (direct filesystem or bucket-relative) to an absolute Path."""
+        file_path = Path(report_path)
+        if file_path.exists():
+            return file_path
+        common_path = self._get_common_bucket_path(context)
+        if common_path:
+            normalized = report_path.replace("\\", "/")
+            candidate = common_path / Path(normalized)
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _extract_pdf_text(self, file_path: Path) -> str | None:
+        """Extract all text from a PDF file page-by-page using pypdf."""
+        _log = logging.getLogger("eventmill.plugin.threat_report_analyzer")
+        try:
+            import pypdf
+        except ImportError:
+            _log.warning("pypdf not installed; cannot extract PDF text from %s", file_path)
+            return None
+        try:
+            reader = pypdf.PdfReader(str(file_path))
+            pages = []
+            for page in reader.pages:
+                try:
+                    pages.append(page.extract_text() or "")
+                except Exception:
+                    pages.append("")
+            return "\n\n".join(pages) if pages else None
+        except Exception as e:
+            _log.error("PDF text extraction failed for %s: %s", file_path, e)
+            return None
+
+    def _split_pdf_into_chunks(
+        self, file_path: Path, max_pages_per_chunk: int | None = None
+    ) -> list[Chunk]:
+        """Split a PDF into page-range Chunks, each under MAX_PAGES_PER_CHUNK."""
+        _log = logging.getLogger("eventmill.plugin.threat_report_analyzer")
+        try:
+            import pypdf
+        except ImportError:
+            _log.warning("pypdf not installed; PDF chunking unavailable for %s", file_path.name)
+            return []
+        max_pages = max_pages_per_chunk or self.MAX_PAGES_PER_CHUNK
+        chunks: list[Chunk] = []
+        try:
+            reader = pypdf.PdfReader(str(file_path))
+            total_pages = min(len(reader.pages), self.MAX_PDF_PAGES)
+            _log.info(
+                "PDF %s: %d pages total, processing up to %d",
+                file_path.name, len(reader.pages), total_pages,
+            )
+            for start in range(0, total_pages, max_pages):
+                end = min(start + max_pages, total_pages)
+                texts = []
+                for i in range(start, end):
+                    try:
+                        texts.append(reader.pages[i].extract_text() or "")
+                    except Exception:
+                        texts.append("")
+                content = "\n\n".join(texts)
+                chunks.append(
+                    Chunk(
+                        index=len(chunks),
+                        content=content,
+                        token_estimate=self.estimate_tokens(content),
+                        source_type="pdf_pages",
+                        page_start=start + 1,
+                        page_end=end,
+                    )
+                )
+        except Exception as e:
+            _log.error("PDF chunking failed for %s: %s", file_path.name, e)
+        return chunks
+
+    def _split_text_into_chunks(
+        self, text: str, max_tokens: int | None = None
+    ) -> list[Chunk]:
+        """Split plain text into Chunks bounded by MAX_TOKENS_PER_CHUNK on paragraph breaks."""
+        limit = max_tokens or self.MAX_TOKENS_PER_CHUNK
+        max_chars = limit * self.CHARS_PER_TOKEN
+        if len(text) <= max_chars:
+            return [
+                Chunk(
+                    index=0,
+                    content=text,
+                    token_estimate=self.estimate_tokens(text),
+                    source_type="text",
+                )
+            ]
+        chunks: list[Chunk] = []
+        paragraphs = text.split("\n\n")
+        current: list[str] = []
+        current_len = 0
+        for para in paragraphs:
+            para_len = len(para) + 2
+            if current_len + para_len > max_chars and current:
+                content = "\n\n".join(current)
+                chunks.append(
+                    Chunk(
+                        index=len(chunks),
+                        content=content,
+                        token_estimate=self.estimate_tokens(content),
+                        source_type="text",
+                    )
+                )
+                current = [para]
+                current_len = para_len
+            else:
+                current.append(para)
+                current_len += para_len
+        if current:
+            content = "\n\n".join(current)
+            chunks.append(
+                Chunk(
+                    index=len(chunks),
+                    content=content,
+                    token_estimate=self.estimate_tokens(content),
+                    source_type="text",
+                )
+            )
+        return chunks
+
+    def _summarize_chunk(
+        self,
+        chunk: Chunk,
+        report_name: str,
+        report_type: str,
+        focus_areas: list[str],
+        context: Any,
+    ) -> dict[str, Any]:
+        """Summarize one chunk using the Flash model (800-1500 words target)."""
+        _log = logging.getLogger("eventmill.plugin.threat_report_analyzer")
+        page_info = (
+            f"pages {chunk.page_start}\u2013{chunk.page_end}"
+            if chunk.page_start is not None
+            else f"chunk {chunk.index + 1}"
+        )
+        prompt = CHUNK_SUMMARIZATION_PROMPT_TEMPLATE.format(
+            report_name=report_name,
+            report_type=report_type,
+            page_info=page_info,
+            focus_areas=", ".join(focus_areas) if focus_areas else "General threat overview",
+            content=chunk.content,
+        )
+        summary_text = chunk.content[:3000]
+        techniques: list[str] = []
+        if context and hasattr(context, "llm_query") and context.llm_query:
+            try:
+                response = context.llm_query.query_text(prompt=prompt, max_tokens=2048)
+                if response.ok:
+                    summary_text = response.text.strip()
+                    techniques = self._extract_techniques(summary_text)
+            except Exception as e:
+                _log.warning("Chunk summarization failed (chunk %d): %s", chunk.index, e)
+        return {
+            "chunk_index": chunk.index,
+            "page_start": chunk.page_start,
+            "page_end": chunk.page_end,
+            "source_type": chunk.source_type,
+            "token_estimate": chunk.token_estimate,
+            "summary": summary_text,
+            "techniques": techniques,
+        }
+
+    def _synthesize_summaries(
+        self,
+        chunk_summaries: list[dict[str, Any]],
+        report_name: str,
+        focus_areas: list[str],
+        max_words: int,
+        context: Any,
+    ) -> str:
+        """Second-pass synthesis: combine chunk summaries into a final cohesive report."""
+        _log = logging.getLogger("eventmill.plugin.threat_report_analyzer")
+
+        def _label(cs: dict[str, Any]) -> str:
+            if cs.get("page_start") is not None:
+                return f"Pages {cs['page_start']}\u2013{cs['page_end']}"
+            return f"Chunk {cs['chunk_index'] + 1}"
+
+        combined = "\n\n---\n\n".join(
+            f"[{_label(cs)}]\n{cs['summary']}" for cs in chunk_summaries
+        )
+        prompt = SYNTHESIS_PROMPT_TEMPLATE.format(
+            report_name=report_name,
+            chunk_count=len(chunk_summaries),
+            max_words=max_words,
+            focus_areas=", ".join(focus_areas) if focus_areas else "General threat overview",
+            chunk_summaries=combined,
+        )
+        if context and hasattr(context, "llm_query") and context.llm_query:
+            try:
+                response = context.llm_query.query_text(prompt=prompt, max_tokens=4096)
+                if response.ok:
+                    return response.text.strip()
+            except Exception as e:
+                _log.warning("Synthesis pass failed: %s", e)
+        return combined
+
+    def _write_chunk_artifact(
+        self,
+        chunk_summary: dict[str, Any],
+        report_path: str,
+        context: Any,
+    ) -> dict[str, Any] | None:
+        """Persist a chunk summary to disk and return its artifact descriptor."""
+        _log = logging.getLogger("eventmill.plugin.threat_report_analyzer")
+        generated = self._get_generated_path(context)
+        if generated is None:
+            return None
+        idx = chunk_summary["chunk_index"]
+        normalized = report_path.replace("\\", "/")
+        chunk_file = generated / f"{normalized}.chunk_{idx:03d}.summary.md"
+        chunk_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            chunk_file.write_text(chunk_summary["summary"], encoding="utf-8")
+            common_path = self._get_common_bucket_path(context)
+            relative = None
+            if common_path:
+                try:
+                    relative = str(chunk_file.relative_to(common_path)).replace("\\", "/")
+                except ValueError:
+                    pass
+            return {
+                "artifact_type": "text/markdown",
+                "tag": "threat_summary_chunk",
+                "file_path": str(chunk_file),
+                "relative_path": relative or str(chunk_file),
+                "source_tool": "threat_report_analyzer",
+                "metadata": {
+                    "source_report": report_path,
+                    "chunk_index": idx,
+                    "page_start": chunk_summary.get("page_start"),
+                    "page_end": chunk_summary.get("page_end"),
+                    "extracted_techniques": chunk_summary.get("techniques", []),
+                },
+            }
+        except Exception as e:
+            _log.warning("Failed to write chunk artifact: %s", e)
+            return None
+
     def _scan_directory(self, base_path: Path) -> list[dict[str, Any]]:
-        """Scan a directory for threat report files."""
+        """Scan a directory for threat report files, preserving nested relative paths."""
         reports = []
 
         for ext in self.SUPPORTED_EXTENSIONS:
@@ -352,17 +790,24 @@ class ThreatReportAnalyzer:
                 if file_path.is_file():
                     try:
                         size = file_path.stat().st_size
+                        relative = file_path.relative_to(base_path)
+                        parts = relative.parts
+                        if parts[0] == self.GENERATED_BASE:
+                            continue
                         reports.append(
                             {
-                                "path": str(file_path),
                                 "name": file_path.name,
+                                "relative_path": str(relative).replace("\\", "/"),
+                                "subdirectory": parts[0] if len(parts) > 1 else "",
+                                "depth": len(parts) - 1,
                                 "size_bytes": size,
+                                "local_path": str(file_path),
                             }
                         )
                     except Exception:
                         continue
 
-        return sorted(reports, key=lambda r: r["name"])
+        return sorted(reports, key=lambda r: r["relative_path"])
 
     def _scan_local_reference_data(self) -> list[dict[str, Any]]:
         """Scan local reference data directory as fallback."""
@@ -374,47 +819,35 @@ class ThreatReportAnalyzer:
                 if file_path.is_file() and file_path.suffix in self.SUPPORTED_EXTENSIONS:
                     try:
                         size = file_path.stat().st_size
+                        relative = file_path.relative_to(ref_data_path)
+                        parts = relative.parts
                         reports.append(
                             {
-                                "path": str(file_path),
                                 "name": file_path.name,
+                                "relative_path": str(relative).replace("\\", "/"),
+                                "subdirectory": parts[0] if len(parts) > 1 else "",
+                                "depth": len(parts) - 1,
                                 "size_bytes": size,
+                                "local_path": str(file_path),
                             }
                         )
                     except Exception:
                         continue
 
-        return sorted(reports, key=lambda r: r["name"])
+        return sorted(reports, key=lambda r: r["relative_path"])
 
     def _read_report_content(self, report_path: str, context: Any) -> str | None:
-        """Read content from a report file."""
-        # Try direct path first
-        file_path = Path(report_path)
-        if file_path.exists():
-            try:
-                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                    return f.read()
-            except Exception:
-                return None
-
-        # Try relative to common bucket
-        common_path = self._get_common_bucket_path(context)
-        if common_path:
-            # Handle nested paths like "mitre/attack.json"
-            relative_path = report_path
-            if "/" in report_path:
-                # Extract just filename if full path provided
-                relative_path = report_path.split("/", 1)[-1]
-
-            file_path = common_path / relative_path
-            if file_path.exists():
-                try:
-                    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                        return f.read()
-                except Exception:
-                    return None
-
-        return None
+        """Read content from a report file, resolving paths at any nesting depth."""
+        file_path = self._resolve_report_path(report_path, context)
+        if file_path is None:
+            return None
+        if file_path.suffix.lower() == ".pdf":
+            return self._extract_pdf_text(file_path)
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except Exception:
+            return None
 
     def _get_report_type(self, report_path: str) -> str:
         """Determine report type from path."""

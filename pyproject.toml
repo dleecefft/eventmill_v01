@@ -64,8 +64,11 @@ plugins-network-forensics = [
     "scapy>=2.5.0",
     "dpkt>=1.9.8",
 ]
+plugins-threat-modeling = [
+    "pypdf>=4.0.0",
+]
 all = [
-    "eventmill[dev,gcp,plugins-log-analysis,plugins-network-forensics]",
+    "eventmill[dev,gcp,plugins-log-analysis,plugins-network-forensics,plugins-threat-modeling]",
 ]
 
 [project.urls]
