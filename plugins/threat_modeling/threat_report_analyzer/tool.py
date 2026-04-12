@@ -398,6 +398,7 @@ class ThreatReportAnalyzer:
         summary_path = self._summary_output_path(report_path, context)
         if summary_path:
             try:
+                summary_path.parent.mkdir(parents=True, exist_ok=True)
                 summary_path.write_text(final_summary, encoding="utf-8")
                 common_path = self._get_common_bucket_path(context)
                 if common_path:
@@ -414,6 +415,21 @@ class ThreatReportAnalyzer:
                 )
             except Exception as e:
                 _log.warning("Failed to persist final summary: %s", e)
+        else:
+            # No local mirror — upload directly to GCS
+            normalized = report_path.replace("\\", "/")
+            gcs_object = f"{self.GENERATED_BASE}/threat_report_analyzer/{normalized}.summary.md"
+            if self._upload_to_gcs(final_summary, gcs_object, context):
+                bucket_name = self._get_common_bucket_name(context)
+                summary_relative = f"gs://{bucket_name}/{gcs_object}"
+                output_artifacts.append(
+                    {
+                        "artifact_type": "text/markdown",
+                        "gcs_uri": summary_relative,
+                        "relative_path": gcs_object,
+                        "source_tool": "threat_report_analyzer",
+                    }
+                )
 
         return ToolResult(
             ok=True,
@@ -766,40 +782,61 @@ class ThreatReportAnalyzer:
         report_path: str,
         context: Any,
     ) -> dict[str, Any] | None:
-        """Persist a chunk summary to disk and return its artifact descriptor."""
+        """Persist a chunk summary to disk (or GCS) and return its artifact descriptor."""
         _log = logging.getLogger("eventmill.plugin.threat_report_analyzer")
-        generated = self._get_generated_path(context)
-        if generated is None:
-            return None
         idx = chunk_summary["chunk_index"]
         normalized = report_path.replace("\\", "/")
-        chunk_file = generated / f"{normalized}.chunk_{idx:03d}.summary.md"
-        chunk_file.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            chunk_file.write_text(chunk_summary["summary"], encoding="utf-8")
-            common_path = self._get_common_bucket_path(context)
-            relative = None
-            if common_path:
-                try:
-                    relative = str(chunk_file.relative_to(common_path)).replace("\\", "/")
-                except ValueError:
-                    pass
-            return {
-                "artifact_type": "text/markdown",
-                "tag": "threat_summary_chunk",
-                "file_path": str(chunk_file),
-                "relative_path": relative or str(chunk_file),
-                "source_tool": "threat_report_analyzer",
-                "metadata": {
-                    "source_report": report_path,
-                    "chunk_index": idx,
-                    "page_start": chunk_summary.get("page_start"),
-                    "page_end": chunk_summary.get("page_end"),
-                    "extracted_techniques": chunk_summary.get("techniques", []),
-                },
-            }
-        except Exception as e:
-            _log.warning("Failed to write chunk artifact: %s", e)
+        generated = self._get_generated_path(context)
+
+        if generated is not None:
+            # Local mirror path
+            chunk_file = generated / f"{normalized}.chunk_{idx:03d}.summary.md"
+            chunk_file.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                chunk_file.write_text(chunk_summary["summary"], encoding="utf-8")
+                common_path = self._get_common_bucket_path(context)
+                relative = None
+                if common_path:
+                    try:
+                        relative = str(chunk_file.relative_to(common_path)).replace("\\", "/")
+                    except ValueError:
+                        pass
+                return {
+                    "artifact_type": "text/markdown",
+                    "tag": "threat_summary_chunk",
+                    "file_path": str(chunk_file),
+                    "relative_path": relative or str(chunk_file),
+                    "source_tool": "threat_report_analyzer",
+                    "metadata": {
+                        "source_report": report_path,
+                        "chunk_index": idx,
+                        "page_start": chunk_summary.get("page_start"),
+                        "page_end": chunk_summary.get("page_end"),
+                        "extracted_techniques": chunk_summary.get("techniques", []),
+                    },
+                }
+            except Exception as e:
+                _log.warning("Failed to write chunk artifact: %s", e)
+                return None
+        else:
+            # No local mirror — upload chunk to GCS
+            gcs_object = f"{self.GENERATED_BASE}/threat_report_analyzer/{normalized}.chunk_{idx:03d}.summary.md"
+            if self._upload_to_gcs(chunk_summary["summary"], gcs_object, context):
+                bucket_name = self._get_common_bucket_name(context)
+                return {
+                    "artifact_type": "text/markdown",
+                    "tag": "threat_summary_chunk",
+                    "gcs_uri": f"gs://{bucket_name}/{gcs_object}",
+                    "relative_path": gcs_object,
+                    "source_tool": "threat_report_analyzer",
+                    "metadata": {
+                        "source_report": report_path,
+                        "chunk_index": idx,
+                        "page_start": chunk_summary.get("page_start"),
+                        "page_end": chunk_summary.get("page_end"),
+                        "extracted_techniques": chunk_summary.get("techniques", []),
+                    },
+                }
             return None
 
     def _scan_directory(self, base_path: Path) -> list[dict[str, Any]]:
@@ -932,6 +969,34 @@ class ThreatReportAnalyzer:
         except Exception as e:
             _log.warning("GCS download failed (%s/%s): %s", bucket_name, object_path, e)
             return None
+
+    def _upload_to_gcs(self, content: str, object_path: str, context: Any) -> bool:
+        """Upload text content to a GCS object in the common bucket.
+
+        Used to persist generated summaries when no local common-bucket mirror
+        exists (local dev pointing at real GCS, or Cloud Run).
+        Returns True on success, False on any failure.
+        """
+        _log = logging.getLogger("eventmill.plugin.threat_report_analyzer")
+        bucket_name = self._get_common_bucket_name(context)
+        try:
+            from google.cloud import storage as gcs_storage
+        except ImportError:
+            _log.warning("google-cloud-storage not installed; cannot upload to GCS")
+            return False
+        try:
+            project = os.environ.get("GCP_PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT")
+            client = gcs_storage.Client(project=project)
+            blob = client.bucket(bucket_name).blob(object_path)
+            blob.upload_from_string(
+                content.encode("utf-8"),
+                content_type="text/markdown; charset=utf-8",
+            )
+            _log.info("Uploaded summary → gs://%s/%s", bucket_name, object_path)
+            return True
+        except Exception as e:
+            _log.warning("GCS upload failed (%s/%s): %s", bucket_name, object_path, e)
+            return False
 
     def _read_report_content(self, report_path: str, context: Any) -> str | None:
         """Read content from a report file, resolving paths at any nesting depth."""
