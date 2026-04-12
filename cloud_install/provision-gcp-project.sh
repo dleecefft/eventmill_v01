@@ -129,6 +129,10 @@ gcloud services enable secretmanager.googleapis.com --project="${PROJECT_ID}" --
 echo "   Enabling Generative Language API (generativelanguage.googleapis.com)..."
 gcloud services enable generativelanguage.googleapis.com --project="${PROJECT_ID}" --quiet
 
+# Cloud Logging — used by Event Mill for structured audit logging (google-cloud-logging)
+echo "   Enabling Cloud Logging API (logging.googleapis.com)..."
+gcloud services enable logging.googleapis.com --project="${PROJECT_ID}" --quiet
+
 # API Keys — required for programmatic API key creation and restriction
 echo "   Enabling API Keys API (apikeys.googleapis.com)..."
 gcloud services enable apikeys.googleapis.com --project="${PROJECT_ID}" --quiet

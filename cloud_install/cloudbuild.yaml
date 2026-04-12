@@ -48,7 +48,7 @@ steps:
       - '--port'
       - '8080'
       - '--memory'
-      - '512Mi'
+      - '1Gi'
       - '--cpu'
       - '1'
       - '--timeout'
@@ -59,8 +59,12 @@ steps:
       - '0'
       - '--max-instances'
       - '3'
+      - '--service-account'
+      - 'eventmill-runner@$PROJECT_ID.iam.gserviceaccount.com'
+      - '--set-secrets'
+      - 'GEMINI_FLASH_API_KEY=eventmill-gemini-flash-api:latest,GEMINI_PRO_API_KEY=eventmill-gemini-pro-api:latest,TTYD_USERNAME=eventmill-ttyd-user:latest,TTYD_PASSWORD=eventmill-ttyd-cred:latest'
       - '--set-env-vars'
-      - 'EVENTMILL_LOG_LEVEL=INFO'
+      - 'EVENTMILL_BUCKET_PREFIX=${_BUCKET_PREFIX},EVENTMILL_LOG_LEVEL=INFO'
       - '--allow-unauthenticated'
 
 images:
@@ -69,6 +73,7 @@ images:
 
 substitutions:
   _REGION: northamerica-northeast2
+  _BUCKET_PREFIX: eventmill
 
 options:
   logging: CLOUD_LOGGING_ONLY

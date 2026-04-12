@@ -17,10 +17,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy dependency manifest and install with GCP extras
+# Copy dependency manifest and install with GCP + threat-modeling extras
+# gcp:                google-cloud-storage, secret-manager, logging
+# plugins-threat-modeling: pypdf (required for PDF report extraction)
 COPY pyproject.toml README.md ./
 RUN pip install --no-cache-dir build && \
-    pip install --no-cache-dir ".[gcp]"
+    pip install --no-cache-dir ".[gcp,plugins-threat-modeling]"
 
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime

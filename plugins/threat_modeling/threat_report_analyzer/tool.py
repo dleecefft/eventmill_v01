@@ -264,15 +264,20 @@ class ThreatReportAnalyzer:
         """List available threat reports in common bucket."""
         reports = []
 
-        # Try to get common bucket path from config or environment
         common_path = self._get_common_bucket_path(context)
 
         if common_path and common_path.exists():
             reports = self._scan_directory(common_path)
-        else:
-            # Fallback: scan local reference data directory
-            local_reports = self._scan_local_reference_data()
-            reports.extend(local_reports)
+
+        if not reports:
+            # Try GCS bucket directly (handles local dev pointing at real GCS)
+            gcs_reports = self._scan_gcs_bucket(self._get_common_bucket_name(context))
+            if gcs_reports:
+                reports = gcs_reports
+            else:
+                # Final fallback: local reference data
+                local_reports = self._scan_local_reference_data()
+                reports.extend(local_reports)
 
         for report in reports:
             summary_path = self._summary_output_path(report["relative_path"], context)
@@ -514,42 +519,58 @@ class ThreatReportAnalyzer:
         output.parent.mkdir(parents=True, exist_ok=True)
         return output
 
-    def _get_common_bucket_path(self, context: Any) -> Path | None:
-        """Get the common bucket path from context or environment."""
-        # Try to get from context config
+    def _get_common_bucket_name(self, context: Any) -> str:
+        """Return the common GCS bucket name from context config or environment.
+
+        Reads EVENTMILL_BUCKET_PREFIX and EVENTMILL_BUCKET_COMMON from
+        context.config first, then falls back to os.environ.  context.config
+        is an empty dict by default, so the env-var fallback is always tried.
+        """
+        config = {}
         if context and hasattr(context, "config"):
             config = context.config or {}
-            bucket_prefix = config.get("EVENTMILL_BUCKET_PREFIX", "eventmill")
-            common_bucket = f"{bucket_prefix}-common"
-        else:
-            bucket_prefix = os.environ.get("EVENTMILL_BUCKET_PREFIX", "eventmill")
-            common_bucket = f"{bucket_prefix}-common"
+        bucket_prefix = (
+            config.get("EVENTMILL_BUCKET_PREFIX")
+            or os.environ.get("EVENTMILL_BUCKET_PREFIX", "eventmill")
+        )
+        override = (
+            config.get("EVENTMILL_BUCKET_COMMON")
+            or os.environ.get("EVENTMILL_BUCKET_COMMON")
+        )
+        return override or f"{bucket_prefix}-common"
 
-        # Check if running in Cloud Run (GCS) or local
+    def _get_common_bucket_path(self, context: Any) -> Path | None:
+        """Get the local filesystem path for the common bucket (local dev only).
+
+        Returns None when running in Cloud Run (K_SERVICE set) or when the
+        local mirror directory does not exist.  Callers that need GCS access
+        should use _get_common_bucket_name() and the GCS helpers directly.
+        """
         if os.environ.get("K_SERVICE"):
-            # In Cloud Run, we'd need GCS client - return None to use fallback
             return None
-        else:
-            # Local development: use local storage path
-            workspace_path = Path.cwd() / "workspace" / "storage" / common_bucket
-            return workspace_path if workspace_path.exists() else None
+        common_bucket = self._get_common_bucket_name(context)
+        workspace_path = Path.cwd() / "workspace" / "storage" / common_bucket
+        return workspace_path if workspace_path.exists() else None
 
     def estimate_tokens(self, text: str) -> int:
         """Estimate LLM token count (~4 characters per token)."""
         return max(1, len(text) // self.CHARS_PER_TOKEN)
 
     def _resolve_report_path(self, report_path: str, context: Any) -> Path | None:
-        """Resolve a report path (direct filesystem or bucket-relative) to an absolute Path."""
+        """Resolve a report path to an absolute local Path, downloading from GCS if needed."""
+        # 1. Direct filesystem path
         file_path = Path(report_path)
         if file_path.exists():
             return file_path
+        # 2. Local common bucket mirror
         common_path = self._get_common_bucket_path(context)
         if common_path:
             normalized = report_path.replace("\\", "/")
             candidate = common_path / Path(normalized)
             if candidate.exists():
                 return candidate
-        return None
+        # 3. Download from GCS on demand
+        return self._download_from_gcs(self._get_common_bucket_name(context), report_path)
 
     def _extract_pdf_text(self, file_path: Path) -> str | None:
         """Extract all text from a PDF file page-by-page using pypdf."""
@@ -835,6 +856,82 @@ class ThreatReportAnalyzer:
                         continue
 
         return sorted(reports, key=lambda r: r["relative_path"])
+
+    def _scan_gcs_bucket(self, bucket_name: str) -> list[dict[str, Any]]:
+        """List threat reports directly from a GCS bucket.
+
+        Used when the local common-bucket mirror does not exist, i.e. local
+        development pointing at a real GCS bucket.  Returns an empty list if
+        google-cloud-storage is not installed or credentials are unavailable.
+        """
+        _log = logging.getLogger("eventmill.plugin.threat_report_analyzer")
+        try:
+            from google.cloud import storage as gcs_storage
+        except ImportError:
+            _log.warning(
+                "google-cloud-storage not installed; GCS listing unavailable for %s", bucket_name
+            )
+            return []
+        try:
+            project = os.environ.get("GCP_PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT")
+            client = gcs_storage.Client(project=project)
+            reports = []
+            for blob in client.list_blobs(bucket_name):
+                suffix = Path(blob.name).suffix.lower()
+                if suffix not in self.SUPPORTED_EXTENSIONS:
+                    continue
+                parts = Path(blob.name).parts
+                if parts and parts[0] == self.GENERATED_BASE:
+                    continue
+                reports.append(
+                    {
+                        "name": Path(blob.name).name,
+                        "relative_path": blob.name.replace("\\", "/"),
+                        "subdirectory": parts[0] if len(parts) > 1 else "",
+                        "depth": len(parts) - 1,
+                        "size_bytes": blob.size or 0,
+                        "local_path": None,
+                        "gcs_uri": f"gs://{bucket_name}/{blob.name}",
+                    }
+                )
+            return sorted(reports, key=lambda r: r["relative_path"])
+        except Exception as e:
+            _log.warning("GCS bucket scan failed (%s): %s", bucket_name, e)
+            return []
+
+    def _download_from_gcs(self, bucket_name: str, object_path: str) -> Path | None:
+        """Download a GCS object to a local temp file and return the path.
+
+        Used by _resolve_report_path when the file is not present in the local
+        common-bucket mirror.  The caller is responsible for the temp file; it
+        will be cleaned up by the OS on process exit.
+        """
+        import tempfile
+
+        _log = logging.getLogger("eventmill.plugin.threat_report_analyzer")
+        try:
+            from google.cloud import storage as gcs_storage
+        except ImportError:
+            _log.warning("google-cloud-storage not installed; cannot download from GCS")
+            return None
+        try:
+            normalized = object_path.replace("\\", "/")
+            project = os.environ.get("GCP_PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT")
+            client = gcs_storage.Client(project=project)
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(normalized)
+            if not blob.exists():
+                _log.warning("GCS object not found: gs://%s/%s", bucket_name, normalized)
+                return None
+            suffix = Path(normalized).suffix or ".bin"
+            fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+            os.close(fd)
+            blob.download_to_filename(tmp_path)
+            _log.info("Downloaded gs://%s/%s → %s", bucket_name, normalized, tmp_path)
+            return Path(tmp_path)
+        except Exception as e:
+            _log.warning("GCS download failed (%s/%s): %s", bucket_name, object_path, e)
+            return None
 
     def _read_report_content(self, report_path: str, context: Any) -> str | None:
         """Read content from a report file, resolving paths at any nesting depth."""
