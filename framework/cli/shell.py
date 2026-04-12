@@ -10,6 +10,7 @@ from __future__ import annotations
 import cmd
 import os
 import random
+import shlex
 import signal
 import sys
 from pathlib import Path
@@ -560,7 +561,10 @@ class EventMillShell(cmd.Cmd):
             print("  No active session. Use 'new' to create one.")
             return
         
-        parts = arg.strip().split(maxsplit=1)
+        try:
+            parts = shlex.split(arg.strip())
+        except ValueError:
+            parts = arg.strip().split(maxsplit=1)
         if not parts:
             print("  Usage: load <file_path_or_name> [artifact_type]")
             return
