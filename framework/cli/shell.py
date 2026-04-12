@@ -18,7 +18,7 @@ from typing import Any
 from ..logging.structured import get_logger, setup_logging, log_user_activity, log_llm_interaction, set_user_context
 from ..session.manager import SessionManager
 from ..session.models import Pillar, ToolExecutionStatus
-from ..plugins.loader import PluginLoader
+from ..plugins.loader import PluginLoader, LoadedPlugin
 from ..routing.router import Router, RouterConfig
 from ..artifacts.registry import ArtifactRegistry, create_artifact_registration_callback
 from ..llm.client import MCPLLMClient, ContextBuilder
@@ -691,14 +691,121 @@ class EventMillShell(cmd.Cmd):
             print("  No tools available.")
             return
         
-        print(f"  {'Tool':30s} {'Pillar':20s} {'Stability':12s} Description")
-        print(f"  {'─' * 30} {'─' * 20} {'─' * 12} {'─' * 30}")
+        print(f"  {'Display Name':30s} {'Invoke As':30s} {'Pillar':20s} {'Stability':12s} Description")
+        print(f"  {'─' * 30} {'─' * 30} {'─' * 20} {'─' * 12} {'─' * 50}")
         
         for p in plugins:
             m = p.manifest
-            desc = m.description_short[:40] if m.description_short else "—"
-            print(f"  {m.display_name:30s} {m.pillar:20s} {m.stability:12s} {desc}")
+            desc = m.description_short[:80] if m.description_short else "—"
+            invoke = f"run {m.tool_name}"
+            print(f"  {m.display_name:30s} {invoke:30s} {m.pillar:20s} {m.stability:12s} {desc}")
     
+    def do_help(self, arg: str) -> None:
+        """Show help for a command or tool.
+
+        Usage: help [command_or_tool_name]
+
+        For tool-specific usage, pass the tool name:
+          help threat_report_analyzer
+        """
+        if arg:
+            plugin = self.plugin_loader.get(arg.strip())
+            if plugin:
+                self._print_tool_help(plugin)
+                return
+        super().do_help(arg)
+
+    def _print_tool_help(self, plugin: LoadedPlugin) -> None:
+        """Print help for a tool by rendering its README.md."""
+        m = plugin.manifest
+        readme_path = m.plugin_dir / "README.md"
+
+        print()
+        print(f"  {'─' * 60}")
+        print(f"  {m.display_name}  ({m.tool_name})")
+        print(f"  Pillar: {m.pillar}   Stability: {m.stability}")
+        print(f"  Invoke: run {m.tool_name} {{\"action\": \"...\"}}") 
+        print(f"  {'─' * 60}")
+        print()
+
+        if readme_path.exists():
+            rendered = self._render_markdown_plain(readme_path.read_text(encoding="utf-8"))
+            print(rendered)
+        else:
+            print(f"  {m.description_short}")
+            print()
+            print("  No README.md available for this tool.")
+        print()
+
+    @staticmethod
+    def _render_markdown_plain(text: str) -> str:
+        """Convert Markdown to readable plain-text for terminal display."""
+        import re
+        import textwrap
+
+        lines = text.splitlines()
+        out: list[str] = []
+        in_code = False
+
+        for line in lines:
+            # Toggle fenced code block
+            if line.startswith("```"):
+                in_code = not in_code
+                if in_code:
+                    out.append("")
+                else:
+                    out.append("")
+                continue
+
+            if in_code:
+                out.append(f"    {line}")
+                continue
+
+            # H1
+            if line.startswith("# "):
+                title = line[2:].strip()
+                out.append(f"\n  {title}")
+                out.append(f"  {'═' * len(title)}")
+                continue
+            # H2
+            if line.startswith("## "):
+                title = line[3:].strip()
+                out.append(f"\n  {title}")
+                out.append(f"  {'─' * len(title)}")
+                continue
+            # H3
+            if line.startswith("### "):
+                title = line[4:].strip()
+                out.append(f"\n  {title}:")
+                continue
+
+            # Strip inline bold/italic/code markers
+            line = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
+            line = re.sub(r"\*(.+?)\*", r"\1", line)
+            line = re.sub(r"`(.+?)`", r"\1", line)
+
+            # Table separator rows — skip
+            if re.match(r"^\|[-| :]+\|$", line.strip()):
+                continue
+
+            # Table rows and list items — indent and pass through
+            if line.startswith("|") or line.startswith("- ") or line.startswith("* ") or re.match(r"^\d+\. ", line):
+                out.append(f"  {line}")
+                continue
+
+            # Blank lines
+            if not line.strip():
+                out.append("")
+                continue
+
+            # Paragraph text — word-wrap at 78
+            wrapped = textwrap.fill(
+                line, width=78, initial_indent="  ", subsequent_indent="  "
+            )
+            out.append(wrapped)
+
+        return "\n".join(out)
+
     def do_run(self, arg: str) -> None:
         """Run a tool on the current session.
         
