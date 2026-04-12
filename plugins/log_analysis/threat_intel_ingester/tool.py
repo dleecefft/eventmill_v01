@@ -112,15 +112,39 @@ def extract_text_from_html(file_path: str) -> str:
 
 
 def extract_text_from_text(file_path: str) -> str:
-    """Read a plain text file."""
+    """Read a plain text file (including Markdown)."""
     with open(file_path, "r", encoding="utf-8", errors="replace") as f:
         return f.read()
+
+
+def extract_text_from_docx(file_path: str) -> str:
+    """Extract text from a Word document using python-docx."""
+    try:
+        from docx import Document
+    except ImportError:
+        raise RuntimeError(
+            "python-docx is required for Word document processing. "
+            "Install with: pip install python-docx"
+        )
+    doc = Document(file_path)
+    parts = []
+    for para in doc.paragraphs:
+        if para.text.strip():
+            parts.append(para.text)
+    # Also extract text from tables
+    for table in doc.tables:
+        for row in table.rows:
+            row_text = "  ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+            if row_text:
+                parts.append(row_text)
+    return "\n".join(parts)
 
 
 TEXT_EXTRACTORS = {
     "pdf_report": extract_text_from_pdf,
     "html_report": extract_text_from_html,
     "text": extract_text_from_text,
+    "docx_report": extract_text_from_docx,
 }
 
 
@@ -338,13 +362,13 @@ class ThreatIntelIngester:
                 "message": f"Artifact {artifact_id} not found in session.",
             }
 
-        if artifact.artifact_type not in ("pdf_report", "html_report", "text"):
+        if artifact.artifact_type not in ("pdf_report", "html_report", "text", "docx_report"):
             return {
                 "ok": False,
                 "error_code": "INPUT_VALIDATION_FAILED",
                 "message": (
                     f"Artifact type '{artifact.artifact_type}' is not supported. "
-                    f"Expected pdf_report, html_report, or text."
+                    f"Expected pdf_report, html_report, text (including .md), or docx_report."
                 ),
             }
 
@@ -359,7 +383,7 @@ class ThreatIntelIngester:
             if artifact.artifact_type == "pdf_report":
                 raw_text = extractor(artifact.file_path, max_pages)
             else:
-                raw_text = extractor(artifact.file_path)
+                raw_text = extractor(str(artifact.file_path))
         except Exception as e:
             logger.error("Text extraction failed: %s", e)
             return {
