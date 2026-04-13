@@ -124,6 +124,120 @@ def _build_stages_from_threat_intel(data: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# DAG data model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DAGNode:
+    """A node in the attack path DAG."""
+    technique_id: str
+    technique_name: str
+    tactic: str
+    leads_to: list[str]       # technique_ids of downstream nodes
+    controls: list[dict]
+    gaps_detected: list[str]
+    path_ids: list[str]       # which paths this node appears in
+
+
+@dataclass
+class AttackDAG:
+    """Directed acyclic graph of attack paths."""
+    nodes: dict[str, DAGNode]  # keyed by technique_id
+    paths: list[dict]           # original path metadata
+    convergence_points: list[str]
+    branch_points: list[str]
+    entry_points: list[str]    # nodes with no incoming edges
+    exit_points: list[str]     # nodes with no outgoing edges
+
+
+def _build_dag_from_attack_graph(
+    attack_graph: dict,
+    mitre_mappings: list[dict],
+) -> "AttackDAG | None":
+    """Build a DAG from the LLM-produced attack_graph structure.
+
+    Returns None if the attack_graph is empty or has no paths,
+    signaling the caller to fall back to the legacy linear builder.
+    """
+    paths = attack_graph.get("paths", [])
+    if not paths:
+        return None
+
+    # Build a lookup for technique metadata from mitre_mappings
+    technique_info: dict[str, dict] = {}
+    for m in mitre_mappings:
+        tid = m.get("technique_id", "")
+        if tid:
+            technique_info[tid] = {
+                "technique_name": m.get("technique_name", ""),
+                "tactic": m.get("tactic", ""),
+            }
+
+    # Collect all nodes and edges from all paths
+    nodes: dict[str, DAGNode] = {}
+    all_targets: set[str] = set()  # technique_ids that are pointed TO
+
+    for path in paths:
+        path_id = path.get("path_id", "unknown")
+        for step in path.get("steps", []):
+            tid = step.get("technique_id", "")
+            if not tid:
+                continue
+            leads_to = step.get("leads_to", [])
+            all_targets.update(leads_to)
+
+            if tid not in nodes:
+                info = technique_info.get(tid, {})
+                nodes[tid] = DAGNode(
+                    technique_id=tid,
+                    technique_name=info.get("technique_name", "")
+                        or step.get("technique_name", ""),
+                    tactic=info.get("tactic", "")
+                        or step.get("tactic", ""),
+                    leads_to=[],
+                    controls=[],
+                    gaps_detected=[],
+                    path_ids=[],
+                )
+            # Merge leads_to (deduplicate)
+            for target in leads_to:
+                if target not in nodes[tid].leads_to:
+                    nodes[tid].leads_to.append(target)
+            if path_id not in nodes[tid].path_ids:
+                nodes[tid].path_ids.append(path_id)
+
+    # Ensure target nodes exist even if they weren't listed as steps
+    for target_id in all_targets:
+        if target_id not in nodes:
+            info = technique_info.get(target_id, {})
+            nodes[target_id] = DAGNode(
+                technique_id=target_id,
+                technique_name=info.get("technique_name", ""),
+                tactic=info.get("tactic", ""),
+                leads_to=[],
+                controls=[],
+                gaps_detected=[],
+                path_ids=[],
+            )
+
+    if not nodes:
+        return None
+
+    # Identify entry and exit points
+    entry_points = [tid for tid in nodes if tid not in all_targets]
+    exit_points = [tid for tid in nodes if not nodes[tid].leads_to]
+
+    return AttackDAG(
+        nodes=nodes,
+        paths=paths,
+        convergence_points=attack_graph.get("convergence_points", []),
+        branch_points=attack_graph.get("branch_points", []),
+        entry_points=entry_points,
+        exit_points=exit_points,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Protocol-compatible result types
 # ---------------------------------------------------------------------------
 
@@ -399,6 +513,142 @@ def _render_mermaid_control_matrix(stages: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# DAG Rendering (multi-path attack graphs)
+# ---------------------------------------------------------------------------
+
+
+def _render_mermaid_dag(dag: AttackDAG, attack_type: str) -> str:
+    """Render a multi-path attack graph as Mermaid flowchart."""
+    lines = [
+        "```mermaid",
+        "flowchart TB",
+        f'    subgraph attack["{attack_type.upper()} Attack Graph"]',
+        "    direction TB",
+    ]
+
+    # Assign short node IDs and render node labels
+    id_map: dict[str, str] = {}
+    for i, (tid, node) in enumerate(dag.nodes.items()):
+        nid = f"N{i}"
+        id_map[tid] = nid
+        name = node.tactic or tid
+        label = f"{name}<br/><small>{tid}"
+        if node.technique_name:
+            label += f" \u2014 {node.technique_name[:30]}"
+        label += "</small>"
+        lines.append(f'    {nid}(["{label}"])')
+
+    # Render edges
+    for tid, node in dag.nodes.items():
+        src = id_map[tid]
+        for target_tid in node.leads_to:
+            if target_tid in id_map:
+                dst = id_map[target_tid]
+                lines.append(f"    {src} --> {dst}")
+
+    lines.append("    end")
+    lines.append("")
+
+    # Style nodes by role
+    convergence_set = set(dag.convergence_points)
+    branch_set = set(dag.branch_points)
+    entry_set = set(dag.entry_points)
+    exit_set = set(dag.exit_points)
+
+    for tid, node in dag.nodes.items():
+        nid = id_map[tid]
+        if tid in convergence_set:
+            lines.append(f"    style {nid} fill:#ffe0b2,stroke:#e65100")
+        elif tid in entry_set:
+            lines.append(f"    style {nid} fill:#bbdefb,stroke:#1565c0")
+        elif tid in exit_set:
+            lines.append(f"    style {nid} fill:#ffcdd2,stroke:#b71c1c")
+        elif node.controls:
+            lines.append(f"    style {nid} fill:#ccffcc,stroke:#00cc00")
+        else:
+            lines.append(f"    style {nid} fill:#ffffcc,stroke:#cccc00")
+
+    lines.append("```")
+
+    # Path legend
+    lines.append("")
+    lines.append("**Paths:**")
+    for p in dag.paths:
+        pid = p.get("path_id", "?")
+        desc = p.get("description", "")
+        lines.append(f"- **{pid}**: {desc}")
+
+    if dag.convergence_points:
+        lines.append("")
+        conv_labels = [
+            f"{tid} ({dag.nodes[tid].tactic})"
+            for tid in dag.convergence_points
+            if tid in dag.nodes
+        ]
+        lines.append(f"**Convergence:** {', '.join(conv_labels)}")
+
+    return "\n".join(lines)
+
+
+def _render_ascii_dag(dag: AttackDAG, attack_type: str) -> str:
+    """Render a multi-path attack graph as ASCII art."""
+    box_width = 100
+    lines: list[str] = []
+
+    header_w = box_width + 4
+    lines.append("")
+    lines.append("+" + "=" * header_w + "+")
+    lines.append("|" + f" ATTACK GRAPH \u2014 {attack_type.upper()} ".center(header_w) + "|")
+    lines.append("|" + f" {len(dag.paths)} path(s), {len(dag.nodes)} techniques ".center(header_w) + "|")
+    lines.append("+" + "=" * header_w + "+")
+    lines.append("")
+
+    for path in dag.paths:
+        pid = path.get("path_id", "unknown")
+        desc = path.get("description", "")
+        lines.append(f"  \u2500\u2500 Path: {pid} \u2500\u2500")
+        if desc:
+            lines.append(f"     {desc}")
+        lines.append("")
+
+        for step in path.get("steps", []):
+            tid = step.get("technique_id", "?")
+            node = dag.nodes.get(tid)
+            if not node:
+                continue
+
+            tactic = node.tactic or "?"
+            name = node.technique_name or ""
+            convergence_marker = " \u25c6 CONVERGE" if tid in dag.convergence_points else ""
+            branch_marker = " \u25c7 BRANCH" if tid in dag.branch_points else ""
+
+            lines.append(f"     [{tid}] {tactic}: {name}{convergence_marker}{branch_marker}")
+
+            if node.leads_to:
+                targets = ", ".join(node.leads_to)
+                lines.append(f"        \u2514\u2500\u2500\u25b6 {targets}")
+
+            for ctrl in node.controls[:3]:
+                cn = ctrl.get("control_name", "?")
+                eff = ctrl.get("effectiveness_rating", "?")
+                lines.append(f"        \u2713 {cn} ({eff})")
+
+            for gap in node.gaps_detected[:2]:
+                lines.append(f"        \u2717 GAP: {gap}")
+
+        lines.append("")
+
+    unprotected = [
+        tid for tid, n in dag.nodes.items()
+        if not n.controls and tid not in dag.exit_points
+    ]
+    if unprotected:
+        lines.append(f"  \u26a0 Unprotected stages: {', '.join(unprotected)}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Plugin Implementation
 # ---------------------------------------------------------------------------
 
@@ -436,7 +686,7 @@ class AttackPathVisualizer:
 
     def _load_stages_from_artifact(
         self, artifact_id: str, context: Any
-    ) -> "list[dict] | ToolResult":
+    ) -> "AttackDAG | list[dict] | ToolResult":
         """Resolve a json_events artifact and extract attack stages from it."""
         artifact = next(
             (a for a in context.artifacts if a.artifact_id == artifact_id), None
@@ -468,6 +718,16 @@ class AttackPathVisualizer:
                 error_code="ARTIFACT_UNREADABLE",
                 message=f"Failed to read artifact: {exc}",
             )
+        # Try multi-path DAG first (new attack_graph field)
+        attack_graph = data.get("attack_graph", {})
+        mitre_mappings = data.get("mitre_mappings", [])
+
+        if attack_graph.get("paths"):
+            dag = _build_dag_from_attack_graph(attack_graph, mitre_mappings)
+            if dag and dag.nodes:
+                return dag
+
+        # Fall back to legacy linear builder
         stages = _build_stages_from_threat_intel(data)
         if not stages:
             return ToolResult(
@@ -491,67 +751,91 @@ class AttackPathVisualizer:
         artifact_id: str | None = payload.get("artifact_id")
         attack_type = payload.get("attack_type", "unknown")
 
-        # Resolve stages — either from a json_events artifact or from inline payload
+        # Resolve source — artifact (DAG or stages) or inline stages payload
+        dag: AttackDAG | None = None
+        stages: list[dict] | None = None
+
         if artifact_id and "stages" not in payload:
-            result_or_stages = self._load_stages_from_artifact(artifact_id, context)
-            if isinstance(result_or_stages, ToolResult):
-                return result_or_stages
-            stages = result_or_stages
+            result_or_data = self._load_stages_from_artifact(artifact_id, context)
+            if isinstance(result_or_data, ToolResult):
+                return result_or_data
+            elif isinstance(result_or_data, AttackDAG):
+                dag = result_or_data
+            else:
+                stages = result_or_data
             if attack_type == "unknown":
                 attack_type = "threat-intel"
         else:
             stages = payload["stages"]
+
         narrative = payload.get("attack_narrative", "")
         include_controls = payload.get("include_controls", True)
 
         try:
-            present = [s for s in stages if s.get("stage_present", True)]
-            missing_req = [s for s in stages if not s.get("stage_present", True) and s.get("relevance") == "required"]
-
             parts: list[str] = []
 
-            if fmt in ("ascii", "both"):
-                parts.append(_render_ascii(stages, attack_type, narrative))
+            if dag:
+                # Multi-path DAG rendering
+                if fmt in ("ascii", "both"):
+                    parts.append(_render_ascii_dag(dag, attack_type))
+                if fmt == "compact":
+                    path_count = len(dag.paths)
+                    node_count = len(dag.nodes)
+                    conv = len(dag.convergence_points)
+                    parts.append(
+                        f"[{attack_type.upper()}] "
+                        f"{path_count} path(s), {node_count} techniques, "
+                        f"{conv} convergence point(s): "
+                        + " \u2192 ".join(
+                            f"{n.tactic}({n.technique_id})"
+                            for n in dag.nodes.values()
+                        )
+                    )
+                if fmt in ("mermaid", "both"):
+                    parts.append(_render_mermaid_dag(dag, attack_type))
 
-            if fmt == "compact":
-                parts.append(_render_compact(stages, attack_type))
-
-            if fmt in ("mermaid", "both"):
-                parts.append(_render_mermaid(stages, attack_type, include_controls))
-
-            visualization = "\n".join(parts)
-
-            # Persist to a format-specific file so the output is directly usable
-            ext = ".mmd" if fmt in ("mermaid",) else ".txt"
-            workspace = Path(os.environ.get("EVENTMILL_WORKSPACE", "./workspace"))
-            output_dir = workspace / "artifacts"
-            output_dir.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_file = output_dir / f"attack_path_{fmt}_{ts}{ext}"
-            artifact_ref = None
-            try:
-                output_file.write_text(visualization, encoding="utf-8")
-                artifact_ref = context.register_artifact(
-                    artifact_type="text",
-                    file_path=str(output_file),
-                    source_tool="attack_path_visualizer",
-                    metadata={"format": fmt, "stages_rendered": len(present)},
+                visualization = "\n".join(parts)
+                return ToolResult(
+                    ok=True,
+                    result={
+                        "format": fmt,
+                        "visualization": visualization,
+                        "stages_rendered": len(dag.nodes),
+                        "missing_required": 0,
+                        "path_count": len(dag.paths),
+                        "convergence_points": dag.convergence_points,
+                        "branch_points": dag.branch_points,
+                        "source": f"artifact:{artifact_id}",
+                    },
                 )
-            except Exception:
-                pass
 
-            return ToolResult(
-                ok=True,
-                result={
-                    "format": fmt,
-                    "visualization": visualization,
-                    "stages_rendered": len(present),
-                    "missing_required": len(missing_req),
-                    "source": f"artifact:{artifact_id}" if artifact_id else "payload",
-                    "output_file": str(output_file),
-                    "output_artifact_id": getattr(artifact_ref, "artifact_id", None),
-                },
-            )
+            else:
+                # Legacy linear rendering (existing code, unchanged)
+                present = [s for s in stages if s.get("stage_present", True)]
+                missing_req = [
+                    s for s in stages
+                    if not s.get("stage_present", True)
+                    and s.get("relevance") == "required"
+                ]
+
+                if fmt in ("ascii", "both"):
+                    parts.append(_render_ascii(stages, attack_type, narrative))
+                if fmt == "compact":
+                    parts.append(_render_compact(stages, attack_type))
+                if fmt in ("mermaid", "both"):
+                    parts.append(_render_mermaid(stages, attack_type, include_controls))
+
+                visualization = "\n".join(parts)
+                return ToolResult(
+                    ok=True,
+                    result={
+                        "format": fmt,
+                        "visualization": visualization,
+                        "stages_rendered": len(present),
+                        "missing_required": len(missing_req),
+                        "source": f"artifact:{artifact_id}" if artifact_id else "payload",
+                    },
+                )
 
         except Exception as e:
             return ToolResult(
@@ -569,19 +853,25 @@ class AttackPathVisualizer:
         rendered = data.get("stages_rendered", 0)
         missing = data.get("missing_required", 0)
         fmt = data.get("format", "?")
+        path_count = data.get("path_count")
+        convergence = data.get("convergence_points", [])
 
-        art_id = data.get("output_artifact_id")
-        out_file = data.get("output_file", "")
-        summary = f"Rendered {rendered} attack stages ({fmt} format)."
+        if path_count:
+            summary = (
+                f"Rendered {rendered} techniques across {path_count} attack path(s) "
+                f"({fmt} format)."
+            )
+            if convergence:
+                summary += f" Convergence at: {', '.join(convergence)}."
+        else:
+            summary = f"Rendered {rendered} attack stages ({fmt} format)."
+
         if missing:
             summary += f" {missing} required stage(s) missing."
-        if art_id:
-            summary += f" Output artifact: {art_id} → {out_file}"
 
         # Include compact flow if available, truncate if too long
         viz = data.get("visualization", "")
         if len(viz) > 1500:
-            # Try to extract just the compact flow or first few lines
             lines = viz.split("\n")
             preview = "\n".join(lines[:20])
             summary += f"\n{preview}\n... (truncated)"

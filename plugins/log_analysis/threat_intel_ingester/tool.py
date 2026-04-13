@@ -217,13 +217,32 @@ def extract_iocs_regex(
 
 LLM_REFINEMENT_PROMPT = """You are an experienced threat intelligence analyst reviewing extracted IOCs from a security report.
 
-TASK: Review the following IOC candidates and their surrounding context. For each IOC:
+TASK: Complete ALL five sections below.
+
+SECTION 1 — IOC VALIDATION: Review each IOC candidate and its surrounding context.
+For each IOC:
 1. Assess whether it is a true indicator of compromise (not a benign version number, documentation example, or false positive)
 2. Assign a confidence level: "low" (uncertain), "medium" (likely real IOC), "high" (confirmed IOC based on context)
 3. Assign an operational priority: "low", "medium", "high" based on the IOC's role in the described attack
 4. Identify related MITRE ATT&CK technique IDs if the context suggests a specific technique
 
-Also identify any MITRE ATT&CK techniques described in the report text that are not already captured as IOC-type extractions. For each technique, note whether it was explicitly mentioned (technique ID appears in text) or inferred from described behavior.
+SECTION 2 — ADDITIONAL MITRE TECHNIQUES: Identify any MITRE ATT&CK techniques described in the report text that are not already captured as IOC-type extractions. For each technique, note whether it was explicitly mentioned (technique ID appears in text) or inferred from described behavior.
+
+SECTION 3 — REPORT METADATA: Extract the report title, campaign name, attributed threat actor, and attribution confidence.
+
+SECTION 4 — TECHNIQUE TACTIC ASSIGNMENT: For EVERY technique in both refined_iocs.related_mitre AND additional_mitre_techniques, you MUST populate the "tactic" field with the correct MITRE ATT&CK tactic name. Use the official tactic names exactly as written:
+Reconnaissance, Resource Development, Initial Access, Execution, Persistence, Privilege Escalation, Defense Evasion, Credential Access, Discovery, Lateral Movement, Collection, Command and Control, Exfiltration, Impact.
+If a technique maps to multiple tactics, use the tactic most relevant to how the report describes its use. NEVER leave the tactic field empty.
+
+SECTION 5 — ATTACK GRAPH: Analyze how the techniques described in the report relate to each other operationally. Real attacks have multiple paths, branches, and convergence points.
+
+For the attack_graph:
+- Identify distinct attack PATHS (e.g., "phishing path" and "supply chain path" may both lead to execution)
+- For each path, list the techniques in causal order: which technique ENABLES or LEADS TO the next
+- Identify CONVERGENCE POINTS — techniques that multiple paths flow into (e.g., both initial access vectors lead to the same execution technique)
+- Identify BRANCH POINTS — techniques that lead to multiple downstream techniques
+- If the report describes only one path, return a single path. Do not invent paths not supported by the report.
+- Use only technique IDs that appear in refined_iocs or additional_mitre_techniques
 
 SOURCE CONTEXT: {source_context}
 
@@ -260,6 +279,28 @@ Respond ONLY with a JSON object in this exact format:
     "campaign_name": "named campaign if mentioned",
     "attributed_actor": "threat actor if attributed",
     "attribution_confidence": "low|medium|high"
+  }},
+  "attack_graph": {{
+    "paths": [
+      {{
+        "path_id": "short-slug-name",
+        "description": "One sentence describing this attack path",
+        "steps": [
+          {{
+            "technique_id": "T1566.001",
+            "tactic": "Initial Access",
+            "leads_to": ["T1059.001"]
+          }},
+          {{
+            "technique_id": "T1059.001",
+            "tactic": "Execution",
+            "leads_to": ["T1053.005", "T1210"]
+          }}
+        ]
+      }}
+    ],
+    "convergence_points": ["T1059.001"],
+    "branch_points": ["T1059.001"]
   }}
 }}
 """
@@ -439,6 +480,7 @@ class ThreatIntelIngester:
         refined_iocs = []
         mitre_mappings = []
         report_meta = {}
+        attack_graph = {}  # multi-path attack graph from LLM
 
         if context.llm_enabled and context.llm_query is not None:
             logger.info("Running LLM refinement on %d IOC candidates", len(raw_iocs))
@@ -494,6 +536,9 @@ class ThreatIntelIngester:
                         "additional_mitre_techniques", []
                     )
                     report_meta = llm_result.get("report_metadata", {})
+
+                    # Extract attack graph for multi-path visualization
+                    attack_graph = llm_result.get("attack_graph", {})
 
                 else:
                     logger.warning(
@@ -572,6 +617,7 @@ class ThreatIntelIngester:
                 "report_metadata": report_meta,
                 "iocs": filtered_iocs,
                 "mitre_mappings": all_mitre,
+                "attack_graph": attack_graph,
             }
 
             # Write artifact file
@@ -706,6 +752,16 @@ class ThreatIntelIngester:
             parts.append(f"Mapped to {tech_count} MITRE techniques: {tech_list}.")
             if tech_count > 6:
                 parts.append(f"(and {tech_count - 6} more)")
+
+        # Attack graph paths
+        if r.get("attack_graph", {}).get("paths"):
+            path_count = len(r["attack_graph"]["paths"])
+            convergence = r["attack_graph"].get("convergence_points", [])
+            parts.append(
+                f"Attack graph: {path_count} path(s) identified"
+                + (f", converging at {', '.join(convergence)}" if convergence else "")
+                + "."
+            )
 
         # Output artifact
         artifacts = result.output_artifacts or []

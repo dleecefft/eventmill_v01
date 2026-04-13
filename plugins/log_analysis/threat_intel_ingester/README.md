@@ -22,7 +22,7 @@ This plugin manages its own output persistence. On successful completion it writ
 ```
 workspace/artifacts/<artifact_id>_ti_iocs.json
 ```
-The file is registered as a `json_events` session artifact with the ID shown in the run summary (e.g., `Output artifact: art_04d30b48 (json_events)`). Use that ID directly as input to `attack_path_visualizer` via `artifact_id`.
+The file is registered as a `json_events` session artifact with the ID shown in the run summary (e.g., `Output artifact: art_04d30b48 (json_events)`). Use that ID directly as input to `attack_path_visualizer` via `artifact_id`. Use `export <artifact_id>` to push the JSON to `common/exports/threat_intel_ingester/` in cloud storage for external access or troubleshooting.
 
 ## LLM Dependency
 

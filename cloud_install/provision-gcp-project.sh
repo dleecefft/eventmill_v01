@@ -369,6 +369,13 @@ echo ""
 echo "   Initializing generated artifacts namespace in common bucket..."
 init_common_folder "generated/threat_report_analyzer"
 
+# Exports: operator-initiated artifact exports via the 'export' CLI command.
+# Convention: common/exports/{source_tool}/{filename}
+# Per-tool subdirectories are created automatically on first write — only the
+# root placeholder is seeded here so the folder is visible in the GCS console.
+echo "   Initializing exports namespace in common bucket..."
+init_common_folder "exports"
+
 echo ""
 
 # =============================================================================
@@ -510,6 +517,8 @@ echo "   gs://${BUCKET_PREFIX}-threat-modeling           (threat modeling)"
 echo "   gs://${BUCKET_PREFIX}-common                    (shared reference data)"
 echo "   gs://${BUCKET_PREFIX}-common/generated/         (tool-generated artifacts)"
 echo "   gs://${BUCKET_PREFIX}-common/generated/threat_report_analyzer/"
+echo "   gs://${BUCKET_PREFIX}-common/exports/           (operator exports via 'export' CLI command)"
+echo "   gs://${BUCKET_PREFIX}-common/exports/<tool>/    (created on first write per tool)"
 echo ""
 echo "Secrets created (placeholder values):"
 echo "   - eventmill-gemini-flash-api  (Flash / light tier)"

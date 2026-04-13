@@ -25,7 +25,7 @@ On successful completion the framework automatically writes the full result to:
 ```
 workspace/artifacts/log_pattern_analyzer_<YYYYMMDD_HHMMSS>.json
 ```
-The file is registered as a `json_events` session artifact. Use `artifacts` to get its ID. The discover mode result includes AI-identified log type and recommended next steps.
+The file is registered as a `json_events` session artifact. Use `artifacts` to get its ID. The discover mode result includes AI-identified log type and recommended next steps. Use `export <artifact_id>` to push the JSON to `common/exports/log_pattern_analyzer/` in cloud storage for external access or troubleshooting.
 
 ## Available GROK Patterns
 
