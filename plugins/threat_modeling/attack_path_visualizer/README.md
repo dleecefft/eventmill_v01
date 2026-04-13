@@ -21,10 +21,31 @@ Four output formats for attack path visualization:
 
 | Direction | Type | Description |
 |-----------|------|-------------|
-| Consumed | `json_events` | Stage data from risk_assessment_analyzer or threat_model_analyzer |
+| Consumed | `json_events` | IOC/MITRE data from `threat_intel_ingester`, or stage data from `risk_assessment_analyzer`/`threat_model_analyzer` |
 | Produced | `text` | Rendered visualization |
 
-## Example
+## Output Persistence
+
+The tool writes the visualization directly to a format-specific file:
+
+| Format | Output file |
+|--------|-------------|
+| `mermaid` | `workspace/artifacts/attack_path_mermaid_<ts>.mmd` |
+| `ascii` | `workspace/artifacts/attack_path_ascii_<ts>.txt` |
+| `compact` | `workspace/artifacts/attack_path_compact_<ts>.txt` |
+| `both` | `workspace/artifacts/attack_path_both_<ts>.txt` |
+
+The file is registered as a `text` session artifact. The artifact ID and full path are shown in the run summary. `.mmd` files can be rendered directly in GitHub, VS Code, or any Mermaid-compatible viewer.
+
+## Example — Direct from threat_intel_ingester
+
+```json
+{"artifact_id": "art_04d30b48", "format": "mermaid"}
+```
+
+Stages are automatically derived from the MITRE technique mappings in the `json_events` artifact, ordered by kill-chain sequence.
+
+## Example — Inline stages
 
 ```json
 {

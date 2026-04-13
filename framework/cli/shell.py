@@ -8,11 +8,13 @@ This is the primary user interface for Event Mill.
 from __future__ import annotations
 
 import cmd
+import json
 import os
 import random
 import shlex
 import signal
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -499,7 +501,96 @@ class EventMillShell(cmd.Cmd):
         
         for b in buckets:
             print(f"  {b['pillar']:25s} {b['bucket']:40s} {b['type']}")
-    
+
+    def do_export(self, arg: str) -> None:
+        """Export a session artifact to the common storage bucket.
+
+        Writes to common/exports/<source_tool>/ by default — mirroring the
+        common/generated/ convention used by threat_report_analyzer.  Intended
+        for troubleshooting or handing off JSON/MMD outputs to external tools.
+        Not required for normal in-container workflows.
+
+        Usage: export <artifact_id> [subfolder]
+
+        artifact_id — ID from the 'artifacts' command (e.g. art_04d30b48)
+        subfolder   — Optional path appended inside exports/<source_tool>/.
+                      Useful for tagging by incident (e.g. incident-2025-04).
+
+        Destination layout:
+          common/exports/<source_tool>/<filename>
+          common/exports/<source_tool>/<subfolder>/<filename>   (with subfolder)
+
+        Examples:
+          export art_04d30b48
+          export art_04d30b48 incident-2025-04
+        """
+        if not self.session_manager.get_current_session():
+            print("  No active session. Use 'session new' first.")
+            return
+
+        if not self.storage_resolver:
+            print("  Storage resolver not initialized.")
+            return
+
+        parts = shlex.split(arg) if arg.strip() else []
+        if not parts:
+            print("  Usage: export <artifact_id> [subfolder]")
+            return
+
+        artifact_id = parts[0]
+        subfolder = parts[1] if len(parts) > 1 else None
+
+        # Resolve artifact
+        artifact = self.session_manager.get_artifact(artifact_id)
+        if artifact is None:
+            print(f"  Artifact '{artifact_id}' not found. Use 'artifacts' to list.")
+            return
+
+        local_path = Path(artifact.file_path)
+        if not local_path.exists():
+            print(f"  Artifact file missing on disk: {local_path}")
+            return
+
+        # Build destination folder: exports/<source_tool>[/<subfolder>]
+        source_tool = getattr(artifact, "source_tool", None) or "unknown"
+        dest_folder = f"exports/{source_tool}"
+        if subfolder:
+            dest_folder = f"{dest_folder}/{subfolder}"
+
+        # Pillar is only needed by the resolver to name the pillar bucket;
+        # since target="common" it won't be used for routing, but must be valid.
+        session = self.session_manager.get_current_session()
+        pillar = session.active_pillar or "log_analysis"
+
+        filename = local_path.name
+        common_bucket = self.storage_resolver.config.common_bucket()
+
+        print(f"  Exporting {artifact_id} ({artifact.artifact_type})")
+        print(f"  Destination: {common_bucket}/{dest_folder}/{filename}")
+
+        try:
+            resolved = self.storage_resolver.upload(
+                local_path=local_path,
+                filename=filename,
+                pillar=pillar,
+                workspace_folder=dest_folder,
+                target="common",
+                metadata={
+                    "artifact_id": artifact_id,
+                    "artifact_type": artifact.artifact_type,
+                    "source_tool": source_tool,
+                },
+            )
+            print(f"  ✓ Uploaded: {resolved.uri}")
+            log_user_activity("export_artifact", {
+                "artifact_id": artifact_id,
+                "destination": resolved.uri,
+                "source_tool": source_tool,
+            })
+        except Exception as e:
+            print(f"  ✗ Export failed: {e}")
+            logger.error("Artifact export failed: %s", e)
+
     def do_files(self, arg: str) -> None:
         """List files available in the current pillar's storage.
         
@@ -863,6 +954,9 @@ class EventMillShell(cmd.Cmd):
                 print(f"    - {error}")
             return
         
+        # Snapshot registered artifacts before execution to detect new ones afterwards
+        _artifacts_before = {a.artifact_id for a in self.session_manager.list_artifacts()}
+
         # Build execution context
         session = self.session_manager.get_current_session()
         # Session artifacts carry the user-visible IDs shown by 'artifacts' command
@@ -925,6 +1019,15 @@ class EventMillShell(cmd.Cmd):
             result = instance.execute(payload, context)
             
             if result.ok:
+                # Auto-persist output if the tool didn't register an artifact itself
+                _artifacts_after = {a.artifact_id for a in self.session_manager.list_artifacts()}
+                if not (_artifacts_after - _artifacts_before) and result.result is not None:
+                    self._auto_persist_result(
+                        result=result,
+                        tool_name=tool_name,
+                        artifacts_produced=getattr(plugin.manifest, "artifacts_produced", []) or [],
+                    )
+
                 summary = instance.summarize_for_llm(result)
                 self.session_manager.complete_execution(
                     execution=execution,
@@ -977,7 +1080,67 @@ class EventMillShell(cmd.Cmd):
             
             print(f"  ✗ Error: {e}")
             logger.exception("Tool execution failed: %s", tool_name)
-    
+
+    def _auto_persist_result(
+        self,
+        result: Any,
+        tool_name: str,
+        artifacts_produced: list[str],
+    ) -> None:
+        """Write a tool's ToolResult.result to disk and register it with the session.
+
+        Called when a tool completes successfully but did not call
+        context.register_artifact() itself.  Produces a single output artifact
+        whose type is taken from the first entry of the manifest's
+        artifacts_produced list (defaulting to 'json_events').
+
+        Text-oriented tools (artifact_type == 'text') receive a .md file whose
+        content is the first string field found among common display keys
+        (visualization, content, summary, analysis, report, output).
+        All other tools receive a .json file containing the full result dict.
+        """
+        workspace = Path(os.environ.get("EVENTMILL_WORKSPACE", "./workspace"))
+        output_dir = workspace / "artifacts"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        artifact_type = artifacts_produced[0] if artifacts_produced else "json_events"
+        result_data = result.result or {}
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Choose format: markdown for text artifacts, JSON for everything else
+        if artifact_type == "text":
+            text_content: str | None = None
+            for key in ("visualization", "content", "summary", "analysis", "report", "output"):
+                val = result_data.get(key)
+                if isinstance(val, str) and val.strip():
+                    text_content = val
+                    break
+            if text_content is None:
+                text_content = json.dumps(result_data, indent=2, default=str)
+            content = text_content
+            ext = ".md"
+        else:
+            content = json.dumps(result_data, indent=2, default=str)
+            ext = ".json"
+
+        filename = f"{tool_name}_{ts}{ext}"
+        output_file = output_dir / filename
+
+        try:
+            output_file.write_text(content, encoding="utf-8")
+            session_art = self.session_manager.register_artifact(
+                artifact_type=artifact_type,
+                file_path=str(output_file),
+                source_tool=tool_name,
+                metadata={"auto_persisted": True},
+            )
+            logger.info(
+                "Auto-persisted output for %s → %s (%s)",
+                tool_name, session_art.artifact_id, artifact_type,
+            )
+        except Exception as exc:
+            logger.warning("Auto-persist failed for %s: %s", tool_name, exc)
+
     def do_history(self, arg: str) -> None:
         """Show tool execution history for the current session.
         

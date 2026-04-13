@@ -12,7 +12,10 @@ Ported from Event Mill v1.0 visualization.py with improvements:
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 
@@ -518,6 +521,25 @@ class AttackPathVisualizer:
 
             visualization = "\n".join(parts)
 
+            # Persist to a format-specific file so the output is directly usable
+            ext = ".mmd" if fmt in ("mermaid",) else ".txt"
+            workspace = Path(os.environ.get("EVENTMILL_WORKSPACE", "./workspace"))
+            output_dir = workspace / "artifacts"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_file = output_dir / f"attack_path_{fmt}_{ts}{ext}"
+            artifact_ref = None
+            try:
+                output_file.write_text(visualization, encoding="utf-8")
+                artifact_ref = context.register_artifact(
+                    artifact_type="text",
+                    file_path=str(output_file),
+                    source_tool="attack_path_visualizer",
+                    metadata={"format": fmt, "stages_rendered": len(present)},
+                )
+            except Exception:
+                pass
+
             return ToolResult(
                 ok=True,
                 result={
@@ -526,6 +548,8 @@ class AttackPathVisualizer:
                     "stages_rendered": len(present),
                     "missing_required": len(missing_req),
                     "source": f"artifact:{artifact_id}" if artifact_id else "payload",
+                    "output_file": str(output_file),
+                    "output_artifact_id": getattr(artifact_ref, "artifact_id", None),
                 },
             )
 
@@ -546,9 +570,13 @@ class AttackPathVisualizer:
         missing = data.get("missing_required", 0)
         fmt = data.get("format", "?")
 
+        art_id = data.get("output_artifact_id")
+        out_file = data.get("output_file", "")
         summary = f"Rendered {rendered} attack stages ({fmt} format)."
         if missing:
             summary += f" {missing} required stage(s) missing."
+        if art_id:
+            summary += f" Output artifact: {art_id} → {out_file}"
 
         # Include compact flow if available, truncate if too long
         viz = data.get("visualization", "")

@@ -16,6 +16,14 @@ Ingests threat intelligence reports (PDF, HTML, STIX, CSV/JSON IOC lists) and ex
 **Produced:**
 - `json_events` — Structured IOC records
 
+## Output Persistence
+
+This plugin manages its own output persistence. On successful completion it writes the full IOC dataset to:
+```
+workspace/artifacts/<artifact_id>_ti_iocs.json
+```
+The file is registered as a `json_events` session artifact with the ID shown in the run summary (e.g., `Output artifact: art_04d30b48 (json_events)`). Use that ID directly as input to `attack_path_visualizer` via `artifact_id`.
+
 ## LLM Dependency
 
 **requires_llm: true**

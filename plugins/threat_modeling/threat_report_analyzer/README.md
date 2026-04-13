@@ -4,7 +4,9 @@
 
 ## What It Does
 
-Reads threat intelligence reports (MITRE ATT&CK, CAPEC, CISA advisories, vendor bulletins) from the common bucket and generates 1500-2000 word markdown summaries for use as context in other analysis tools.
+Reads threat intelligence reports (MITRE ATT&CK, CAPEC, CISA advisories, vendor bulletins, vendor PDFs) from the common bucket and generates 1500-2000 word markdown summaries for use as context in other analysis tools.
+
+Handles large files (up to 50 MB / ~1,000 pages) using a chunked processing approach — content is split into segments, each summarized independently, then merged into a single coherent output.
 
 Three actions:
 
@@ -27,12 +29,36 @@ Expected directory structure in the common bucket:
 └── vulnerabilities/         # CVE/vulnerability data
 ```
 
+## Supported Input Formats
+
+| Format | Extensions | Notes |
+|--------|-----------|-------|
+| PDF | `.pdf` | Full text extraction via pdfplumber; chunked for large reports |
+| Word | `.docx`, `.doc` | Extracted via python-docx |
+| JSON / STIX | `.json` | MITRE ATT&CK bundles, STIX 2.x |
+| XML | `.xml` | CAPEC, CVRF, STIX 1.x |
+| Markdown | `.md`, `.markdown` | Pre-processed summaries |
+| Plain text | `.txt` | Raw advisories, bulletins |
+| CSV | `.csv` | Structured IOC/vulnerability lists |
+
 ## Artifacts
 
 | Direction | Type | Description |
 |-----------|------|-------------|
-| Consumed | — | — |
-| Produced | `text` | Markdown summaries for other tools |
+| Consumed | — | — (reads directly from common bucket or local reference data) |
+| Produced | `text` | Markdown summaries for use by other tools |
+
+## Output Persistence
+
+The plugin writes summary files to the common bucket mirror path:
+```
+workspace/storage/<bucket>/generated/<report_name>.summary.md
+```
+For multi-chunk large files, individual chunk summaries are also written:
+```
+workspace/storage/<bucket>/generated/<report_name>.chunk_NNN.summary.md
+```
+The framework additionally registers the final summary as a `text` session artifact. Use `artifacts` to get its ID, then `load` it or pass it as input to `risk_assessment_analyzer` or `threat_model_analyzer`.
 
 ## Example Usage
 
@@ -74,7 +100,8 @@ When LLM is connected, it generates structured markdown summaries with:
 
 ## Notes
 
-- Supports JSON, XML, Markdown, TXT, CSV, and STIX file formats
+- Supports PDF, DOCX, JSON, XML, Markdown, TXT, CSV, and STIX file formats
+- Large files (up to 50 MB / ~1,000 pages) processed in chunks; each chunk is summarized individually and results merged
 - Falls back to local `framework/reference_data/` directory when common bucket unavailable
 - Extracts MITRE ATT&CK technique IDs (T1234 format) from summaries
-- Maximum content passed to LLM: 50KB (truncated for token limits)
+- Maximum content passed to LLM per chunk: 50 KB (truncated for token limits)
