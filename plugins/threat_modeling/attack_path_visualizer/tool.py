@@ -11,8 +11,113 @@ Ported from Event Mill v1.0 visualization.py with improvements:
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# MITRE ATT&CK tactic → kill-chain stage mapping
+# ---------------------------------------------------------------------------
+
+TACTIC_ORDER = [
+    "reconnaissance",
+    "resource-development",
+    "initial-access",
+    "execution",
+    "persistence",
+    "privilege-escalation",
+    "defense-evasion",
+    "credential-access",
+    "discovery",
+    "lateral-movement",
+    "collection",
+    "command-and-control",
+    "exfiltration",
+    "impact",
+]
+
+TACTIC_DISPLAY = {
+    "reconnaissance": "Reconnaissance",
+    "resource-development": "Resource Development",
+    "initial-access": "Initial Access",
+    "execution": "Execution",
+    "persistence": "Persistence",
+    "privilege-escalation": "Privilege Escalation",
+    "defense-evasion": "Defense Evasion",
+    "credential-access": "Credential Access",
+    "discovery": "Discovery",
+    "lateral-movement": "Lateral Movement",
+    "collection": "Collection",
+    "command-and-control": "Command and Control",
+    "exfiltration": "Exfiltration",
+    "impact": "Impact",
+}
+
+_CONF_RANK = {"high": 2, "medium": 1, "low": 0}
+
+
+def _build_stages_from_threat_intel(data: dict) -> list[dict]:
+    """Convert threat_intel_ingester json_events output into attack_path_visualizer stages.
+
+    Groups MITRE technique mappings by tactic and orders them in kill-chain
+    sequence.  The highest-confidence technique per tactic becomes the primary
+    stage entry; additional techniques are recorded as metadata.
+    """
+    mitre_mappings = data.get("mitre_mappings", [])
+    if not mitre_mappings:
+        return []
+
+    # Group by normalised tactic label
+    buckets: dict[str, list[dict]] = {}
+    for mapping in mitre_mappings:
+        tactic = mapping.get("tactic", "unknown").lower().replace(" ", "-")
+        buckets.setdefault(tactic, []).append(mapping)
+
+    stages: list[dict] = []
+
+    # Known tactics in kill-chain order
+    for tactic in TACTIC_ORDER:
+        if tactic not in buckets:
+            continue
+        techniques = sorted(
+            buckets[tactic],
+            key=lambda t: _CONF_RANK.get(t.get("confidence", "low"), 0),
+            reverse=True,
+        )
+        primary = techniques[0]
+        extra_ids = [t.get("technique_id", "") for t in techniques[1:] if t.get("technique_id")]
+        stage: dict[str, Any] = {
+            "name": TACTIC_DISPLAY.get(tactic, tactic.replace("-", " ").title()),
+            "mitre_technique_id": primary.get("technique_id", ""),
+            "technique_claimed": primary.get("technique_name", ""),
+            "stage_present": True,
+            "controls": [],
+            "gaps_detected": [],
+        }
+        if extra_ids:
+            stage["additional_techniques"] = extra_ids
+        stages.append(stage)
+
+    # Unknown / ICS-only tactics appended at end
+    for tactic, techniques in buckets.items():
+        if tactic in TACTIC_ORDER:
+            continue
+        primary = sorted(
+            techniques,
+            key=lambda t: _CONF_RANK.get(t.get("confidence", "low"), 0),
+            reverse=True,
+        )[0]
+        stages.append({
+            "name": tactic.replace("-", " ").title(),
+            "mitre_technique_id": primary.get("technique_id", ""),
+            "technique_claimed": primary.get("technique_name", ""),
+            "stage_present": True,
+            "controls": [],
+            "gaps_detected": [],
+        })
+
+    return stages
 
 
 # ---------------------------------------------------------------------------
@@ -307,9 +412,15 @@ class AttackPathVisualizer:
     def validate_inputs(self, payload: dict[str, Any]) -> ValidationResult:
         errors: list[str] = []
 
-        if "stages" not in payload:
-            errors.append("'stages' is required")
-        elif not isinstance(payload["stages"], list):
+        has_artifact = "artifact_id" in payload
+        has_stages = "stages" in payload
+
+        if not has_artifact and not has_stages:
+            errors.append(
+                "Either 'artifact_id' (json_events from threat_intel_ingester) "
+                "or 'stages' list is required"
+            )
+        elif has_stages and not isinstance(payload["stages"], list):
             errors.append("'stages' must be a list")
 
         fmt = payload.get("format", "ascii")
@@ -320,6 +431,53 @@ class AttackPathVisualizer:
             return ValidationResult(ok=False, errors=errors)
         return ValidationResult(ok=True)
 
+    def _load_stages_from_artifact(
+        self, artifact_id: str, context: Any
+    ) -> "list[dict] | ToolResult":
+        """Resolve a json_events artifact and extract attack stages from it."""
+        artifact = next(
+            (a for a in context.artifacts if a.artifact_id == artifact_id), None
+        )
+        if artifact is None:
+            return ToolResult(
+                ok=False,
+                error_code="ARTIFACT_NOT_FOUND",
+                message=(
+                    f"Artifact '{artifact_id}' not found in session. "
+                    "Use 'artifacts' to list loaded artifacts."
+                ),
+            )
+        if artifact.artifact_type != "json_events":
+            return ToolResult(
+                ok=False,
+                error_code="INPUT_VALIDATION_FAILED",
+                message=(
+                    f"Expected a json_events artifact (from threat_intel_ingester), "
+                    f"got '{artifact.artifact_type}'."
+                ),
+            )
+        try:
+            with open(artifact.file_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as exc:
+            return ToolResult(
+                ok=False,
+                error_code="ARTIFACT_UNREADABLE",
+                message=f"Failed to read artifact: {exc}",
+            )
+        stages = _build_stages_from_threat_intel(data)
+        if not stages:
+            return ToolResult(
+                ok=False,
+                error_code="NO_MITRE_MAPPINGS",
+                message=(
+                    "No MITRE technique mappings found in the json_events artifact. "
+                    "Re-run threat_intel_ingester with an LLM connected to populate "
+                    "technique mappings, or supply 'stages' manually."
+                ),
+            )
+        return stages
+
     def execute(
         self,
         payload: dict[str, Any],
@@ -327,8 +485,19 @@ class AttackPathVisualizer:
     ) -> ToolResult:
         """Render attack path visualization."""
         fmt = payload.get("format", "ascii")
-        stages = payload["stages"]
+        artifact_id: str | None = payload.get("artifact_id")
         attack_type = payload.get("attack_type", "unknown")
+
+        # Resolve stages — either from a json_events artifact or from inline payload
+        if artifact_id and "stages" not in payload:
+            result_or_stages = self._load_stages_from_artifact(artifact_id, context)
+            if isinstance(result_or_stages, ToolResult):
+                return result_or_stages
+            stages = result_or_stages
+            if attack_type == "unknown":
+                attack_type = "threat-intel"
+        else:
+            stages = payload["stages"]
         narrative = payload.get("attack_narrative", "")
         include_controls = payload.get("include_controls", True)
 
@@ -356,6 +525,7 @@ class AttackPathVisualizer:
                     "visualization": visualization,
                     "stages_rendered": len(present),
                     "missing_required": len(missing_req),
+                    "source": f"artifact:{artifact_id}" if artifact_id else "payload",
                 },
             )
 

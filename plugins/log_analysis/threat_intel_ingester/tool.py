@@ -476,8 +476,13 @@ class ThreatIntelIngester:
                 )
 
                 if llm_response.ok and llm_response.text:
+                    # Strip markdown code fences (LLMs often wrap JSON in ```json...```)
+                    raw = llm_response.text.strip()
+                    if raw.startswith("```"):
+                        raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
+                        raw = re.sub(r"\n?```\s*$", "", raw)
                     # Parse LLM JSON response
-                    llm_result = json.loads(llm_response.text)
+                    llm_result = json.loads(raw.strip())
 
                     # Build refined IOC list
                     for refined in llm_result.get("refined_iocs", []):
