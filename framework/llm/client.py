@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any
 
 from ..plugins.protocol import LLMQueryInterface, LLMResponse
@@ -39,7 +40,7 @@ class MCPLLMClient:
         model_id: str = "gemini-2.5-flash",
         transport: str = "stdio",
         endpoint: str | None = None,
-        max_retries: int = 2,
+        max_retries: int = 3,
     ):
         """Initialize MCP LLM client.
         
@@ -237,6 +238,12 @@ class MCPLLMClient:
         parts.append(prompt)
         return "\n".join(parts)
     
+    @staticmethod
+    def _is_retriable(exc: Exception) -> bool:
+        """Return True for transient API errors that warrant a retry."""
+        msg = str(exc)
+        return any(marker in msg for marker in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"))
+
     def _execute_mcp_query(
         self,
         prompt: str,
@@ -257,20 +264,34 @@ class MCPLLMClient:
         if system_context:
             config.system_instruction = system_context
         
-        response = self._genai_client.models.generate_content(
-            model=self.model_id,
-            contents=prompt,
-            config=config,
-        )
-        
-        text = response.text or ""
-        
-        # Track token usage if available
-        if hasattr(response, "usage_metadata") and response.usage_metadata:
-            um = response.usage_metadata
-            self._total_tokens_used += getattr(um, "total_token_count", 0)
-        
-        return text
+        last_exc: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self._genai_client.models.generate_content(
+                    model=self.model_id,
+                    contents=prompt,
+                    config=config,
+                )
+                text = response.text or ""
+                if hasattr(response, "usage_metadata") and response.usage_metadata:
+                    um = response.usage_metadata
+                    self._total_tokens_used += getattr(um, "total_token_count", 0)
+                return text
+            except Exception as exc:
+                if attempt < self.max_retries and self._is_retriable(exc):
+                    wait = 2 ** attempt  # 1 s, 2 s, 4 s …
+                    logger.warning(
+                        "LLM transient error (attempt %d/%d), retrying in %ds: %s",
+                        attempt + 1,
+                        self.max_retries + 1,
+                        wait,
+                        exc,
+                    )
+                    time.sleep(wait)
+                    last_exc = exc
+                else:
+                    raise
+        raise last_exc  # type: ignore[misc]
     
     def _execute_mcp_multimodal_query(
         self,
@@ -298,13 +319,30 @@ class MCPLLMClient:
             genai_types.Part.from_bytes(data=image_data, mime_type=mime_type),
         ]
         
-        response = self._genai_client.models.generate_content(
-            model=self.model_id,
-            contents=contents,
-            config=config,
-        )
-        
-        return response.text or ""
+        last_exc: Exception | None = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self._genai_client.models.generate_content(
+                    model=self.model_id,
+                    contents=contents,
+                    config=config,
+                )
+                return response.text or ""
+            except Exception as exc:
+                if attempt < self.max_retries and self._is_retriable(exc):
+                    wait = 2 ** attempt
+                    logger.warning(
+                        "LLM multimodal transient error (attempt %d/%d), retrying in %ds: %s",
+                        attempt + 1,
+                        self.max_retries + 1,
+                        wait,
+                        exc,
+                    )
+                    time.sleep(wait)
+                    last_exc = exc
+                else:
+                    raise
+        raise last_exc  # type: ignore[misc]
 
 
 class TieredLLMClient:
