@@ -59,12 +59,13 @@ gcloud run deploy "${SERVICE_NAME}" \
     --image="${IMAGE_NAME}" \
     --platform=managed \
     --port=8080 \
-    --memory=512Mi \
-    --cpu=1 \
+    --memory=2Gi \
+    --cpu=2 \
+    --no-cpu-throttling \
     --min-instances=0 \
     --max-instances=3 \
     --timeout=3600 \
-    --concurrency=10 \
+    --concurrency=5 \
     --session-affinity \
     --set-env-vars="GEMINI_FLASH_API_KEY=${GEMINI_FLASH_API_KEY:-}" \
     --set-env-vars="GEMINI_PRO_API_KEY=${GEMINI_PRO_API_KEY:-}" \
