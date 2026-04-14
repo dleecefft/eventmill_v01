@@ -1030,7 +1030,18 @@ class EventMillShell(cmd.Cmd):
 
             worker = threading.Thread(target=_run_plugin, daemon=True)
             worker.start()
-            worker.join(timeout=timeout)
+
+            # Poll with a visible elapsed-time ticker instead of a single
+            # silent join.  The periodic output also keeps the WebSocket
+            # alive through Cloud Run's load-balancer.
+            _tick = 10  # seconds between progress updates
+            _elapsed = 0
+            while _elapsed < timeout:
+                worker.join(timeout=min(_tick, timeout - _elapsed))
+                _elapsed += _tick
+                if not worker.is_alive():
+                    break
+                print(f"  \u23f3 {_elapsed}s / {timeout}s ...", flush=True)
 
             if worker.is_alive():
                 print(f"  \u2718 Timed out after {timeout}s")
