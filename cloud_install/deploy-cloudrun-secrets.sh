@@ -134,6 +134,7 @@ gcloud run deploy "${SERVICE_NAME}" \
     --max-instances=3 \
     --timeout=3600 \
     --concurrency=10 \
+    --session-affinity \
     --service-account="${SA_EMAIL}" \
     --set-secrets="GEMINI_FLASH_API_KEY=${SECRET_GEMINI_FLASH}:latest,GEMINI_PRO_API_KEY=${SECRET_GEMINI_PRO}:latest,TTYD_USERNAME=${SECRET_TTYD_USER}:latest,TTYD_PASSWORD=${SECRET_TTYD_CRED}:latest" \
     --set-env-vars="EVENTMILL_BUCKET_PREFIX=${BUCKET_PREFIX},GCS_LOG_BUCKET=${GCS_LOG_BUCKET},EVENTMILL_LOG_LEVEL=${EVENTMILL_LOG_LEVEL:-INFO}" \
