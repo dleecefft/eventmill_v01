@@ -92,7 +92,10 @@ class MCPLLMClient:
             return False
         
         try:
-            self._genai_client = genai.Client(api_key=resolved_key)
+            self._genai_client = genai.Client(
+                api_key=resolved_key,
+                http_options={"timeout": 120_000},  # 120 s per request
+            )
             self._connected = True
             logger.info(
                 "Connected to %s via Google GenAI SDK", self.model_id,
@@ -242,7 +245,10 @@ class MCPLLMClient:
     def _is_retriable(exc: Exception) -> bool:
         """Return True for transient API errors that warrant a retry."""
         msg = str(exc)
-        return any(marker in msg for marker in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"))
+        return any(marker in msg for marker in (
+            "503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
+            "DeadlineExceeded", "Timeout", "timed out",
+        ))
 
     def _execute_mcp_query(
         self,

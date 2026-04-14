@@ -14,6 +14,7 @@ import random
 import shlex
 import signal
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -25,7 +26,7 @@ from ..plugins.loader import PluginLoader, LoadedPlugin
 from ..routing.router import Router, RouterConfig
 from ..artifacts.registry import ArtifactRegistry, create_artifact_registration_callback
 from ..llm.client import MCPLLMClient, ContextBuilder, TieredLLMClient
-from ..plugins.protocol import ExecutionContext, ReferenceDataView, ArtifactRef
+from ..plugins.protocol import ExecutionContext, ReferenceDataView, ArtifactRef, TimeoutClass
 from ..cloud.resolver import StorageResolver, StorageResolverConfig, create_local_resolver
 
 logger = get_logger("cli")
@@ -1013,10 +1014,44 @@ class EventMillShell(cmd.Cmd):
             tool_name=tool_name,
         )
         
-        print(f"  Running {plugin.manifest.display_name}...")
+        timeout = TimeoutClass.get_limit(plugin.manifest.timeout_class)
+        print(f"  Running {plugin.manifest.display_name} (timeout {timeout}s)...")
         
         try:
-            result = instance.execute(payload, context)
+            # Execute with thread-based timeout to prevent indefinite hangs
+            _result_holder: list = [None]
+            _error_holder: list = [None]
+
+            def _run_plugin():
+                try:
+                    _result_holder[0] = instance.execute(payload, context)
+                except Exception as exc:
+                    _error_holder[0] = exc
+
+            worker = threading.Thread(target=_run_plugin, daemon=True)
+            worker.start()
+            worker.join(timeout=timeout)
+
+            if worker.is_alive():
+                print(f"  \u2718 Timed out after {timeout}s")
+                self.session_manager.complete_execution(
+                    execution=execution,
+                    status=ToolExecutionStatus.FAILED,
+                    summary=f"Execution timed out after {timeout}s",
+                )
+                log_user_activity("run_tool", {
+                    "tool_name": tool_name,
+                    "execution_id": execution.execution_id,
+                    "status": "timeout",
+                })
+                return
+
+            if _error_holder[0] is not None:
+                raise _error_holder[0]
+
+            result = _result_holder[0]
+            if result is None:
+                raise RuntimeError("Plugin returned None instead of ToolResult")
             
             if result.ok:
                 # Auto-persist output if the tool didn't register an artifact itself

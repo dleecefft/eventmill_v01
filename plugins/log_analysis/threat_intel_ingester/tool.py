@@ -212,6 +212,88 @@ def extract_iocs_regex(
 
 
 # ---------------------------------------------------------------------------
+# Chunked LLM processing helpers
+# ---------------------------------------------------------------------------
+
+_MAX_IOC_PER_CHUNK: int = 30        # IOC candidates per LLM call
+_MAX_TEXT_CHARS_PER_CHUNK: int = 3_500  # Report text chars per LLM call
+
+
+def _chunk_text(text: str, max_chars: int = _MAX_TEXT_CHARS_PER_CHUNK) -> list[str]:
+    """Split text into paragraph-bounded chunks, each under max_chars."""
+    if len(text) <= max_chars:
+        return [text]
+    chunks: list[str] = []
+    paragraphs = text.split("\n\n")
+    current: list[str] = []
+    current_len = 0
+    for para in paragraphs:
+        para_len = len(para) + 2  # account for the "\n\n" separator
+        if current_len + para_len > max_chars and current:
+            chunks.append("\n\n".join(current))
+            current = [para]
+            current_len = para_len
+        else:
+            current.append(para)
+            current_len += para_len
+    if current:
+        chunks.append("\n\n".join(current))
+    return chunks or [text[:max_chars]]
+
+
+def _merge_llm_chunk_results(chunk_results: list[dict]) -> dict:
+    """Merge LLM JSON results from multiple document chunks.
+
+    IOCs and MITRE techniques are deduplicated by value/technique_id.
+    report_metadata comes from the first successful chunk.
+    attack_graph paths are unioned and deduplicated by path_id.
+    """
+    merged_iocs: list[dict] = []
+    merged_mitre: list[dict] = []
+    seen_ioc_keys: set[str] = set()
+    seen_tids: set[str] = set()
+    report_meta: dict = {}
+    ag_paths: list[dict] = []
+    ag_convergence: set[str] = set()
+    ag_branches: set[str] = set()
+
+    for result in chunk_results:
+        for ioc in result.get("refined_iocs", []):
+            key = f"{ioc.get('ioc_type')}:{ioc.get('value', '').lower()}"
+            if key not in seen_ioc_keys:
+                seen_ioc_keys.add(key)
+                merged_iocs.append(ioc)
+
+        for m in result.get("additional_mitre_techniques", []):
+            tid = m.get("technique_id", "")
+            if tid and tid not in seen_tids:
+                seen_tids.add(tid)
+                merged_mitre.append(m)
+
+        if not report_meta:
+            report_meta = result.get("report_metadata") or {}
+
+        ag = result.get("attack_graph") or {}
+        for path in ag.get("paths", []):
+            pid = path.get("path_id")
+            if not any(p.get("path_id") == pid for p in ag_paths):
+                ag_paths.append(path)
+        ag_convergence.update(ag.get("convergence_points", []))
+        ag_branches.update(ag.get("branch_points", []))
+
+    return {
+        "refined_iocs": merged_iocs,
+        "additional_mitre_techniques": merged_mitre,
+        "report_metadata": report_meta,
+        "attack_graph": {
+            "paths": ag_paths,
+            "convergence_points": list(ag_convergence),
+            "branch_points": list(ag_branches),
+        } if ag_paths else {},
+    }
+
+
+# ---------------------------------------------------------------------------
 # LLM Refinement Prompt
 # ---------------------------------------------------------------------------
 
@@ -485,19 +567,8 @@ class ThreatIntelIngester:
         if context.llm_enabled and context.llm_query is not None:
             logger.info("Running LLM refinement on %d IOC candidates", len(raw_iocs))
 
-            ioc_candidates_text = "\n".join(
-                f"- [{ioc.ioc_type}] {ioc.value} | Context: {ioc.context[:200]}"
-                for ioc in raw_iocs[:100]  # Limit to avoid context overflow
-            )
-
-            prompt = LLM_REFINEMENT_PROMPT.format(
-                source_context=source_context or "Not provided",
-                ioc_candidates=ioc_candidates_text,
-                report_text=raw_text[:8000],  # Truncate for context budget
-            )
-
             # Use framework reference data for MITRE grounding
-            grounding = []
+            grounding: list[str] = []
             if hasattr(context, "reference_data"):
                 mitre_data = context.reference_data.get("mitre_attack_enterprise")
                 if mitre_data:
@@ -506,51 +577,99 @@ class ThreatIntelIngester:
                         "for validation. Use official technique IDs."
                     )
 
-            try:
-                llm_response = context.llm_query.query_text(
-                    prompt=prompt,
-                    system_context=(
-                        "You are a threat intelligence analyst. "
-                        "Respond only with valid JSON."
-                    ),
-                    max_tokens=4096,
-                    grounding_data=grounding,
+            # Split large inputs into chunks to stay within LLM context limits.
+            # Large PDFs previously caused repeated 503s even with backoff because
+            # the monolithic prompt (100 IOCs + 8 kB text) exceeded the model's
+            # comfortable input window.  Each chunk call is ~7-10 kB total.
+            ioc_batches = [
+                raw_iocs[i:i + _MAX_IOC_PER_CHUNK]
+                for i in range(0, max(1, len(raw_iocs)), _MAX_IOC_PER_CHUNK)
+            ]
+            text_chunks = _chunk_text(raw_text, _MAX_TEXT_CHARS_PER_CHUNK)
+            n_chunks = max(len(ioc_batches), len(text_chunks))
+
+            logger.info(
+                "Splitting into %d LLM chunk(s) (%d IOC batches, %d text chunks)",
+                n_chunks, len(ioc_batches), len(text_chunks),
+            )
+
+            def _parse_llm_json(response_text: str) -> dict | None:
+                raw_resp = response_text.strip()
+                if raw_resp.startswith("```"):
+                    raw_resp = re.sub(r"^```(?:json)?\s*\n?", "", raw_resp)
+                    raw_resp = re.sub(r"\n?```\s*$", "", raw_resp)
+                try:
+                    return json.loads(raw_resp.strip())
+                except (json.JSONDecodeError, ValueError):
+                    return None
+
+            chunk_results: list[dict] = []
+            for i in range(n_chunks):
+                ioc_batch = ioc_batches[i] if i < len(ioc_batches) else []
+                text_chunk = text_chunks[i] if i < len(text_chunks) else ""
+
+                if not ioc_batch and not text_chunk:
+                    continue
+
+                candidates_text = (
+                    "\n".join(
+                        f"- [{ioc.ioc_type}] {ioc.value} | Context: {ioc.context[:200]}"
+                        for ioc in ioc_batch
+                    )
+                    or "(none in this section)"
                 )
 
-                if llm_response.ok and llm_response.text:
-                    # Strip markdown code fences (LLMs often wrap JSON in ```json...```)
-                    raw = llm_response.text.strip()
-                    if raw.startswith("```"):
-                        raw = re.sub(r"^```(?:json)?\s*\n?", "", raw)
-                        raw = re.sub(r"\n?```\s*$", "", raw)
-                    # Parse LLM JSON response
-                    llm_result = json.loads(raw.strip())
+                prompt = LLM_REFINEMENT_PROMPT.format(
+                    source_context=source_context or "Not provided",
+                    ioc_candidates=candidates_text,
+                    report_text=text_chunk,
+                )
 
-                    # Build refined IOC list
-                    for refined in llm_result.get("refined_iocs", []):
-                        if refined.get("is_false_positive", False):
-                            continue
+                logger.info(
+                    "LLM chunk %d/%d — %d IOCs, %d chars text",
+                    i + 1, n_chunks, len(ioc_batch), len(text_chunk),
+                )
+
+                try:
+                    llm_response = context.llm_query.query_text(
+                        prompt=prompt,
+                        system_context=(
+                            "You are a threat intelligence analyst. "
+                            "Respond only with valid JSON."
+                        ),
+                        max_tokens=4096,
+                        grounding_data=grounding,
+                    )
+
+                    if llm_response.ok and llm_response.text:
+                        parsed = _parse_llm_json(llm_response.text)
+                        if parsed:
+                            chunk_results.append(parsed)
+                        else:
+                            logger.warning(
+                                "Chunk %d/%d: JSON parse failed", i + 1, n_chunks
+                            )
+                    else:
+                        logger.warning(
+                            "Chunk %d/%d LLM call failed: %s",
+                            i + 1, n_chunks, llm_response.error,
+                        )
+
+                except Exception as e:
+                    logger.warning("Chunk %d/%d error: %s", i + 1, n_chunks, e)
+
+            if chunk_results:
+                merged = _merge_llm_chunk_results(chunk_results)
+                for refined in merged.get("refined_iocs", []):
+                    if not refined.get("is_false_positive", False):
                         refined_iocs.append(refined)
-
-                    mitre_mappings = llm_result.get(
-                        "additional_mitre_techniques", []
-                    )
-                    report_meta = llm_result.get("report_metadata", {})
-
-                    # Extract attack graph for multi-path visualization
-                    attack_graph = llm_result.get("attack_graph", {})
-
-                else:
-                    logger.warning(
-                        "LLM refinement failed, falling back to regex-only results. "
-                        "Error: %s",
-                        llm_response.error,
-                    )
-                    # Fall through to regex-only path
-
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
-                logger.warning("LLM response parsing failed: %s", e)
-                # Fall through to regex-only path
+                mitre_mappings = merged.get("additional_mitre_techniques", [])
+                report_meta = merged.get("report_metadata", {})
+                attack_graph = merged.get("attack_graph", {})
+            else:
+                logger.warning(
+                    "All LLM chunks failed, falling back to regex-only results."
+                )
 
         # If LLM refinement didn't produce results, use regex baseline
         if not refined_iocs:

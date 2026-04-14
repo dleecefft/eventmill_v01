@@ -303,8 +303,10 @@ class TimeoutClass:
     
     LIMITS = {
         FAST: 30,
+        "short": 30,
         MEDIUM: 120,
         SLOW: 600,
+        "long": 600,
     }
     
     @classmethod
