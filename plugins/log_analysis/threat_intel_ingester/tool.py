@@ -565,6 +565,7 @@ class ThreatIntelIngester:
         attack_graph = {}  # multi-path attack graph from LLM
 
         if context.llm_enabled and context.llm_query is not None:
+            logger.info("[DIAG] LLM enabled, llm_query type=%s", type(context.llm_query).__name__)
             logger.info("Running LLM refinement on %d IOC candidates", len(raw_iocs))
 
             # Use framework reference data for MITRE grounding
@@ -642,25 +643,66 @@ class ThreatIntelIngester:
                     )
 
                     if llm_response.ok and llm_response.text:
+                        logger.info(
+                            "[DIAG] Chunk %d/%d raw LLM response (%d chars): %.300s",
+                            i + 1, n_chunks, len(llm_response.text),
+                            llm_response.text[:300],
+                        )
                         parsed = _parse_llm_json(llm_response.text)
                         if parsed:
+                            n_refined = len(parsed.get("refined_iocs", []))
+                            n_fp = sum(
+                                1 for r in parsed.get("refined_iocs", [])
+                                if r.get("is_false_positive")
+                            )
+                            n_mitre = len(parsed.get("additional_mitre_techniques", []))
+                            n_paths = len(parsed.get("attack_graph", {}).get("paths", []))
+                            logger.info(
+                                "[DIAG] Chunk %d/%d parsed OK — "
+                                "%d refined_iocs (%d false_pos), "
+                                "%d additional_mitre, %d attack_paths",
+                                i + 1, n_chunks,
+                                n_refined, n_fp, n_mitre, n_paths,
+                            )
                             chunk_results.append(parsed)
                         else:
                             logger.warning(
-                                "Chunk %d/%d: JSON parse failed", i + 1, n_chunks
+                                "[DIAG] Chunk %d/%d: JSON parse FAILED. "
+                                "First 500 chars: %.500s",
+                                i + 1, n_chunks, llm_response.text[:500],
                             )
                     else:
                         logger.warning(
-                            "Chunk %d/%d LLM call failed: %s",
-                            i + 1, n_chunks, llm_response.error,
+                            "[DIAG] Chunk %d/%d LLM call failed: ok=%s, "
+                            "has_text=%s, error=%s",
+                            i + 1, n_chunks, llm_response.ok,
+                            bool(llm_response.text), llm_response.error,
                         )
 
                 except Exception as e:
-                    logger.warning("Chunk %d/%d error: %s", i + 1, n_chunks, e)
+                    logger.warning(
+                        "[DIAG] Chunk %d/%d EXCEPTION: %s: %s",
+                        i + 1, n_chunks, type(e).__name__, e,
+                    )
+
+            logger.info(
+                "[DIAG] LLM loop done — %d/%d chunks produced parseable JSON",
+                len(chunk_results), n_chunks,
+            )
 
             if chunk_results:
                 merged = _merge_llm_chunk_results(chunk_results)
-                for refined in merged.get("refined_iocs", []):
+                all_refined = merged.get("refined_iocs", [])
+                non_fp = [r for r in all_refined if not r.get("is_false_positive", False)]
+                logger.info(
+                    "[DIAG] Merged result — %d refined_iocs total, "
+                    "%d after false-positive filter, "
+                    "%d additional_mitre, attack_graph paths=%d",
+                    len(all_refined), len(non_fp),
+                    len(merged.get("additional_mitre_techniques", [])),
+                    len(merged.get("attack_graph", {}).get("paths", [])),
+                )
+                for refined in all_refined:
                     if not refined.get("is_false_positive", False):
                         refined_iocs.append(refined)
                 mitre_mappings = merged.get("additional_mitre_techniques", [])
@@ -668,11 +710,19 @@ class ThreatIntelIngester:
                 attack_graph = merged.get("attack_graph", {})
             else:
                 logger.warning(
-                    "All LLM chunks failed, falling back to regex-only results."
+                    "[DIAG] All %d LLM chunks failed — falling back to regex-only.",
+                    n_chunks,
                 )
 
         # If LLM refinement didn't produce results, use regex baseline
         if not refined_iocs:
+            llm_was_enabled = context.llm_enabled and context.llm_query is not None
+            logger.warning(
+                "[DIAG] FALLBACK to regex-only — refined_iocs empty. "
+                "LLM enabled=%s, mitre_mappings=%d, attack_graph_paths=%d",
+                llm_was_enabled, len(mitre_mappings),
+                len(attack_graph.get("paths", [])) if isinstance(attack_graph, dict) else 0,
+            )
             logger.info("Using regex-only IOC results (no LLM refinement)")
             refined_iocs = [
                 {
