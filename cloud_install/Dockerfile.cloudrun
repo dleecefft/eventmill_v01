@@ -70,7 +70,7 @@ USER eventmill
 ENV PORT=8080
 ENV PYTHONUNBUFFERED=1
 ENV EVENTMILL_WORKSPACE=/app/workspace
-ENV EVENTMILL_LOG_LEVEL=DEBUG
+ENV EVENTMILL_LOG_LEVEL=INFO
 
 # LLM API keys are injected via Cloud Run secrets (--set-secrets in deploy script):
 #   GEMINI_FLASH_API_KEY - Gemini Flash (light tier, fast/cheap)

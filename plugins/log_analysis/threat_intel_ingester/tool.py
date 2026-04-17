@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from framework.logging.structured import log_llm_interaction
+
 logger = logging.getLogger("eventmill.plugin.threat_intel_ingester")
 
 # ---------------------------------------------------------------------------
@@ -630,6 +632,11 @@ class ThreatIntelIngester:
                     "LLM chunk %d/%d — %d IOCs, %d chars text",
                     i + 1, n_chunks, len(ioc_batch), len(text_chunk),
                 )
+                logger.info(
+                    "[DIAG] Chunk %d/%d PROMPT SENT (%d chars). "
+                    "First 500: %.500s",
+                    i + 1, n_chunks, len(prompt), prompt[:500],
+                )
 
                 try:
                     llm_response = context.llm_query.query_text(
@@ -642,11 +649,25 @@ class ThreatIntelIngester:
                         grounding_data=grounding,
                     )
 
+                    # --- Cloud Logging audit: input + output ---
+                    log_llm_interaction(
+                        prompt=f"[ti_ingester chunk {i+1}/{n_chunks}] {prompt[:500]}",
+                        response_text=(
+                            llm_response.text[:500] if llm_response.text else None
+                        ),
+                        model_id="threat_intel_ingester",
+                        error=(
+                            str(llm_response.error)
+                            if not llm_response.ok else None
+                        ),
+                    )
+
                     if llm_response.ok and llm_response.text:
                         logger.info(
-                            "[DIAG] Chunk %d/%d raw LLM response (%d chars): %.300s",
+                            "[DIAG] Chunk %d/%d LLM RESPONSE (%d chars). "
+                            "First 500: %.500s",
                             i + 1, n_chunks, len(llm_response.text),
-                            llm_response.text[:300],
+                            llm_response.text[:500],
                         )
                         parsed = _parse_llm_json(llm_response.text)
                         if parsed:
@@ -677,6 +698,11 @@ class ThreatIntelIngester:
                             "has_text=%s, error=%s",
                             i + 1, n_chunks, llm_response.ok,
                             bool(llm_response.text), llm_response.error,
+                        )
+                        logger.warning(
+                            "[DIAG] Chunk %d/%d FAILED RESPONSE text first 500: %.500s",
+                            i + 1, n_chunks,
+                            (llm_response.text or "(none)")[:500],
                         )
 
                 except Exception as e:
