@@ -637,7 +637,7 @@ class ThreatIntelIngester:
                             "You are a threat intelligence analyst. "
                             "Respond only with valid JSON."
                         ),
-                        max_tokens=4096,
+                        max_tokens=3000,
                         grounding_data=grounding,
                     )
 

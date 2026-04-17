@@ -87,6 +87,23 @@ def example_response() -> dict:
         return json.load(f)
 
 
+@dataclass
+class MockToolResult:
+    """Minimal ToolResult stand-in for summarize_for_llm tests."""
+    ok: bool = True
+    result: dict = field(default_factory=dict)
+    message: str = ""
+    output_artifacts: list = field(default_factory=list)
+
+
+@pytest.fixture
+def example_tool_result(example_response: dict) -> MockToolResult:
+    return MockToolResult(
+        ok=example_response.get("ok", True),
+        result=example_response.get("result", {}),
+    )
+
+
 @pytest.fixture
 def tool_class():
     return _tool_mod.ThreatIntelIngester
@@ -172,7 +189,7 @@ class TestManifestLoads:
         assert manifest["stability"] in valid
 
     def test_timeout_class_is_valid(self, manifest: dict):
-        valid = ["fast", "medium", "slow"]
+        valid = ["fast", "short", "medium", "slow", "long"]
         assert manifest["timeout_class"] in valid
 
     def test_capabilities_format(self, manifest: dict):
@@ -259,39 +276,39 @@ class TestToolInstantiation:
 class TestValidateInputs:
     def test_accepts_valid_example(self, tool_instance, example_request: dict):
         result = tool_instance.validate_inputs(example_request)
-        assert result["ok"] is True
-        assert len(result.get("errors", [])) == 0
+        assert result.ok is True
+        assert len(result.errors or []) == 0
 
     def test_rejects_missing_artifact_id(self, tool_instance):
         result = tool_instance.validate_inputs({})
-        assert result["ok"] is False
-        assert any("artifact_id" in e for e in result["errors"])
+        assert result.ok is False
+        assert any("artifact_id" in e for e in result.errors)
 
     def test_rejects_invalid_ioc_type(self, tool_instance):
         result = tool_instance.validate_inputs({
             "artifact_id": "art_0001",
             "ioc_types": ["ip", "invalid_type"],
         })
-        assert result["ok"] is False
-        assert any("invalid_type" in e for e in result["errors"])
+        assert result.ok is False
+        assert any("invalid_type" in e for e in result.errors)
 
     def test_rejects_invalid_confidence(self, tool_instance):
         result = tool_instance.validate_inputs({
             "artifact_id": "art_0001",
             "confidence_threshold": "extreme",
         })
-        assert result["ok"] is False
+        assert result.ok is False
 
     def test_rejects_max_pages_out_of_range(self, tool_instance):
         result = tool_instance.validate_inputs({
             "artifact_id": "art_0001",
             "max_pages": 500,
         })
-        assert result["ok"] is False
+        assert result.ok is False
 
     def test_accepts_minimal_payload(self, tool_instance):
         result = tool_instance.validate_inputs({"artifact_id": "art_0001"})
-        assert result["ok"] is True
+        assert result.ok is True
 
 
 # ---------------------------------------------------------------------------
@@ -332,47 +349,46 @@ class TestExampleValidation:
 
 class TestSummarizeForLLM:
     def test_returns_non_empty_string(
-        self, tool_instance, example_response: dict
+        self, tool_instance, example_tool_result
     ):
-        summary = tool_instance.summarize_for_llm(example_response)
+        summary = tool_instance.summarize_for_llm(example_tool_result)
         assert isinstance(summary, str)
         assert len(summary) > 0
 
     def test_under_2000_characters(
-        self, tool_instance, example_response: dict
+        self, tool_instance, example_tool_result
     ):
-        summary = tool_instance.summarize_for_llm(example_response)
+        summary = tool_instance.summarize_for_llm(example_tool_result)
         assert len(summary) <= 2000, (
             f"Summary is {len(summary)} chars, exceeds 2000 limit"
         )
 
     def test_contains_ioc_count(
-        self, tool_instance, example_response: dict
+        self, tool_instance, example_tool_result
     ):
-        summary = tool_instance.summarize_for_llm(example_response)
+        summary = tool_instance.summarize_for_llm(example_tool_result)
         # Should mention the total IOC count from the example
         assert "9" in summary or "IOC" in summary
 
     def test_contains_mitre_reference(
-        self, tool_instance, example_response: dict
+        self, tool_instance, example_tool_result
     ):
-        summary = tool_instance.summarize_for_llm(example_response)
+        summary = tool_instance.summarize_for_llm(example_tool_result)
         assert "MITRE" in summary or "T1" in summary
 
     def test_handles_error_result(self, tool_instance):
-        error_result = {
-            "ok": False,
-            "error_code": "ARTIFACT_NOT_FOUND",
-            "message": "Artifact art_9999 not found in session.",
-        }
+        error_result = MockToolResult(
+            ok=False,
+            message="Artifact art_9999 not found in session.",
+        )
         summary = tool_instance.summarize_for_llm(error_result)
         assert isinstance(summary, str)
         assert "failed" in summary.lower()
 
     def test_no_raw_json_in_summary(
-        self, tool_instance, example_response: dict
+        self, tool_instance, example_tool_result
     ):
-        summary = tool_instance.summarize_for_llm(example_response)
+        summary = tool_instance.summarize_for_llm(example_tool_result)
         # Summary should be plain text, not JSON
         assert not summary.strip().startswith("{")
         assert not summary.strip().startswith("[")
@@ -411,8 +427,8 @@ class TestExecuteErrorHandling:
         result = tool_instance.execute(
             {"artifact_id": "art_nonexistent"}, context
         )
-        assert result["ok"] is False
-        assert result["error_code"] == "ARTIFACT_NOT_FOUND"
+        assert result.ok is False
+        assert result.error_code == "ARTIFACT_NOT_FOUND"
 
     def test_returns_error_for_wrong_artifact_type(self, tool_instance):
         context = MockExecutionContext(
@@ -427,8 +443,8 @@ class TestExecuteErrorHandling:
         result = tool_instance.execute(
             {"artifact_id": "art_0001"}, context
         )
-        assert result["ok"] is False
-        assert result["error_code"] == "INPUT_VALIDATION_FAILED"
+        assert result.ok is False
+        assert result.error_code == "INPUT_VALIDATION_FAILED"
 
 
 # ---------------------------------------------------------------------------
