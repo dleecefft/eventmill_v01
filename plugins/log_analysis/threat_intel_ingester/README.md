@@ -18,6 +18,23 @@ For **PDF reports**, the plugin now supports **native PDF ingestion via the Gemi
    export GEMINI_PRO_API_KEY="your-pro-key"
    ```
 2. **Python dependencies** — installed via `pip install ".[plugins-log-analysis]"` from the project root.
+3. **MITRE ATT&CK lookup** (one-time setup) — build the local technique database:
+   ```bash
+   python scripts/build_mitre_lookup.py
+   ```
+   This downloads the Enterprise and ICS ATT&CK STIX bundles from the
+   [MITRE CTI repository](https://github.com/mitre/cti) (currently pinned
+   to **ATT&CK v18.1**) and writes a compact lookup file to
+   `plugins/log_analysis/threat_intel_ingester/data/mitre_techniques.json`
+   (~774 techniques). The plugin uses this file to:
+   - **Enrich** LLM output with authoritative technique names and tactics
+   - **Backfill** technique IDs referenced in attack graphs but missing from mappings
+   - **Validate** every technique ID and mark non-ATT&CK IDs with `(non-ATT&CK ID)`
+     and `"mitre_validated": false` so analysts know when an ID was LLM-generated
+
+   Re-run the script after a new ATT&CK version is released to pick up new
+   techniques. The plugin works without the file but skips enrichment and
+   validation — a warning is logged on first use.
 
 ### Running in Event Mill
 
@@ -100,7 +117,7 @@ If native ingestion is unavailable (no API connection, model doesn't support PDF
 the native call fails), the plugin falls back to:
 
 1. Text extraction via `pdfplumber`
-2. Paragraph-bounded chunking (~3500 chars per chunk)
+2. Paragraph-bounded chunking (~6000 chars per chunk)
 3. Multiple `query_text()` calls with `QueryHints(tier="light")`
 4. Result merging and deduplication across chunks
 
@@ -169,4 +186,7 @@ Beyond framework baseline:
 
 ## Reference Data Overrides
 
-None.
+- **`data/mitre_techniques.json`** — Local ATT&CK technique lookup (Enterprise + ICS).
+  Built by `scripts/build_mitre_lookup.py` from official MITRE STIX bundles.
+  Used for technique name/tactic enrichment and ID validation. See Prerequisites
+  step 3 for setup instructions.

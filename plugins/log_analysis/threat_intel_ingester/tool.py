@@ -881,10 +881,7 @@ class ThreatIntelIngester:
                             f"[ti_ingester native_pdf] "
                             f"{native_prompt[:500]}"
                         ),
-                        response_text=(
-                            native_response.text[:500]
-                            if native_response.text else None
-                        ),
+                        response_text=native_response.text,
                         model_id=(
                             native_response.model_used
                             or "threat_intel_ingester"
@@ -931,6 +928,19 @@ class ThreatIntelIngester:
                                 native_response.token_usage,
                                 native_response.text[:200],
                                 native_response.text[-200:],
+                            )
+                            # Also log to activity so it shows in GCP
+                            log_llm_interaction(
+                                prompt="[ti_ingester native_pdf] JSON_PARSE_FAILED",
+                                response_text=native_response.text,
+                                model_id=(
+                                    native_response.model_used
+                                    or "threat_intel_ingester"
+                                ),
+                                error=(
+                                    f"JSON parse failed on {len(native_response.text)}-char "
+                                    f"response. first_100={native_response.text[:100]!r}"
+                                ),
                             )
                     else:
                         logger.warning(
@@ -1032,9 +1042,7 @@ class ThreatIntelIngester:
                     # --- Cloud Logging audit: input + output ---
                     log_llm_interaction(
                         prompt=f"[ti_ingester chunk {i+1}/{n_chunks}] {prompt[:500]}",
-                        response_text=(
-                            llm_response.text[:500] if llm_response.text else None
-                        ),
+                        response_text=llm_response.text,
                         model_id=llm_response.model_used or "threat_intel_ingester",
                         error=(
                             str(llm_response.error)
@@ -1141,7 +1149,9 @@ class ThreatIntelIngester:
                 )
 
         # If LLM refinement didn't produce results, use regex baseline
+        ingestion_mode = "llm"  # track which path produced results
         if not refined_iocs:
+            ingestion_mode = "regex_only"
             llm_was_enabled = context.llm_enabled and context.llm_query is not None
             logger.warning(
                 "[DIAG] FALLBACK to regex-only — refined_iocs empty. "
@@ -1283,12 +1293,14 @@ class ThreatIntelIngester:
                 },
                 "iocs": filtered_iocs,
                 "mitre_mappings": all_mitre,
+                "attack_graph": attack_graph,
                 "summary": {
                     "total_iocs": len(filtered_iocs),
                     "ioc_breakdown": ioc_breakdown,
                     "high_priority_count": high_priority_count,
                     "mitre_technique_count": len(all_mitre),
                     "confidence_distribution": confidence_dist,
+                    "ingestion_mode": ingestion_mode,
                 },
             },
             output_artifacts=output_artifacts_list,
@@ -1359,6 +1371,15 @@ class ThreatIntelIngester:
                 f"Attack graph: {path_count} path(s) identified"
                 + (f", converging at {', '.join(convergence)}" if convergence else "")
                 + "."
+            )
+
+        # Ingestion mode warning
+        mode = summary.get("ingestion_mode", "")
+        if mode == "regex_only":
+            parts.append(
+                "WARNING: LLM analysis failed — results are regex-only "
+                "(low confidence, no MITRE mapping, no attack graph). "
+                "Check logs for LLM failure details."
             )
 
         # Output artifact
