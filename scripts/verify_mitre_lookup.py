@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 
-DB = Path(__file__).parent.parent / "plugins/log_analysis/threat_intel_ingester/data/mitre_techniques.json"
+DB = Path(__file__).parent.parent / "framework/reference_data/mitre_techniques.json"
 db = json.load(open(DB))
 
 # All technique IDs from the CrowdStrike Gemini output

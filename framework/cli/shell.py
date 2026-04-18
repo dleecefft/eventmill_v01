@@ -27,6 +27,7 @@ from ..routing.router import Router, RouterConfig
 from ..artifacts.registry import ArtifactRegistry, create_artifact_registration_callback
 from ..llm.client import MCPLLMClient, ContextBuilder, LLMDispatcher
 from ..plugins.protocol import ExecutionContext, ReferenceDataView, ArtifactRef, TimeoutClass
+from ..reference_data.mitre_attack import get_mitre_db
 from ..cloud.resolver import StorageResolver, StorageResolverConfig, create_local_resolver
 
 logger = get_logger("cli")
@@ -1006,7 +1007,7 @@ class EventMillShell(cmd.Cmd):
             llm_enabled=self.llm_client is not None and self.llm_client.connected,
             llm_query=self.llm_client,
             register_artifact=_register_artifact,
-            reference_data=ReferenceDataView(),
+            reference_data=ReferenceDataView({"mitre_techniques": get_mitre_db()}),
         )
         
         # Track execution

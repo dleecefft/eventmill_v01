@@ -20,6 +20,7 @@ from typing import Any
 
 from framework.logging.structured import log_llm_interaction
 from framework.plugins.protocol import ToolResult, ValidationResult, QueryHints
+from framework.reference_data.mitre_attack import get_mitre_db as _get_mitre_db
 
 logger = logging.getLogger("eventmill.plugin.threat_intel_ingester")
 
@@ -386,45 +387,9 @@ def _repair_truncated_json(text: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Local MITRE ATT&CK technique lookup
+# MITRE ATT&CK technique lookup — delegated to framework.reference_data
 # ---------------------------------------------------------------------------
-
-_MITRE_DATA_FILE = Path(__file__).parent / "data" / "mitre_techniques.json"
-_MITRE_TECHNIQUE_DB: dict[str, dict] | None = None
-
-
-def _get_mitre_db() -> dict[str, dict]:
-    """Load the compact MITRE technique lookup (built by build_mitre_lookup.py).
-
-    Returns an empty dict (with a warning) if the data file has not been
-    generated yet.  The file is loaded at most once per process.
-    """
-    global _MITRE_TECHNIQUE_DB
-    if _MITRE_TECHNIQUE_DB is not None:
-        return _MITRE_TECHNIQUE_DB
-
-    if not _MITRE_DATA_FILE.exists():
-        logger.warning(
-            "MITRE lookup file not found at %s — "
-            "run 'python scripts/build_mitre_lookup.py' to build it. "
-            "Reconciliation will use LLM-provided data only.",
-            _MITRE_DATA_FILE,
-        )
-        _MITRE_TECHNIQUE_DB = {}
-        return _MITRE_TECHNIQUE_DB
-
-    try:
-        with open(_MITRE_DATA_FILE, "r", encoding="utf-8") as fh:
-            _MITRE_TECHNIQUE_DB = json.load(fh)
-        logger.info(
-            "Loaded MITRE technique lookup: %d techniques from %s",
-            len(_MITRE_TECHNIQUE_DB), _MITRE_DATA_FILE,
-        )
-    except Exception as exc:
-        logger.warning("Failed to load MITRE lookup: %s", exc)
-        _MITRE_TECHNIQUE_DB = {}
-
-    return _MITRE_TECHNIQUE_DB
+# _get_mitre_db is imported above from framework.reference_data.mitre_attack
 
 
 def _reconcile_mitre_mappings(

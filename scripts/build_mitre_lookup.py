@@ -10,7 +10,7 @@ Usage:
     python scripts/build_mitre_lookup.py
 
 Output:
-    plugins/log_analysis/threat_intel_ingester/data/mitre_techniques.json
+    framework/reference_data/mitre_techniques.json
 """
 
 from __future__ import annotations
@@ -40,10 +40,8 @@ STIX_URLS = {
 
 OUTPUT_PATH = (
     Path(__file__).resolve().parent.parent
-    / "plugins"
-    / "log_analysis"
-    / "threat_intel_ingester"
-    / "data"
+    / "framework"
+    / "reference_data"
     / "mitre_techniques.json"
 )
 

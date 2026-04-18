@@ -18,15 +18,16 @@ For **PDF reports**, the plugin now supports **native PDF ingestion via the Gemi
    export GEMINI_PRO_API_KEY="your-pro-key"
    ```
 2. **Python dependencies** — installed via `pip install ".[plugins-log-analysis]"` from the project root.
-3. **MITRE ATT&CK lookup** (one-time setup) — build the local technique database:
+3. **MITRE ATT&CK lookup** (one-time setup) — build the shared technique database:
    ```bash
    python scripts/build_mitre_lookup.py
    ```
    This downloads the Enterprise and ICS ATT&CK STIX bundles from the
    [MITRE CTI repository](https://github.com/mitre/cti) (currently pinned
    to **ATT&CK v18.1**) and writes a compact lookup file to
-   `plugins/log_analysis/threat_intel_ingester/data/mitre_techniques.json`
-   (~774 techniques). The plugin uses this file to:
+   `framework/reference_data/mitre_techniques.json` (~774 techniques).
+   The shared MITRE module (`framework.reference_data.mitre_attack`) is
+   used by this plugin and others to:
    - **Enrich** LLM output with authoritative technique names and tactics
    - **Backfill** technique IDs referenced in attack graphs but missing from mappings
    - **Validate** every technique ID and mark non-ATT&CK IDs with `(non-ATT&CK ID)`
@@ -186,7 +187,7 @@ Beyond framework baseline:
 
 ## Reference Data Overrides
 
-- **`data/mitre_techniques.json`** — Local ATT&CK technique lookup (Enterprise + ICS).
-  Built by `scripts/build_mitre_lookup.py` from official MITRE STIX bundles.
-  Used for technique name/tactic enrichment and ID validation. See Prerequisites
+- **`framework/reference_data/mitre_techniques.json`** — Shared ATT&CK technique
+  lookup (Enterprise + ICS). Built by `scripts/build_mitre_lookup.py`. Accessed
+  via `framework.reference_data.mitre_attack.get_mitre_db()`. See Prerequisites
   step 3 for setup instructions.
