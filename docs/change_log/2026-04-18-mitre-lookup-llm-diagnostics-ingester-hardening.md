@@ -423,17 +423,84 @@ New fields on mapping entries:
 
 ---
 
+## Session 3 — Kill-Chain Tactic Progression Fix
+
+**Date:** 2026-04-18 (continued)
+**Primary File Modified:** `plugins/log_analysis/threat_intel_ingester/tool.py`
+**Supporting File:** `plugins/log_analysis/threat_intel_ingester/tests/test_contract.py`
+
+### Problem
+
+Despite the multi-role refactor (Session 2), T1078.004 still appeared with
+tactic "Initial Access" in all attack paths. Root cause: the **LLM itself**
+assigned "Initial Access" for T1078.004 in every attack_graph step, even
+when the technique appeared at step 3 after credential theft. The reconciler
+correctly preserved the LLM's (wrong) tactic, resulting in a single merged
+entry instead of the expected multi-role split.
+
+### Fix: Two-Layer Defense
+
+#### A. `TACTIC_ORDER` + `ENTRY_ONLY_TACTICS` Constants
+
+- Added 14-entry `TACTIC_ORDER` dict mapping each MITRE tactic to its
+  kill-chain ordinal (Reconnaissance=1 through Impact=14).
+- Added `ENTRY_ONLY_TACTICS` set: `{Reconnaissance, Resource Development,
+  Initial Access}` — tactics that should only appear at the first step of
+  a path.
+
+#### B. `_fix_tactic_progression()` — Reconciler Step 0
+
+New function called at the start of `_reconcile_mitre_mappings`, before
+building the `(tid, tactic)` index. For each attack path:
+
+1. Skips step 0 (first step is allowed any tactic).
+2. For steps 1+, if the assigned tactic is in `ENTRY_ONLY_TACTICS`:
+   - Looks up the technique's valid tactics from the MITRE database.
+   - Filters out entry-only tactics, keeping alternatives.
+   - Picks the alternative with the highest kill-chain ordinal.
+   - Reassigns the step's tactic and logs the change.
+3. If no alternatives exist (all valid tactics are entry-only), keeps the
+   original tactic unchanged.
+
+For T1078.004 at step 2 of aitm-cloud-compromise:
+- "Initial Access" is entry-only → filter it out.
+- Remaining: Defense Evasion (7), Privilege Escalation (6), Persistence (5).
+- Highest ordinal: **Defense Evasion** (7).
+- The subsequent backfill creates two distinct `(T1078.004, Initial Access)`
+  and `(T1078.004, Defense Evasion)` entries with separate `context_paths`.
+
+#### C. Multi-Shot LLM Prompt Enhancement (Section 5)
+
+Added a `CRITICAL — TACTIC ASSIGNMENT IN ATTACK PATHS` block with:
+- Explicit rule: "Initial Access should only appear at the FIRST step."
+- List of common multi-tactic techniques with their valid tactics.
+- Three concrete examples showing T1078 reuse across paths with different
+  tactical roles:
+  - As entry point → Initial Access
+  - After credential theft → Persistence
+  - At two stages in one path → Initial Access then Privilege Escalation
+
+#### D. New Contract Tests (5 tests)
+
+- `TestTacticProgression`:
+  - Reassigns "Initial Access" at step 2 → Defense Evasion
+  - Preserves "Initial Access" at step 0
+  - Leaves non-entry tactic (Persistence) untouched
+  - Keeps entry tactic when no alternatives exist
+  - End-to-end reconcile splits T1078.004 into two distinct role entries
+
+---
+
 ## Test Results
 
-299 tests passing (232 plugin + 67 framework), 0 failures.
+304 tests passing (237 plugin + 67 framework), 0 failures.
 
 ---
 
 ## What's Next
 
-- Monitor production runs for tactic mismatch warnings to gauge LLM
-  hallucination rate on tactic assignment.
+- Re-run the CrowdStrike report to verify T1078.004 now splits into
+  multi-role entries with the code-level fix active.
+- Monitor production runs for tactic mismatch warnings.
 - Consider adding `context_paths` filtering to `attack_path_visualizer`
   to render per-path subgraphs on demand.
-- Monitor GCP activity logs for future JSON parse failures now that they're
-  visible in the activity log stream.

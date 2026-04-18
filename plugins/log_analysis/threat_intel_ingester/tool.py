@@ -76,6 +76,33 @@ def was_defanged(original: str, refanged: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# MITRE ATT&CK Kill-Chain Ordering
+# ---------------------------------------------------------------------------
+
+TACTIC_ORDER: dict[str, int] = {
+    "Reconnaissance": 1,
+    "Resource Development": 2,
+    "Initial Access": 3,
+    "Execution": 4,
+    "Persistence": 5,
+    "Privilege Escalation": 6,
+    "Defense Evasion": 7,
+    "Credential Access": 8,
+    "Discovery": 9,
+    "Lateral Movement": 10,
+    "Collection": 11,
+    "Command and Control": 12,
+    "Exfiltration": 13,
+    "Impact": 14,
+}
+
+# Tactics that should only appear at the entry point (first step) of a path.
+# If a later step is assigned one of these and the technique has alternatives,
+# the reconciler will reassign using the kill-chain ordering.
+ENTRY_ONLY_TACTICS: set[str] = {"Reconnaissance", "Resource Development", "Initial Access"}
+
+
+# ---------------------------------------------------------------------------
 # Text Extraction Helpers
 # ---------------------------------------------------------------------------
 
@@ -394,6 +421,71 @@ def _repair_truncated_json(text: str) -> dict | None:
 # _get_mitre_db is imported above from framework.reference_data.mitre_attack
 
 
+def _fix_tactic_progression(
+    attack_graph: dict,
+    mitre_db: dict[str, dict],
+) -> tuple[dict, int]:
+    """Enforce kill-chain tactic progression within each attack path.
+
+    **Entry-point-only rule**: ``Initial Access``, ``Reconnaissance``, and
+    ``Resource Development`` should only appear at the first step of a path.
+    If a later step uses one of these and the technique has alternative valid
+    tactics in the MITRE database, reassign to the valid tactic with the
+    highest kill-chain ordinal (preferring forward progression).
+
+    Mutates the ``attack_graph`` in place and returns it along with the
+    count of reassignments made.
+    """
+    reassign_count = 0
+
+    for path in attack_graph.get("paths", []):
+        path_id = path.get("path_id", "unknown")
+        steps = path.get("steps", [])
+        if len(steps) < 2:
+            continue
+
+        for step_idx, step in enumerate(steps):
+            if step_idx == 0:
+                continue  # first step is allowed to use entry-only tactics
+
+            tid = step.get("technique_id", "")
+            tactic = step.get("tactic", "")
+            if not tid or not tactic:
+                continue
+
+            if tactic not in ENTRY_ONLY_TACTICS:
+                continue  # tactic is fine, no fix needed
+
+            # Technique is using an entry-only tactic at a non-first step.
+            # Look up its valid tactics from the MITRE database.
+            local = mitre_db.get(tid, {})
+            valid_tactics: list[str] = local.get("tactics", [])
+            if not valid_tactics:
+                continue  # no DB data to pick from
+
+            # Filter out entry-only tactics, keep alternatives
+            alternatives = [
+                t for t in valid_tactics
+                if t not in ENTRY_ONLY_TACTICS and t in TACTIC_ORDER
+            ]
+            if not alternatives:
+                continue  # all valid tactics are entry-only; keep as-is
+
+            # Pick the alternative with the highest kill-chain ordinal
+            best = max(alternatives, key=lambda t: TACTIC_ORDER[t])
+
+            logger.info(
+                "[TACTIC-FIX] Path %r step %d: %s reassigned "
+                "%r -> %r (entry-only tactic at non-first step; "
+                "valid alternatives: %s)",
+                path_id, step_idx, tid, tactic, best, alternatives,
+            )
+            step["tactic"] = best
+            reassign_count += 1
+
+    return attack_graph, reassign_count
+
+
 def _reconcile_mitre_mappings(
     all_mitre: list[dict],
     attack_graph: dict,
@@ -404,6 +496,8 @@ def _reconcile_mitre_mappings(
     multiple times with different tactics when it serves different roles
     across attack paths.
 
+    0. Runs ``_fix_tactic_progression`` on the attack_graph to reassign
+       entry-only tactics (Initial Access, etc.) on non-first steps.
     1. Backfills ``(technique_id, tactic)`` pairs from *attack_graph* steps,
        populating ``context_paths`` with the path IDs where each pair appears.
     2. Enriches entries that have empty ``technique_name`` or ``tactic``
@@ -414,6 +508,9 @@ def _reconcile_mitre_mappings(
     Returns the (mutated) *all_mitre* list.
     """
     mitre_db = _get_mitre_db()
+
+    # --- Step 0: fix tactic progression in attack_graph ---
+    _fix_tactic_progression(attack_graph, mitre_db)
 
     # --- Index existing entries by (technique_id, tactic) ---
     existing: dict[tuple[str, str], dict] = {}
@@ -650,6 +747,24 @@ For the attack_graph:
 - Identify BRANCH POINTS — techniques that lead to multiple downstream techniques
 - If the report describes only one path, return a single path. Do not invent paths not supported by the report.
 - Use only technique IDs that appear in refined_iocs or additional_mitre_techniques
+
+CRITICAL — TACTIC ASSIGNMENT IN ATTACK PATHS:
+Each step's tactic MUST reflect the technique's ROLE AT THAT POSITION in the path, not its most common tactic. "Initial Access" should only appear at the FIRST step of a path — it means the entry point. If the same technique appears later (after access was already gained), assign the tactic that matches its role at that later stage.
+
+Many techniques have multiple valid MITRE tactics. Common multi-tactic techniques:
+- T1078 (Valid Accounts): Initial Access, Persistence, Privilege Escalation, Defense Evasion
+- T1053 (Scheduled Task/Job): Execution, Persistence, Privilege Escalation
+- T1098 (Account Manipulation): Persistence, Privilege Escalation
+
+Example — T1078 reused across two paths with DIFFERENT tactics:
+  Path "cred-spray": T1110 (Credential Access) → T1078 (tactic: "Initial Access") → T1087 (Discovery)
+    ↑ T1078 IS the initial foothold here — correct tactic is Initial Access.
+
+  Path "aitm-phishing": T1566 (Initial Access) → T1557 (Credential Access) → T1078 (tactic: "Persistence")
+    ↑ Initial access already happened at T1566. T1078 is using stolen creds to MAINTAIN access — correct tactic is Persistence.
+
+  Path "insider-escalation": T1078 (tactic: "Initial Access") → T1068 (Privilege Escalation) → T1078 (tactic: "Privilege Escalation")
+    ↑ Same technique at two different stages — different roles, different tactics.
 
 SOURCE CONTEXT: {source_context}
 

@@ -737,3 +737,161 @@ class TestSummarizeMultiRole:
         summary = tool_instance.summarize_for_llm(result)
         assert "2 MITRE techniques" in summary
         assert "unique" not in summary
+
+
+# ---------------------------------------------------------------------------
+# Test 14: Tactic progression fix
+# ---------------------------------------------------------------------------
+
+
+class TestTacticProgression:
+    """Verify _fix_tactic_progression reassigns entry-only tactics on non-first steps."""
+
+    def test_reassigns_initial_access_at_step2(self):
+        """T1078.004 at step 2 with 'Initial Access' should be reassigned."""
+        mitre_db = {
+            "T1566.004": {
+                "name": "Spearphishing Voice",
+                "tactics": ["Initial Access"],
+            },
+            "T1078.004": {
+                "name": "Cloud Accounts",
+                "tactics": [
+                    "Defense Evasion", "Persistence",
+                    "Privilege Escalation", "Initial Access",
+                ],
+            },
+        }
+        attack_graph = {
+            "paths": [
+                {
+                    "path_id": "test-path",
+                    "steps": [
+                        {"technique_id": "T1566.004", "tactic": "Initial Access",
+                         "leads_to": ["T1078.004"]},
+                        {"technique_id": "T1078.004", "tactic": "Initial Access",
+                         "leads_to": []},
+                    ],
+                },
+            ],
+        }
+        _, count = _tool_mod._fix_tactic_progression(attack_graph, mitre_db)
+        assert count == 1
+        step2 = attack_graph["paths"][0]["steps"][1]
+        assert step2["tactic"] != "Initial Access"
+        # Should pick highest ordinal non-entry tactic = Defense Evasion (7)
+        assert step2["tactic"] == "Defense Evasion"
+
+    def test_preserves_first_step_initial_access(self):
+        """Initial Access at step 0 should NOT be reassigned."""
+        mitre_db = {
+            "T1078": {
+                "name": "Valid Accounts",
+                "tactics": [
+                    "Defense Evasion", "Persistence",
+                    "Privilege Escalation", "Initial Access",
+                ],
+            },
+        }
+        attack_graph = {
+            "paths": [
+                {
+                    "path_id": "first-step",
+                    "steps": [
+                        {"technique_id": "T1078", "tactic": "Initial Access",
+                         "leads_to": []},
+                    ],
+                },
+            ],
+        }
+        _, count = _tool_mod._fix_tactic_progression(attack_graph, mitre_db)
+        assert count == 0
+        assert attack_graph["paths"][0]["steps"][0]["tactic"] == "Initial Access"
+
+    def test_leaves_non_entry_tactic_untouched(self):
+        """Persistence at step 2 should not be reassigned."""
+        mitre_db = {
+            "T1078": {
+                "name": "Valid Accounts",
+                "tactics": [
+                    "Defense Evasion", "Persistence",
+                    "Privilege Escalation", "Initial Access",
+                ],
+            },
+        }
+        attack_graph = {
+            "paths": [
+                {
+                    "path_id": "ok-path",
+                    "steps": [
+                        {"technique_id": "T1566", "tactic": "Initial Access",
+                         "leads_to": ["T1078"]},
+                        {"technique_id": "T1078", "tactic": "Persistence",
+                         "leads_to": []},
+                    ],
+                },
+            ],
+        }
+        _, count = _tool_mod._fix_tactic_progression(attack_graph, mitre_db)
+        assert count == 0
+        assert attack_graph["paths"][0]["steps"][1]["tactic"] == "Persistence"
+
+    def test_keeps_entry_tactic_when_no_alternatives(self):
+        """If all valid tactics are entry-only, keep the original."""
+        mitre_db = {
+            "T1595": {
+                "name": "Active Scanning",
+                "tactics": ["Reconnaissance"],
+            },
+        }
+        attack_graph = {
+            "paths": [
+                {
+                    "path_id": "recon-path",
+                    "steps": [
+                        {"technique_id": "T1566", "tactic": "Initial Access",
+                         "leads_to": ["T1595"]},
+                        {"technique_id": "T1595", "tactic": "Reconnaissance",
+                         "leads_to": []},
+                    ],
+                },
+            ],
+        }
+        _, count = _tool_mod._fix_tactic_progression(attack_graph, mitre_db)
+        assert count == 0
+        assert attack_graph["paths"][0]["steps"][1]["tactic"] == "Reconnaissance"
+
+    def test_end_to_end_reconcile_splits_multi_role(self):
+        """Full reconcile: T1078.004 in 2 paths, same LLM tactic, should split after fix."""
+        all_mitre = [
+            {"technique_id": "T1078.004", "tactic": "Initial Access",
+             "technique_name": "Cloud Accounts", "confidence": "inferred",
+             "report_context": "from LLM"},
+        ]
+        attack_graph = {
+            "paths": [
+                {
+                    "path_id": "path-A",
+                    "steps": [
+                        {"technique_id": "T1078.004", "tactic": "Initial Access",
+                         "leads_to": []},
+                    ],
+                },
+                {
+                    "path_id": "path-B",
+                    "steps": [
+                        {"technique_id": "T1566", "tactic": "Initial Access",
+                         "leads_to": ["T1078.004"]},
+                        {"technique_id": "T1078.004", "tactic": "Initial Access",
+                         "leads_to": []},
+                    ],
+                },
+            ],
+        }
+        result = _tool_mod._reconcile_mitre_mappings(all_mitre, attack_graph)
+        t1078_entries = [m for m in result if m["technique_id"] == "T1078.004"]
+        # Should now have 2 entries — one with Initial Access (path-A),
+        # one with the reassigned tactic (path-B)
+        tactics = {m["tactic"] for m in t1078_entries}
+        assert "Initial Access" in tactics
+        assert len(tactics) == 2  # two distinct tactics
