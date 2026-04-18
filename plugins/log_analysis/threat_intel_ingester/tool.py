@@ -386,6 +386,188 @@ def _repair_truncated_json(text: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Local MITRE ATT&CK technique lookup
+# ---------------------------------------------------------------------------
+
+_MITRE_DATA_FILE = Path(__file__).parent / "data" / "mitre_techniques.json"
+_MITRE_TECHNIQUE_DB: dict[str, dict] | None = None
+
+
+def _get_mitre_db() -> dict[str, dict]:
+    """Load the compact MITRE technique lookup (built by build_mitre_lookup.py).
+
+    Returns an empty dict (with a warning) if the data file has not been
+    generated yet.  The file is loaded at most once per process.
+    """
+    global _MITRE_TECHNIQUE_DB
+    if _MITRE_TECHNIQUE_DB is not None:
+        return _MITRE_TECHNIQUE_DB
+
+    if not _MITRE_DATA_FILE.exists():
+        logger.warning(
+            "MITRE lookup file not found at %s — "
+            "run 'python scripts/build_mitre_lookup.py' to build it. "
+            "Reconciliation will use LLM-provided data only.",
+            _MITRE_DATA_FILE,
+        )
+        _MITRE_TECHNIQUE_DB = {}
+        return _MITRE_TECHNIQUE_DB
+
+    try:
+        with open(_MITRE_DATA_FILE, "r", encoding="utf-8") as fh:
+            _MITRE_TECHNIQUE_DB = json.load(fh)
+        logger.info(
+            "Loaded MITRE technique lookup: %d techniques from %s",
+            len(_MITRE_TECHNIQUE_DB), _MITRE_DATA_FILE,
+        )
+    except Exception as exc:
+        logger.warning("Failed to load MITRE lookup: %s", exc)
+        _MITRE_TECHNIQUE_DB = {}
+
+    return _MITRE_TECHNIQUE_DB
+
+
+def _reconcile_mitre_mappings(
+    all_mitre: list[dict],
+    attack_graph: dict,
+) -> list[dict]:
+    """Reconcile and enrich mitre_mappings against local ATT&CK data.
+
+    1. Backfills technique IDs referenced in *attack_graph* steps/leads_to
+       but missing from *all_mitre*.
+    2. Enriches entries that have empty ``technique_name`` or ``tactic``
+       using the local MITRE lookup.
+    3. Logs every backfill and enrichment so gaps in LLM output are visible.
+
+    Returns the (mutated) *all_mitre* list.
+    """
+    mitre_db = _get_mitre_db()
+
+    # Index existing entries by technique_id
+    existing: dict[str, dict] = {}
+    for m in all_mitre:
+        tid = m.get("technique_id", "")
+        if tid:
+            existing[tid] = m
+
+    backfill_count = 0
+    enrich_count = 0
+
+    # --- Step 1: backfill from attack_graph ---
+    for path in attack_graph.get("paths", []):
+        path_id = path.get("path_id", "unknown")
+        for step in path.get("steps", []):
+            step_tid = step.get("technique_id", "")
+            if not step_tid:
+                continue
+
+            check_ids = [step_tid] + [
+                t for t in step.get("leads_to", []) if t
+            ]
+            for check_tid in check_ids:
+                if check_tid in existing:
+                    continue
+
+                local = mitre_db.get(check_tid, {})
+                new_entry = {
+                    "technique_id": check_tid,
+                    "technique_name": local.get("name", ""),
+                    "tactic": (
+                        local["tactics"][0] if local.get("tactics")
+                        else step.get("tactic", "")
+                        if check_tid == step_tid
+                        else ""
+                    ),
+                    "confidence": "inferred",
+                    "report_context": (
+                        f"Backfilled — referenced in "
+                        f"attack_graph path '{path_id}'"
+                    ),
+                }
+                all_mitre.append(new_entry)
+                existing[check_tid] = new_entry
+                backfill_count += 1
+                logger.info(
+                    "[RECONCILE] Backfilled technique %s (%s, tactic=%s) "
+                    "from attack_graph path '%s' | local_lookup=%s",
+                    check_tid,
+                    new_entry["technique_name"] or "(unknown)",
+                    new_entry["tactic"] or "(unknown)",
+                    path_id,
+                    "hit" if local else "miss",
+                )
+
+    # --- Step 2: enrich stubs with empty name/tactic ---
+    for entry in all_mitre:
+        tid = entry.get("technique_id", "")
+        if not tid:
+            continue
+
+        needs_name = not entry.get("technique_name")
+        needs_tactic = not entry.get("tactic")
+        if not needs_name and not needs_tactic:
+            continue
+
+        local = mitre_db.get(tid, {})
+        if not local:
+            continue
+
+        changes: list[str] = []
+        if needs_name and local.get("name"):
+            entry["technique_name"] = local["name"]
+            changes.append(f"name={local['name']!r}")
+        if needs_tactic and local.get("tactics"):
+            entry["tactic"] = local["tactics"][0]
+            changes.append(f"tactic={local['tactics'][0]!r}")
+
+        if changes:
+            enrich_count += 1
+            logger.info(
+                "[RECONCILE] Enriched %s: %s | from local MITRE lookup",
+                tid, ", ".join(changes),
+            )
+
+    # --- Step 3: validate IDs and mark non-ATT&CK entries ---
+    # Only run when we actually have a loaded DB; skip if the lookup
+    # file hasn't been built yet (all entries stay unmarked).
+    unvalidated_count = 0
+    if mitre_db:
+        for entry in all_mitre:
+            tid = entry.get("technique_id", "")
+            if not tid:
+                continue
+            if tid in mitre_db:
+                entry["mitre_validated"] = True
+            else:
+                entry["mitre_validated"] = False
+                unvalidated_count += 1
+                # Annotate the name so frontline analysts see it
+                # without needing access to tool logs.
+                name = entry.get("technique_name", "")
+                if name and "(non-ATT&CK ID)" not in name:
+                    entry["technique_name"] = f"{name} (non-ATT&CK ID)"
+                elif not name:
+                    entry["technique_name"] = "(non-ATT&CK ID)"
+                logger.warning(
+                    "[RECONCILE] Unvalidated technique %s (%s) — "
+                    "not found in ATT&CK v18.1 (DB has %d techniques). "
+                    "Keeping entry but marking as non-ATT&CK.",
+                    tid, entry["technique_name"], len(mitre_db),
+                )
+
+    if backfill_count or enrich_count or unvalidated_count:
+        logger.info(
+            "[RECONCILE] Summary: %d backfilled, %d enriched, "
+            "%d unvalidated, %d total mitre_mappings "
+            "(local DB has %d techniques)",
+            backfill_count, enrich_count, unvalidated_count,
+            len(all_mitre), len(mitre_db),
+        )
+
+    return all_mitre
+
+
+# ---------------------------------------------------------------------------
 # LLM Refinement Prompt
 # ---------------------------------------------------------------------------
 
@@ -949,7 +1131,7 @@ class ThreatIntelIngester:
                 mitre_mappings = merged.get("additional_mitre_techniques", [])
                 report_meta = merged.get("report_metadata", {})
                 attack_graph = merged.get("attack_graph", {})
-            else:
+            elif not native_pdf_succeeded:
                 logger.warning(
                     "[DIAG] All %d LLM chunks failed — "
                     "json_parse_failures=%d, llm_call_failures=%d, "
@@ -1001,12 +1183,15 @@ class ThreatIntelIngester:
                     all_mitre.append(
                         {
                             "technique_id": tech_id,
-                            "technique_name": "",  # Would be resolved from reference data
+                            "technique_name": "",  # enriched by _reconcile below
                             "tactic": "",
                             "confidence": "inferred",
                             "report_context": f"Associated with IOC {ioc['value']}",
                         }
                     )
+
+        # --- Reconcile: backfill + enrich from local ATT&CK data ---
+        all_mitre = _reconcile_mitre_mappings(all_mitre, attack_graph)
 
         # --- Build summary ---
         ioc_breakdown: dict[str, int] = {}
