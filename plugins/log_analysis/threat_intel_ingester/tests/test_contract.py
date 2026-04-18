@@ -499,3 +499,241 @@ class TestRegexExtraction:
     def test_empty_text_returns_empty(self):
         iocs = _tool_mod.extract_iocs_regex("", ["ip", "domain", "cve"])
         assert len(iocs) == 0
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Multi-role merge deduplication
+# ---------------------------------------------------------------------------
+
+
+class TestMergeMultiRole:
+    """Verify _merge_llm_chunk_results deduplicates by (technique_id, tactic)."""
+
+    def test_same_tid_different_tactics_preserved(self):
+        chunks = [
+            {
+                "refined_iocs": [],
+                "additional_mitre_techniques": [
+                    {"technique_id": "T1078", "tactic": "Initial Access",
+                     "technique_name": "Valid Accounts", "confidence": "inferred",
+                     "report_context": "cred harvesting"},
+                ],
+                "report_metadata": {},
+                "attack_graph": {"paths": []},
+            },
+            {
+                "refined_iocs": [],
+                "additional_mitre_techniques": [
+                    {"technique_id": "T1078", "tactic": "Persistence",
+                     "technique_name": "Valid Accounts", "confidence": "inferred",
+                     "report_context": "long-term access"},
+                ],
+                "report_metadata": {},
+                "attack_graph": {"paths": []},
+            },
+        ]
+        merged = _tool_mod._merge_llm_chunk_results(chunks)
+        mitre = merged["additional_mitre_techniques"]
+        assert len(mitre) == 2
+        tactics = {m["tactic"] for m in mitre}
+        assert tactics == {"Initial Access", "Persistence"}
+
+    def test_exact_duplicate_tid_tactic_deduplicated(self):
+        chunks = [
+            {
+                "refined_iocs": [],
+                "additional_mitre_techniques": [
+                    {"technique_id": "T1078", "tactic": "Initial Access",
+                     "technique_name": "Valid Accounts", "confidence": "inferred",
+                     "report_context": "first chunk"},
+                ],
+                "report_metadata": {},
+                "attack_graph": {"paths": []},
+            },
+            {
+                "refined_iocs": [],
+                "additional_mitre_techniques": [
+                    {"technique_id": "T1078", "tactic": "Initial Access",
+                     "technique_name": "Valid Accounts", "confidence": "explicit",
+                     "report_context": "second chunk duplicate"},
+                ],
+                "report_metadata": {},
+                "attack_graph": {"paths": []},
+            },
+        ]
+        merged = _tool_mod._merge_llm_chunk_results(chunks)
+        mitre = merged["additional_mitre_techniques"]
+        assert len(mitre) == 1
+
+
+# ---------------------------------------------------------------------------
+# Test 12: Multi-role reconcile with context_paths
+# ---------------------------------------------------------------------------
+
+
+class TestReconcileMultiRole:
+    """Verify _reconcile_mitre_mappings handles (tid, tactic) identity."""
+
+    def test_context_paths_populated_from_graph(self):
+        all_mitre = [
+            {"technique_id": "T1078", "tactic": "Initial Access",
+             "technique_name": "Valid Accounts", "confidence": "inferred",
+             "report_context": "from LLM"},
+        ]
+        attack_graph = {
+            "paths": [
+                {
+                    "path_id": "path-A",
+                    "steps": [
+                        {"technique_id": "T1078", "tactic": "Initial Access",
+                         "leads_to": []},
+                    ],
+                },
+            ],
+        }
+        result = _tool_mod._reconcile_mitre_mappings(all_mitre, attack_graph)
+        entry = result[0]
+        assert "context_paths" in entry
+        assert "path-A" in entry["context_paths"]
+
+    def test_new_tactic_role_backfilled_from_graph(self):
+        all_mitre = [
+            {"technique_id": "T1078", "tactic": "Initial Access",
+             "technique_name": "Valid Accounts", "confidence": "inferred",
+             "report_context": "from LLM"},
+        ]
+        attack_graph = {
+            "paths": [
+                {
+                    "path_id": "path-A",
+                    "steps": [
+                        {"technique_id": "T1078", "tactic": "Initial Access",
+                         "leads_to": []},
+                    ],
+                },
+                {
+                    "path_id": "path-B",
+                    "steps": [
+                        {"technique_id": "T1078", "tactic": "Persistence",
+                         "leads_to": []},
+                    ],
+                },
+            ],
+        }
+        result = _tool_mod._reconcile_mitre_mappings(all_mitre, attack_graph)
+        tactics = {m["tactic"] for m in result if m["technique_id"] == "T1078"}
+        assert "Initial Access" in tactics
+        assert "Persistence" in tactics
+        assert len(result) == 2
+
+    def test_empty_tactic_promoted_from_graph(self):
+        all_mitre = [
+            {"technique_id": "T1059", "tactic": "",
+             "technique_name": "", "confidence": "inferred",
+             "report_context": "from IOC"},
+        ]
+        attack_graph = {
+            "paths": [
+                {
+                    "path_id": "path-X",
+                    "steps": [
+                        {"technique_id": "T1059", "tactic": "Execution",
+                         "leads_to": []},
+                    ],
+                },
+            ],
+        }
+        result = _tool_mod._reconcile_mitre_mappings(all_mitre, attack_graph)
+        assert len(result) == 1
+        assert result[0]["tactic"] == "Execution"
+
+    def test_leads_to_orphan_backfilled(self):
+        all_mitre = []
+        attack_graph = {
+            "paths": [
+                {
+                    "path_id": "path-1",
+                    "steps": [
+                        {"technique_id": "T1566", "tactic": "Initial Access",
+                         "leads_to": ["T9999"]},
+                    ],
+                },
+            ],
+        }
+        result = _tool_mod._reconcile_mitre_mappings(all_mitre, attack_graph)
+        tids = {m["technique_id"] for m in result}
+        assert "T1566" in tids
+        assert "T9999" in tids
+
+
+# ---------------------------------------------------------------------------
+# Test 13: summarize_for_llm with multi-role counts
+# ---------------------------------------------------------------------------
+
+
+class TestSummarizeMultiRole:
+    """Verify summarize_for_llm shows unique vs total when they differ."""
+
+    def test_multi_role_summary_shows_both_counts(self, tool_instance):
+        result = MockToolResult(
+            ok=True,
+            result={
+                "report_metadata": {
+                    "title": "Test Report",
+                    "page_count": 5,
+                    "artifact_type": "pdf_report",
+                },
+                "iocs": [
+                    {"ioc_type": "ip", "value": "1.2.3.4", "confidence": "high"},
+                ],
+                "mitre_mappings": [
+                    {"technique_id": "T1078", "tactic": "Initial Access",
+                     "technique_name": "Valid Accounts"},
+                    {"technique_id": "T1078", "tactic": "Persistence",
+                     "technique_name": "Valid Accounts"},
+                    {"technique_id": "T1566", "tactic": "Initial Access",
+                     "technique_name": "Phishing"},
+                ],
+                "summary": {
+                    "total_iocs": 1,
+                    "ioc_breakdown": {"ip": 1},
+                    "high_priority_count": 0,
+                    "mitre_technique_count": 3,
+                    "unique_technique_count": 2,
+                    "confidence_distribution": {"low": 0, "medium": 0, "high": 1},
+                },
+            },
+        )
+        summary = tool_instance.summarize_for_llm(result)
+        assert "2 unique techniques" in summary
+        assert "3 tactical roles" in summary
+
+    def test_single_role_summary_shows_standard_format(self, tool_instance):
+        result = MockToolResult(
+            ok=True,
+            result={
+                "report_metadata": {
+                    "title": "Test Report",
+                    "page_count": 3,
+                    "artifact_type": "pdf_report",
+                },
+                "iocs": [],
+                "mitre_mappings": [
+                    {"technique_id": "T1078", "tactic": "Initial Access",
+                     "technique_name": "Valid Accounts"},
+                    {"technique_id": "T1566", "tactic": "Initial Access",
+                     "technique_name": "Phishing"},
+                ],
+                "summary": {
+                    "total_iocs": 0,
+                    "ioc_breakdown": {},
+                    "high_priority_count": 0,
+                    "mitre_technique_count": 2,
+                    "unique_technique_count": 2,
+                    "confidence_distribution": {"low": 0, "medium": 0, "high": 0},
+                },
+            },
+        )
+        summary = tool_instance.summarize_for_llm(result)
+        assert "2 MITRE techniques" in summary
+        assert "unique" not in summary

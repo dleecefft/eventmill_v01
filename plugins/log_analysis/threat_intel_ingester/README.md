@@ -32,6 +32,17 @@ For **PDF reports**, the plugin now supports **native PDF ingestion via the Gemi
    - **Backfill** technique IDs referenced in attack graphs but missing from mappings
    - **Validate** every technique ID and mark non-ATT&CK IDs with `(non-ATT&CK ID)`
      and `"mitre_validated": false` so analysts know when an ID was LLM-generated
+   - **Validate tactics** against each technique's allowed tactics, logging
+     warnings for mismatches that may indicate LLM hallucinations
+
+   ### Multi-Role Tactic Mappings
+
+   The `mitre_mappings` array uses `(technique_id, tactic)` as the identity key.
+   When the same technique serves different roles in different attack paths
+   (e.g., T1078 as "Initial Access" in one path and "Persistence" in another),
+   it appears as multiple entries with a `context_paths` field listing the
+   attack-graph path IDs where each role was observed. Techniques with a
+   single role produce a single entry as before — the change is purely additive.
 
    Re-run the script after a new ATT&CK version is released to pick up new
    techniques. The plugin works without the file but skips enrichment and
@@ -160,7 +171,7 @@ If the LLM connection is unavailable, the plugin falls back to regex-only extrac
 ## Example summarize_for_llm() Output
 
 ```
-Ingested pdf_report (12 pages): APT29 Campaign Analysis. Attributed to APT29 (high confidence), campaign: SolarWinds Follow-on. Extracted 47 IOCs: 23 ips, 12 domains, 8 hash_sha256s, 4 cves. 3 IOCs flagged as high-priority. Mapped to 6 MITRE techniques: T1566.001 (Spearphishing Attachment), T1059.001 (PowerShell), T1053.005 (Scheduled Task), T1071.001 (Web Protocols), T1486 (Data Encrypted for Impact), T1048.003 (Exfiltration Over Unencrypted Protocol). Attack graph: 2 path(s) identified, converging at T1059.001. Output artifact: art_0002 (json_events).
+Ingested pdf_report (12 pages): APT29 Campaign Analysis. Attributed to APT29 (high confidence), campaign: SolarWinds Follow-on. Extracted 47 IOCs: 23 ips, 12 domains, 8 hash_sha256s, 4 cves. 3 IOCs flagged as high-priority. Mapped to 5 unique techniques across 7 tactical roles: T1566.001 (Spearphishing Attachment), T1059.001 (PowerShell), T1078 (Initial Access, Persistence), T1486 (Data Encrypted for Impact), T1048.003 (Exfiltration Over Unencrypted Protocol). Attack graph: 2 path(s) identified, converging at T1059.001. Output artifact: art_0002 (json_events).
 ```
 
 ## Limitations

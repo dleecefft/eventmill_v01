@@ -306,18 +306,134 @@ output with 16 CVE IOCs, 21 MITRE mappings (all `mitre_validated: true`), and
 
 ---
 
+## Session 2 — Multi-Role Tactic Mapping Refactor
+
+**Date:** 2026-04-18 (continued)
+**Primary Files Modified:** `plugins/log_analysis/threat_intel_ingester/tool.py`, `plugins/threat_modeling/attack_path_visualizer/tool.py`
+**Supporting Files:** `plugins/log_analysis/threat_intel_ingester/schemas/output.schema.json`, `plugins/log_analysis/threat_intel_ingester/README.md`, `plugins/log_analysis/threat_intel_ingester/examples/response.example.json`, both plugin `tests/test_contract.py` files
+
+### Problem
+
+The `mitre_mappings` array used `technique_id` as an implicit identity key —
+each technique could appear at most once. When an LLM reported the same
+technique serving different tactical roles in different attack paths (e.g.,
+T1078 "Valid Accounts" as both "Initial Access" and "Persistence"), the
+reconciler flattened to `tactics[0]` and discarded the per-path context.
+The visualizer then rendered a single node, losing the multi-role insight.
+
+### Changes
+
+#### A. `_merge_llm_chunk_results()` — Dedup Key Change
+
+- Changed dedup key from `technique_id` alone to `(technique_id, tactic)`.
+- Two chunks can now each contribute a T1078 entry with different tactics and
+  both survive the merge.
+
+#### B. `_reconcile_mitre_mappings()` — Full Rewrite
+
+Identity key changed to `(technique_id, tactic)`. Three-step process updated:
+
+1. **Backfill** — Scans all `(tid, tactic)` pairs from attack graph steps.
+   Existing exact matches get `context_paths` populated. Empty-tactic entries
+   are promoted when a graph step provides the tactic. New `(tid, tactic)`
+   pairs are created as backfill entries.
+2. **Enrich** — Same as before, but logs a warning when a technique has
+   multiple valid tactics and no graph context to disambiguate.
+3. **Validate** — Now also checks the assigned tactic against the technique's
+   allowed tactics list, logging warnings for mismatches that may indicate
+   LLM hallucinations. Summary line includes tactic mismatch count.
+
+New fields on mapping entries:
+- `context_paths: list[str]` — attack graph path IDs where this `(tid, tactic)`
+  pair appears.
+
+#### C. LLM Prompt Update (Section 4)
+
+- Added explicit instruction that the same technique ID can appear multiple
+  times in `additional_mitre_techniques` with different tactics when it serves
+  different roles — "This is expected, not a duplication error."
+- Updated JSON response format example with T1078 appearing twice (Initial
+  Access + Persistence) to demonstrate the expected pattern.
+
+#### D. `execute()` Summary — `unique_technique_count`
+
+- Added `unique_technique_count` (count of distinct `technique_id` values)
+  alongside the existing `mitre_technique_count` (total role entries).
+
+#### E. `summarize_for_llm()` — Multi-Role Display
+
+- When `unique_technique_count != mitre_technique_count`, the summary reads:
+  `"Mapped to 5 unique techniques across 7 tactical roles: T1078 (Initial Access, Persistence), ..."`
+- When counts match, the standard format is preserved:
+  `"Mapped to 5 MITRE techniques: T1078 (Valid Accounts), ..."`
+
+#### F. `attack_path_visualizer/tool.py` — Composite Node Keys
+
+- New helper `_node_key(tid, tactic) -> str` produces composite keys like
+  `T1078|initial-access` so the same technique with different tactics becomes
+  distinct DAG nodes.
+- `_build_dag_from_attack_graph()` rewritten to:
+  - Build metadata lookup keyed by `(technique_id, tactic)` with fallback by
+    `technique_id` alone.
+  - Build per-path step mapping for `leads_to` edge resolution.
+  - Create nodes keyed by composite `tid|tactic-slug`.
+  - Resolve `leads_to` targets within per-path context to connect to the
+    correct tactic-specific node.
+- `_render_mermaid_dag()` updated:
+  - Node labels use `node.technique_id` instead of composite key.
+  - Convergence/branch matching uses `node.technique_id` (plain IDs from LLM);
+    entry/exit matching uses composite keys (computed by builder).
+  - Convergence legend searches by `node.technique_id`.
+- `_render_ascii_dag()` updated with same fixes.
+
+#### G. Em-Dash Encoding Fix
+
+- Replaced Unicode em-dash (`\u2014`) with ASCII ` - ` in Mermaid labels,
+  ASCII header, and path legend lines. Prevents mojibake (`â€"`) when output
+  is decoded as CP1252 on Windows terminals.
+
+#### H. Schema & Documentation
+
+- `output.schema.json`:
+  - `mitre_mappings` description updated to document `(technique_id, tactic)` identity key.
+  - Added `context_paths` property definition.
+  - Added `unique_technique_count` to summary properties.
+- `README.md`:
+  - Added "Multi-Role Tactic Mappings" subsection under Prerequisites.
+  - Added tactic validation bullet point.
+  - Updated `summarize_for_llm()` example output.
+- `response.example.json`:
+  - Added `context_paths` to two entries.
+  - Added `unique_technique_count` to summary.
+
+#### I. New Contract Tests
+
+**threat_intel_ingester** (9 new tests):
+- `TestMergeMultiRole` — same tid with different tactics preserved; exact
+  duplicates deduplicated.
+- `TestReconcileMultiRole` — context_paths populated; new tactic backfilled;
+  empty tactic promoted; leads_to orphan backfilled.
+- `TestSummarizeMultiRole` — multi-role shows both counts; single-role shows
+  standard format.
+
+**attack_path_visualizer** (6 new tests):
+- `TestMultiRoleDAG` — distinct nodes for same technique; total node count;
+  both tactic labels in Mermaid output; both in ASCII; convergence styling
+  by technique_id; `_node_key` helper correctness.
+
+---
+
 ## Test Results
 
-285 tests passing, 0 failures, 0 modifications to existing tests.
+299 tests passing (232 plugin + 67 framework), 0 failures.
 
 ---
 
 ## What's Next
 
-- Other plugins (`attack_path_visualizer`, `risk_assessment_analyzer`,
-  `threat_model_analyzer`) can now import `get_mitre_db()` or use
-  `context.reference_data.get("mitre_techniques")` for technique validation.
-- Consider adding `mitre_validated` filtering to the attack path visualizer
-  to flag non-ATT&CK nodes in rendered graphs.
+- Monitor production runs for tactic mismatch warnings to gauge LLM
+  hallucination rate on tactic assignment.
+- Consider adding `context_paths` filtering to `attack_path_visualizer`
+  to render per-path subgraphs on demand.
 - Monitor GCP activity logs for future JSON parse failures now that they're
   visible in the activity log stream.

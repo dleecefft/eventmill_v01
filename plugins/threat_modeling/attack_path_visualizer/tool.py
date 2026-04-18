@@ -133,7 +133,7 @@ class DAGNode:
     technique_id: str
     technique_name: str
     tactic: str
-    leads_to: list[str]       # technique_ids of downstream nodes
+    leads_to: list[str]       # composite keys of downstream nodes
     controls: list[dict]
     gaps_detected: list[str]
     path_ids: list[str]       # which paths this node appears in
@@ -142,12 +142,22 @@ class DAGNode:
 @dataclass
 class AttackDAG:
     """Directed acyclic graph of attack paths."""
-    nodes: dict[str, DAGNode]  # keyed by technique_id
+    nodes: dict[str, DAGNode]  # keyed by composite "tid|tactic-slug"
     paths: list[dict]           # original path metadata
     convergence_points: list[str]
     branch_points: list[str]
     entry_points: list[str]    # nodes with no incoming edges
     exit_points: list[str]     # nodes with no outgoing edges
+
+
+def _node_key(tid: str, tactic: str) -> str:
+    """Build a composite node key from technique ID and tactic.
+
+    Nodes for the same technique with different tactics become distinct
+    nodes in the DAG, preserving multi-role visibility.
+    """
+    slug = tactic.lower().replace(" ", "-") if tactic else "unknown"
+    return f"{tid}|{slug}"
 
 
 def _build_dag_from_attack_graph(
@@ -156,6 +166,11 @@ def _build_dag_from_attack_graph(
 ) -> "AttackDAG | None":
     """Build a DAG from the LLM-produced attack_graph structure.
 
+    Nodes are keyed by ``(technique_id, tactic)`` so the same technique
+    serving different tactical roles in different paths renders as
+    separate nodes.  Edges are resolved within per-path context so that
+    ``leads_to`` targets point to the correct tactic-specific node.
+
     Returns None if the attack_graph is empty or has no paths,
     signaling the caller to fall back to the legacy linear builder.
     """
@@ -163,55 +178,105 @@ def _build_dag_from_attack_graph(
     if not paths:
         return None
 
-    # Build a lookup for technique metadata from mitre_mappings
-    technique_info: dict[str, dict] = {}
+    # Build a lookup for technique metadata from mitre_mappings,
+    # keyed by (technique_id, tactic) with fallback by technique_id alone.
+    info_by_pair: dict[tuple[str, str], dict] = {}
+    info_by_tid: dict[str, dict] = {}
     for m in mitre_mappings:
         tid = m.get("technique_id", "")
+        tactic = m.get("tactic", "")
         if tid:
-            technique_info[tid] = {
+            info_by_pair[(tid, tactic)] = {
                 "technique_name": m.get("technique_name", ""),
-                "tactic": m.get("tactic", ""),
+                "tactic": tactic,
             }
+            if tid not in info_by_tid:
+                info_by_tid[tid] = {
+                    "technique_name": m.get("technique_name", ""),
+                    "tactic": tactic,
+                }
 
-    # Collect all nodes and edges from all paths
+    # First pass: build per-path step mapping (technique_id -> tactic)
+    path_step_map: dict[str, dict[str, str]] = {}
+    for path in paths:
+        pid = path.get("path_id", "unknown")
+        path_step_map[pid] = {}
+        for step in path.get("steps", []):
+            tid = step.get("technique_id", "")
+            tactic = step.get("tactic", "")
+            if tid:
+                path_step_map[pid][tid] = tactic
+
+    def _resolve_target_key(target_tid: str, source_path_id: str) -> str:
+        """Resolve a leads_to target to its composite node key.
+
+        Look up the target's tactic within the same path first, then
+        fall back to other paths, then to metadata lookup.
+        """
+        tactic = path_step_map.get(source_path_id, {}).get(target_tid, "")
+        if not tactic:
+            for pid, pmap in path_step_map.items():
+                if target_tid in pmap:
+                    tactic = pmap[target_tid]
+                    break
+        if not tactic:
+            info = info_by_tid.get(target_tid, {})
+            tactic = info.get("tactic", "")
+        return _node_key(target_tid, tactic)
+
+    # Second pass: create nodes and edges
     nodes: dict[str, DAGNode] = {}
-    all_targets: set[str] = set()  # technique_ids that are pointed TO
+    all_target_keys: set[str] = set()
 
     for path in paths:
         path_id = path.get("path_id", "unknown")
         for step in path.get("steps", []):
             tid = step.get("technique_id", "")
+            step_tactic = step.get("tactic", "")
             if not tid:
                 continue
-            leads_to = step.get("leads_to", [])
-            all_targets.update(leads_to)
 
-            if tid not in nodes:
-                info = technique_info.get(tid, {})
-                nodes[tid] = DAGNode(
+            nk = _node_key(tid, step_tactic)
+
+            if nk not in nodes:
+                info = info_by_pair.get(
+                    (tid, step_tactic),
+                    info_by_tid.get(tid, {}),
+                )
+                nodes[nk] = DAGNode(
                     technique_id=tid,
-                    technique_name=info.get("technique_name", "")
-                        or step.get("technique_name", ""),
-                    tactic=info.get("tactic", "")
-                        or step.get("tactic", ""),
+                    technique_name=(
+                        info.get("technique_name", "")
+                        or step.get("technique_name", "")
+                    ),
+                    tactic=step_tactic or info.get("tactic", ""),
                     leads_to=[],
                     controls=[],
                     gaps_detected=[],
                     path_ids=[],
                 )
-            # Merge leads_to (deduplicate)
-            for target in leads_to:
-                if target not in nodes[tid].leads_to:
-                    nodes[tid].leads_to.append(target)
-            if path_id not in nodes[tid].path_ids:
-                nodes[tid].path_ids.append(path_id)
+
+            # Resolve leads_to to composite keys within path context
+            for target_tid in step.get("leads_to", []):
+                if not target_tid:
+                    continue
+                target_nk = _resolve_target_key(target_tid, path_id)
+                all_target_keys.add(target_nk)
+                if target_nk not in nodes[nk].leads_to:
+                    nodes[nk].leads_to.append(target_nk)
+
+            if path_id not in nodes[nk].path_ids:
+                nodes[nk].path_ids.append(path_id)
 
     # Ensure target nodes exist even if they weren't listed as steps
-    for target_id in all_targets:
-        if target_id not in nodes:
-            info = technique_info.get(target_id, {})
-            nodes[target_id] = DAGNode(
-                technique_id=target_id,
+    for target_key in all_target_keys:
+        if target_key not in nodes:
+            # Parse tid from composite key (tid|tactic-slug)
+            parts = target_key.split("|", 1)
+            tid = parts[0]
+            info = info_by_tid.get(tid, {})
+            nodes[target_key] = DAGNode(
+                technique_id=tid,
                 technique_name=info.get("technique_name", ""),
                 tactic=info.get("tactic", ""),
                 leads_to=[],
@@ -223,9 +288,9 @@ def _build_dag_from_attack_graph(
     if not nodes:
         return None
 
-    # Identify entry and exit points
-    entry_points = [tid for tid in nodes if tid not in all_targets]
-    exit_points = [tid for tid in nodes if not nodes[tid].leads_to]
+    # Identify entry and exit points (using composite keys)
+    entry_points = [nk for nk in nodes if nk not in all_target_keys]
+    exit_points = [nk for nk in nodes if not nodes[nk].leads_to]
 
     return AttackDAG(
         nodes=nodes,
@@ -528,40 +593,42 @@ def _render_mermaid_dag(dag: AttackDAG, attack_type: str) -> str:
 
     # Assign short node IDs and render node labels
     id_map: dict[str, str] = {}
-    for i, (tid, node) in enumerate(dag.nodes.items()):
+    for i, (nk, node) in enumerate(dag.nodes.items()):
         nid = f"N{i}"
-        id_map[tid] = nid
-        name = node.tactic or tid
-        label = f"{name}<br/><small>{tid}"
+        id_map[nk] = nid
+        name = node.tactic or node.technique_id
+        label = f"{name}<br/><small>{node.technique_id}"
         if node.technique_name:
-            label += f" \u2014 {node.technique_name[:30]}"
+            label += f" - {node.technique_name[:30]}"
         label += "</small>"
         lines.append(f'    {nid}(["{label}"])')
 
     # Render edges
-    for tid, node in dag.nodes.items():
-        src = id_map[tid]
-        for target_tid in node.leads_to:
-            if target_tid in id_map:
-                dst = id_map[target_tid]
+    for nk, node in dag.nodes.items():
+        src = id_map[nk]
+        for target_nk in node.leads_to:
+            if target_nk in id_map:
+                dst = id_map[target_nk]
                 lines.append(f"    {src} --> {dst}")
 
     lines.append("    end")
     lines.append("")
 
     # Style nodes by role
+    # convergence/branch are plain technique_ids from the LLM;
+    # entry/exit are composite keys computed by the builder.
     convergence_set = set(dag.convergence_points)
     branch_set = set(dag.branch_points)
     entry_set = set(dag.entry_points)
     exit_set = set(dag.exit_points)
 
-    for tid, node in dag.nodes.items():
-        nid = id_map[tid]
-        if tid in convergence_set:
+    for nk, node in dag.nodes.items():
+        nid = id_map[nk]
+        if node.technique_id in convergence_set:
             lines.append(f"    style {nid} fill:#ffe0b2,stroke:#e65100")
-        elif tid in entry_set:
+        elif nk in entry_set:
             lines.append(f"    style {nid} fill:#bbdefb,stroke:#1565c0")
-        elif tid in exit_set:
+        elif nk in exit_set:
             lines.append(f"    style {nid} fill:#ffcdd2,stroke:#b71c1c")
         elif node.controls:
             lines.append(f"    style {nid} fill:#ccffcc,stroke:#00cc00")
@@ -580,11 +647,12 @@ def _render_mermaid_dag(dag: AttackDAG, attack_type: str) -> str:
 
     if dag.convergence_points:
         lines.append("")
-        conv_labels = [
-            f"{tid} ({dag.nodes[tid].tactic})"
-            for tid in dag.convergence_points
-            if tid in dag.nodes
-        ]
+        conv_labels = []
+        for ctid in dag.convergence_points:
+            for nk, node in dag.nodes.items():
+                if node.technique_id == ctid:
+                    conv_labels.append(f"{ctid} ({node.tactic})")
+                    break
         lines.append(f"**Convergence:** {', '.join(conv_labels)}")
 
     return "\n".join(lines)
@@ -635,6 +703,8 @@ def _render_ascii_dag(dag: AttackDAG, attack_type: str) -> str:
     """
     box_width = 100
     lines: list[str] = []
+    # convergence/branch are plain technique_ids from the LLM;
+    # entry/exit are composite keys computed by the builder.
     convergence_set = set(dag.convergence_points)
     branch_set = set(dag.branch_points)
     entry_set = set(dag.entry_points)
@@ -644,7 +714,7 @@ def _render_ascii_dag(dag: AttackDAG, attack_type: str) -> str:
     header_w = box_width + 4
     lines.append("")
     lines.append("+" + "=" * header_w + "+")
-    lines.append("|" + f" ATTACK GRAPH \u2014 {attack_type.upper()} ".center(header_w) + "|")
+    lines.append("|" + f" ATTACK GRAPH - {attack_type.upper()} ".center(header_w) + "|")
     lines.append("|" + f" {len(dag.paths)} path(s), {len(dag.nodes)} techniques ".center(header_w) + "|")
     lines.append("+" + "=" * header_w + "+")
     lines.append("")
@@ -653,7 +723,7 @@ def _render_ascii_dag(dag: AttackDAG, attack_type: str) -> str:
     for p in dag.paths:
         pid = p.get("path_id", "?")
         desc = p.get("description", "")
-        lines.append(f"  Path: {pid}" + (f" \u2014 {desc}" if desc else ""))
+        lines.append(f"  Path: {pid}" + (f" - {desc}" if desc else ""))
     lines.append("")
 
     # --- Topological layers ---
@@ -662,10 +732,16 @@ def _render_ascii_dag(dag: AttackDAG, attack_type: str) -> str:
     for layer_idx, layer_tids in enumerate(layers):
         # Determine layer annotation
         layer_nodes = [dag.nodes[tid] for tid in layer_tids]
-        is_convergence = any(tid in convergence_set for tid in layer_tids)
-        is_branch = any(tid in branch_set for tid in layer_tids)
-        is_entry = all(tid in entry_set for tid in layer_tids)
-        is_exit = all(tid in exit_set for tid in layer_tids)
+        is_convergence = any(
+            dag.nodes[nk].technique_id in convergence_set
+            for nk in layer_tids
+        )
+        is_branch = any(
+            dag.nodes[nk].technique_id in branch_set
+            for nk in layer_tids
+        )
+        is_entry = all(nk in entry_set for nk in layer_tids)
+        is_exit = all(nk in exit_set for nk in layer_tids)
 
         if len(layer_tids) > 1:
             # Multiple nodes on this layer — show them side-by-side
@@ -732,21 +808,25 @@ def _render_ascii_dag(dag: AttackDAG, attack_type: str) -> str:
 
         if len(layer_tids) == 1:
             # --- Single node layer ---
-            tid = layer_tids[0]
-            node = dag.nodes[tid]
+            nk = layer_tids[0]
+            node = dag.nodes[nk]
             tactic = node.tactic or "?"
             name = node.technique_name or ""
             path_labels = ", ".join(node.path_ids) if node.path_ids else ""
 
             lines.append("  +" + "-" * box_width + "+")
-            header = f" [{tid}] {tactic}: {name}"
+            header = f" [{node.technique_id}] {tactic}: {name}"
             if annotation:
                 header += annotation
             lines.append("  |" + header.ljust(box_width) + "|")
             if path_labels:
                 lines.append("  |" + f"    Paths: {path_labels}".ljust(box_width) + "|")
             if node.leads_to:
-                targets = ", ".join(node.leads_to)
+                target_tids = [
+                    dag.nodes[t].technique_id
+                    for t in node.leads_to if t in dag.nodes
+                ]
+                targets = ", ".join(target_tids)
                 lines.append("  |" + f"    \u2514\u2500\u2500\u25b6 {targets}".ljust(box_width) + "|")
             for ctrl in node.controls[:3]:
                 cn = ctrl.get("control_name", "?")
@@ -760,16 +840,20 @@ def _render_ascii_dag(dag: AttackDAG, attack_type: str) -> str:
             # --- Multiple nodes side-by-side ---
             # Build column content for each node
             columns: list[list[str]] = []
-            for tid in layer_tids:
-                node = dag.nodes[tid]
+            for nk in layer_tids:
+                node = dag.nodes[nk]
                 tactic = node.tactic or "?"
                 name = node.technique_name or ""
                 col: list[str] = []
-                col.append(f"[{tid}] {tactic}")
+                col.append(f"[{node.technique_id}] {tactic}")
                 if name:
                     col.append(f"  {name[:node_width - 4]}")
                 if node.leads_to:
-                    col.append(f"  \u2514\u25b6 {', '.join(node.leads_to)}")
+                    target_tids = [
+                        dag.nodes[t].technique_id
+                        for t in node.leads_to if t in dag.nodes
+                    ]
+                    col.append(f"  \u2514\u25b6 {', '.join(target_tids)}")
                 for ctrl in node.controls[:2]:
                     cn = ctrl.get("control_name", "?")
                     eff = ctrl.get("effectiveness_rating", "?")
@@ -807,8 +891,8 @@ def _render_ascii_dag(dag: AttackDAG, attack_type: str) -> str:
     # --- Unprotected stages warning ---
     lines.append("")
     unprotected = [
-        tid for tid, n in dag.nodes.items()
-        if not n.controls and tid not in exit_set
+        n.technique_id for nk, n in dag.nodes.items()
+        if not n.controls and nk not in exit_set
     ]
     if unprotected:
         lines.append(f"  \u26a0 Unprotected stages: {', '.join(unprotected)}")

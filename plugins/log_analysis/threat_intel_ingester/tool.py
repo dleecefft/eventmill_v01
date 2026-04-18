@@ -248,14 +248,14 @@ def _chunk_text(text: str, max_chars: int = _MAX_TEXT_CHARS_PER_CHUNK) -> list[s
 def _merge_llm_chunk_results(chunk_results: list[dict]) -> dict:
     """Merge LLM JSON results from multiple document chunks.
 
-    IOCs and MITRE techniques are deduplicated by value/technique_id.
+    IOCs are deduplicated by (type, value); MITRE techniques by (technique_id, tactic).
     report_metadata comes from the first successful chunk.
     attack_graph paths are unioned and deduplicated by path_id.
     """
     merged_iocs: list[dict] = []
     merged_mitre: list[dict] = []
     seen_ioc_keys: set[str] = set()
-    seen_tids: set[str] = set()
+    seen_mitre_keys: set[tuple[str, str]] = set()
     report_meta: dict = {}
     ag_paths: list[dict] = []
     ag_convergence: set[str] = set()
@@ -270,8 +270,10 @@ def _merge_llm_chunk_results(chunk_results: list[dict]) -> dict:
 
         for m in result.get("additional_mitre_techniques", []):
             tid = m.get("technique_id", "")
-            if tid and tid not in seen_tids:
-                seen_tids.add(tid)
+            tactic = m.get("tactic", "")
+            mkey = (tid, tactic)
+            if tid and mkey not in seen_mitre_keys:
+                seen_mitre_keys.add(mkey)
                 merged_mitre.append(m)
 
         if not report_meta:
@@ -398,69 +400,133 @@ def _reconcile_mitre_mappings(
 ) -> list[dict]:
     """Reconcile and enrich mitre_mappings against local ATT&CK data.
 
-    1. Backfills technique IDs referenced in *attack_graph* steps/leads_to
-       but missing from *all_mitre*.
+    Identity key is ``(technique_id, tactic)`` — one technique can appear
+    multiple times with different tactics when it serves different roles
+    across attack paths.
+
+    1. Backfills ``(technique_id, tactic)`` pairs from *attack_graph* steps,
+       populating ``context_paths`` with the path IDs where each pair appears.
     2. Enriches entries that have empty ``technique_name`` or ``tactic``
        using the local MITRE lookup.
-    3. Logs every backfill and enrichment so gaps in LLM output are visible.
+    3. Validates technique IDs, marks non-ATT&CK entries, and flags tactic
+       mismatches.
 
     Returns the (mutated) *all_mitre* list.
     """
     mitre_db = _get_mitre_db()
 
-    # Index existing entries by technique_id
-    existing: dict[str, dict] = {}
+    # --- Index existing entries by (technique_id, tactic) ---
+    existing: dict[tuple[str, str], dict] = {}
     for m in all_mitre:
         tid = m.get("technique_id", "")
+        tactic = m.get("tactic", "")
         if tid:
-            existing[tid] = m
+            existing[(tid, tactic)] = m
 
     backfill_count = 0
     enrich_count = 0
 
-    # --- Step 1: backfill from attack_graph ---
+    # --- Step 1: backfill from attack_graph with per-step tactic ---
+    # Collect all (tid, tactic) -> [path_ids] from graph steps
+    graph_keys: dict[tuple[str, str], list[str]] = {}
+    all_leads_to: set[str] = set()
+    step_tids: set[str] = set()
+
     for path in attack_graph.get("paths", []):
         path_id = path.get("path_id", "unknown")
         for step in path.get("steps", []):
-            step_tid = step.get("technique_id", "")
-            if not step_tid:
+            tid = step.get("technique_id", "")
+            tactic = step.get("tactic", "")
+            if not tid:
                 continue
+            step_tids.add(tid)
+            key = (tid, tactic)
+            graph_keys.setdefault(key, [])
+            if path_id not in graph_keys[key]:
+                graph_keys[key].append(path_id)
+            all_leads_to.update(t for t in step.get("leads_to", []) if t)
 
-            check_ids = [step_tid] + [
-                t for t in step.get("leads_to", []) if t
-            ]
-            for check_tid in check_ids:
-                if check_tid in existing:
-                    continue
+    for key, path_ids in graph_keys.items():
+        tid, tactic = key
+        if key in existing:
+            # Exact (tid, tactic) match — just add context_paths
+            entry = existing[key]
+            paths_list = entry.setdefault("context_paths", [])
+            for pid in path_ids:
+                if pid not in paths_list:
+                    paths_list.append(pid)
+            continue
 
-                local = mitre_db.get(check_tid, {})
-                new_entry = {
-                    "technique_id": check_tid,
-                    "technique_name": local.get("name", ""),
-                    "tactic": (
-                        local["tactics"][0] if local.get("tactics")
-                        else step.get("tactic", "")
-                        if check_tid == step_tid
-                        else ""
-                    ),
-                    "confidence": "inferred",
-                    "report_context": (
-                        f"Backfilled — referenced in "
-                        f"attack_graph path '{path_id}'"
-                    ),
-                }
-                all_mitre.append(new_entry)
-                existing[check_tid] = new_entry
-                backfill_count += 1
-                logger.info(
-                    "[RECONCILE] Backfilled technique %s (%s, tactic=%s) "
-                    "from attack_graph path '%s' | local_lookup=%s",
-                    check_tid,
-                    new_entry["technique_name"] or "(unknown)",
-                    new_entry["tactic"] or "(unknown)",
-                    path_id,
-                    "hit" if local else "miss",
-                )
+        # Check for existing entry with same tid but empty tactic
+        # (from IOC-derived or LLM additional_mitre with empty tactic)
+        empty_key = (tid, "")
+        if empty_key in existing:
+            entry = existing.pop(empty_key)
+            entry["tactic"] = tactic
+            paths_list = entry.setdefault("context_paths", [])
+            for pid in path_ids:
+                if pid not in paths_list:
+                    paths_list.append(pid)
+            existing[key] = entry
+            enrich_count += 1
+            logger.info(
+                "[RECONCILE] Promoted %s: set tactic=%r from "
+                "attack_graph path(s) %s",
+                tid, tactic, ", ".join(path_ids),
+            )
+            continue
+
+        # New (tid, tactic) pair — create entry
+        local = mitre_db.get(tid, {})
+        new_entry = {
+            "technique_id": tid,
+            "technique_name": local.get("name", ""),
+            "tactic": tactic,
+            "context_paths": list(path_ids),
+            "confidence": "inferred",
+            "report_context": (
+                f"Backfilled from attack_graph path(s) "
+                f"'{', '.join(path_ids)}'"
+            ),
+        }
+        all_mitre.append(new_entry)
+        existing[key] = new_entry
+        backfill_count += 1
+        logger.info(
+            "[RECONCILE] Backfilled technique %s (tactic=%s) "
+            "from attack_graph path(s) %s | local_lookup=%s",
+            tid, tactic, ", ".join(path_ids),
+            "hit" if local else "miss",
+        )
+
+    # Handle leads_to targets that never appear as steps in any path
+    orphan_tids = all_leads_to - step_tids
+    for oid in sorted(orphan_tids):
+        # Skip if any entry already exists for this technique_id
+        if any(etid == oid for (etid, _) in existing):
+            continue
+        local = mitre_db.get(oid, {})
+        fallback_tactic = local["tactics"][0] if local.get("tactics") else ""
+        new_entry = {
+            "technique_id": oid,
+            "technique_name": local.get("name", ""),
+            "tactic": fallback_tactic,
+            "context_paths": [],
+            "confidence": "inferred",
+            "report_context": (
+                "Backfilled — referenced as leads_to target "
+                "in attack_graph"
+            ),
+        }
+        all_mitre.append(new_entry)
+        existing[(oid, fallback_tactic)] = new_entry
+        backfill_count += 1
+        logger.info(
+            "[RECONCILE] Backfilled leads_to orphan %s (tactic=%s) "
+            "| local_lookup=%s",
+            oid, fallback_tactic or "(unknown)",
+            "hit" if local else "miss",
+        )
 
     # --- Step 2: enrich stubs with empty name/tactic ---
     for entry in all_mitre:
@@ -482,6 +548,13 @@ def _reconcile_mitre_mappings(
             entry["technique_name"] = local["name"]
             changes.append(f"name={local['name']!r}")
         if needs_tactic and local.get("tactics"):
+            if len(local["tactics"]) > 1:
+                logger.warning(
+                    "[RECONCILE] %s has %d valid tactics %s but no "
+                    "graph context to disambiguate — defaulting to %r",
+                    tid, len(local["tactics"]), local["tactics"],
+                    local["tactics"][0],
+                )
             entry["tactic"] = local["tactics"][0]
             changes.append(f"tactic={local['tactics'][0]!r}")
 
@@ -496,6 +569,7 @@ def _reconcile_mitre_mappings(
     # Only run when we actually have a loaded DB; skip if the lookup
     # file hasn't been built yet (all entries stay unmarked).
     unvalidated_count = 0
+    tactic_mismatch_count = 0
     if mitre_db:
         for entry in all_mitre:
             tid = entry.get("technique_id", "")
@@ -503,6 +577,17 @@ def _reconcile_mitre_mappings(
                 continue
             if tid in mitre_db:
                 entry["mitre_validated"] = True
+                # Validate tactic against allowed tactics for this technique
+                entry_tactic = entry.get("tactic", "")
+                allowed = mitre_db[tid].get("tactics", [])
+                if entry_tactic and allowed and entry_tactic not in allowed:
+                    tactic_mismatch_count += 1
+                    logger.warning(
+                        "[RECONCILE] Tactic mismatch: %s assigned "
+                        "tactic %r but ATT&CK allows %s — "
+                        "keeping LLM assignment, may be hallucinated",
+                        tid, entry_tactic, allowed,
+                    )
             else:
                 entry["mitre_validated"] = False
                 unvalidated_count += 1
@@ -520,12 +605,13 @@ def _reconcile_mitre_mappings(
                     tid, entry["technique_name"], len(mitre_db),
                 )
 
-    if backfill_count or enrich_count or unvalidated_count:
+    if backfill_count or enrich_count or unvalidated_count or tactic_mismatch_count:
         logger.info(
             "[RECONCILE] Summary: %d backfilled, %d enriched, "
-            "%d unvalidated, %d total mitre_mappings "
-            "(local DB has %d techniques)",
+            "%d unvalidated, %d tactic mismatches, "
+            "%d total mitre_mappings (local DB has %d techniques)",
             backfill_count, enrich_count, unvalidated_count,
+            tactic_mismatch_count,
             len(all_mitre), len(mitre_db),
         )
 
@@ -553,7 +639,7 @@ SECTION 3 — REPORT METADATA: Extract the report title, campaign name, attribut
 
 SECTION 4 — TECHNIQUE TACTIC ASSIGNMENT: For EVERY technique in both refined_iocs.related_mitre AND additional_mitre_techniques, you MUST populate the "tactic" field with the correct MITRE ATT&CK tactic name. Use the official tactic names exactly as written:
 Reconnaissance, Resource Development, Initial Access, Execution, Persistence, Privilege Escalation, Defense Evasion, Credential Access, Discovery, Lateral Movement, Collection, Command and Control, Exfiltration, Impact.
-If a technique maps to multiple tactics, use the tactic most relevant to how the report describes its use. NEVER leave the tactic field empty.
+If a technique maps to multiple tactics, use the tactic most relevant to how the report describes its use. When the same technique ID appears in multiple attack paths serving different attacker objectives, include it multiple times in `additional_mitre_techniques` — once per distinct role — with the tactic that matches each role. This is expected, not a duplication error. NEVER leave the tactic field empty.
 
 SECTION 5 — ATTACK GRAPH: Analyze how the techniques described in the report relate to each other operationally. Real attacks have multiple paths, branches, and convergence points.
 
@@ -593,6 +679,20 @@ Respond ONLY with a JSON object in this exact format:
       "tactic": "Tactic Name",
       "confidence": "explicit|inferred",
       "report_context": "brief description of the behavior"
+    }},
+    {{
+      "technique_id": "T1078",
+      "technique_name": "Valid Accounts",
+      "tactic": "Initial Access",
+      "confidence": "inferred",
+      "report_context": "Attacker used harvested credentials for initial foothold"
+    }},
+    {{
+      "technique_id": "T1078",
+      "technique_name": "Valid Accounts",
+      "tactic": "Persistence",
+      "confidence": "inferred",
+      "report_context": "Same credentials reused to maintain long-term access"
     }}
   ],
   "report_metadata": {{
@@ -1264,6 +1364,10 @@ class ThreatIntelIngester:
                     "ioc_breakdown": ioc_breakdown,
                     "high_priority_count": high_priority_count,
                     "mitre_technique_count": len(all_mitre),
+                    "unique_technique_count": len(
+                        {m.get("technique_id") for m in all_mitre
+                         if m.get("technique_id")}
+                    ),
                     "confidence_distribution": confidence_dist,
                     "ingestion_mode": ingestion_mode,
                 },
@@ -1317,16 +1421,43 @@ class ThreatIntelIngester:
         if hp > 0:
             parts.append(f"{hp} IOCs flagged as high-priority.")
 
-        # MITRE techniques
+        # MITRE techniques — group by technique_id for multi-role display
         tech_count = summary.get("mitre_technique_count", 0)
+        unique_count = summary.get("unique_technique_count", tech_count)
         if tech_count > 0 and mitre:
-            tech_list = ", ".join(
-                f"{m['technique_id']} ({m.get('technique_name', '')})"
-                for m in mitre[:6]
-            )
-            parts.append(f"Mapped to {tech_count} MITRE techniques: {tech_list}.")
-            if tech_count > 6:
-                parts.append(f"(and {tech_count - 6} more)")
+            by_tid: dict[str, list[str]] = {}
+            names: dict[str, str] = {}
+            for m in mitre:
+                tid = m.get("technique_id", "")
+                if not tid:
+                    continue
+                by_tid.setdefault(tid, [])
+                tac = m.get("tactic", "")
+                if tac and tac not in by_tid[tid]:
+                    by_tid[tid].append(tac)
+                if not names.get(tid):
+                    names[tid] = m.get("technique_name", "")
+
+            tech_parts = []
+            for tid in list(by_tid.keys())[:6]:
+                tactics = by_tid[tid]
+                if len(tactics) > 1:
+                    tech_parts.append(f"{tid} ({', '.join(tactics)})")
+                else:
+                    tech_parts.append(f"{tid} ({names.get(tid, '')})")
+
+            if unique_count != tech_count:
+                parts.append(
+                    f"Mapped to {unique_count} unique techniques across "
+                    f"{tech_count} tactical roles: {', '.join(tech_parts)}."
+                )
+            else:
+                parts.append(
+                    f"Mapped to {tech_count} MITRE techniques: "
+                    f"{', '.join(tech_parts)}."
+                )
+            if len(by_tid) > 6:
+                parts.append(f"(and {len(by_tid) - 6} more)")
 
         # Attack graph paths
         if r.get("attack_graph", {}).get("paths"):
