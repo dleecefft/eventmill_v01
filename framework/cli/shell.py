@@ -1066,6 +1066,17 @@ class EventMillShell(cmd.Cmd):
                 raise RuntimeError("Plugin returned None instead of ToolResult")
             
             if result.ok:
+                # Register output_artifacts declared by the plugin
+                for oa in (result.output_artifacts or []):
+                    oa_path = Path(oa.get("file_path", ""))
+                    if oa_path.exists():
+                        self.session_manager.register_artifact(
+                            artifact_type=oa.get("artifact_type", "text"),
+                            file_path=str(oa_path),
+                            source_tool=tool_name,
+                            metadata={"plugin_artifact_id": oa.get("artifact_id", "")},
+                        )
+
                 # Auto-persist output if the tool didn't register an artifact itself
                 _artifacts_after = {a.artifact_id for a in self.session_manager.list_artifacts()}
                 if not (_artifacts_after - _artifacts_before) and result.result is not None:
