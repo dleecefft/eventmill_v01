@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from framework.logging.structured import log_llm_interaction
+from framework.plugins.protocol import ToolResult, ValidationResult, QueryHints
 
 logger = logging.getLogger("eventmill.plugin.threat_intel_ingester")
 
@@ -295,6 +296,18 @@ def _merge_llm_chunk_results(chunk_results: list[dict]) -> dict:
     }
 
 
+def _parse_llm_json(response_text: str) -> dict | None:
+    """Strip markdown code fences and parse JSON from LLM response."""
+    raw_resp = response_text.strip()
+    if raw_resp.startswith("```"):
+        raw_resp = re.sub(r"^```(?:json)?\s*\n?", "", raw_resp)
+        raw_resp = re.sub(r"\n?```\s*$", "", raw_resp)
+    try:
+        return json.loads(raw_resp.strip())
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # LLM Refinement Prompt
 # ---------------------------------------------------------------------------
@@ -390,25 +403,7 @@ Respond ONLY with a JSON object in this exact format:
 """
 
 
-# ---------------------------------------------------------------------------
-# Protocol Types
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class ToolResult:
-    ok: bool
-    result: dict[str, Any] | None = None
-    error_code: str | None = None
-    message: str | None = None
-    details: dict[str, Any] | None = None
-    output_artifacts: list[dict[str, Any]] | None = None
-
-
-@dataclass
-class ValidationResult:
-    ok: bool
-    errors: list[str] | None = None
+# ToolResult, ValidationResult, QueryHints imported from framework.plugins.protocol
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +575,108 @@ class ThreatIntelIngester:
                         "for validation. Use official technique IDs."
                     )
 
+            # --- Native PDF path: send full document to LLM directly ---
+            native_pdf_succeeded = False
+            if (artifact.artifact_type == "pdf_report"
+                    and hasattr(context.llm_query, 'supports_native_document')
+                    and context.llm_query.supports_native_document("application/pdf")):
+                logger.info(
+                    "Native PDF ingestion available — attempting "
+                    "query_with_document()"
+                )
+                candidates_text = (
+                    "\n".join(
+                        f"- [{ioc.ioc_type}] {ioc.value} "
+                        f"| Context: {ioc.context[:200]}"
+                        for ioc in raw_iocs
+                    )
+                    or "(none found by regex pre-scan)"
+                )
+                native_prompt = LLM_REFINEMENT_PROMPT.format(
+                    source_context=source_context or "Not provided",
+                    ioc_candidates=candidates_text,
+                    report_text=(
+                        "[Full PDF document is attached — analyze the "
+                        "complete document directly instead of this "
+                        "placeholder text.]"
+                    ),
+                )
+                try:
+                    native_response = context.llm_query.query_with_document(
+                        prompt=native_prompt,
+                        artifact=artifact,
+                        system_context=(
+                            "You are a threat intelligence analyst. "
+                            "Respond only with valid JSON."
+                        ),
+                        max_tokens=8192,
+                        grounding_data=grounding,
+                        hints=QueryHints(
+                            tier="heavy",
+                            prefers_native_file=True,
+                            needs_structured_output=True,
+                        ),
+                    )
+                    log_llm_interaction(
+                        prompt=(
+                            f"[ti_ingester native_pdf] "
+                            f"{native_prompt[:500]}"
+                        ),
+                        response_text=(
+                            native_response.text[:500]
+                            if native_response.text else None
+                        ),
+                        model_id=(
+                            native_response.model_used
+                            or "threat_intel_ingester"
+                        ),
+                        error=(
+                            str(native_response.error)
+                            if not native_response.ok else None
+                        ),
+                    )
+                    if native_response.ok and native_response.text:
+                        parsed = _parse_llm_json(native_response.text)
+                        if parsed:
+                            logger.info(
+                                "Native PDF ingestion succeeded "
+                                "(transport=%s, model=%s)",
+                                native_response.transport_path,
+                                native_response.model_used,
+                            )
+                            all_refined = parsed.get("refined_iocs", [])
+                            refined_iocs = [
+                                r for r in all_refined
+                                if not r.get("is_false_positive", False)
+                            ]
+                            mitre_mappings = parsed.get(
+                                "additional_mitre_techniques", [],
+                            )
+                            report_meta = parsed.get(
+                                "report_metadata", {},
+                            )
+                            attack_graph = parsed.get(
+                                "attack_graph", {},
+                            )
+                            native_pdf_succeeded = True
+                        else:
+                            logger.warning(
+                                "Native PDF response not valid JSON "
+                                "— falling back to chunked text path"
+                            )
+                    else:
+                        logger.warning(
+                            "Native PDF query failed (ok=%s, error=%s) "
+                            "— falling back to chunked text path",
+                            native_response.ok, native_response.error,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "Native PDF path exception: %s: %s "
+                        "— falling back to chunked text path",
+                        type(e).__name__, e,
+                    )
+
             # Split large inputs into chunks to stay within LLM context limits.
             # Large PDFs previously caused repeated 503s even with backoff because
             # the monolithic prompt (100 IOCs + 8 kB text) exceeded the model's
@@ -591,20 +688,17 @@ class ThreatIntelIngester:
             text_chunks = _chunk_text(raw_text, _MAX_TEXT_CHARS_PER_CHUNK)
             n_chunks = max(len(ioc_batches), len(text_chunks))
 
+            if native_pdf_succeeded:
+                n_chunks = 0
+                logger.info(
+                    "Skipping chunked LLM path — native PDF "
+                    "ingestion succeeded"
+                )
+
             logger.info(
                 "Splitting into %d LLM chunk(s) (%d IOC batches, %d text chunks)",
                 n_chunks, len(ioc_batches), len(text_chunks),
             )
-
-            def _parse_llm_json(response_text: str) -> dict | None:
-                raw_resp = response_text.strip()
-                if raw_resp.startswith("```"):
-                    raw_resp = re.sub(r"^```(?:json)?\s*\n?", "", raw_resp)
-                    raw_resp = re.sub(r"\n?```\s*$", "", raw_resp)
-                try:
-                    return json.loads(raw_resp.strip())
-                except (json.JSONDecodeError, ValueError):
-                    return None
 
             chunk_results: list[dict] = []
             for i in range(n_chunks):
@@ -647,6 +741,10 @@ class ThreatIntelIngester:
                         ),
                         max_tokens=3000,
                         grounding_data=grounding,
+                        hints=QueryHints(
+                            tier="light",
+                            needs_structured_output=True,
+                        ),
                     )
 
                     # --- Cloud Logging audit: input + output ---
@@ -655,7 +753,7 @@ class ThreatIntelIngester:
                         response_text=(
                             llm_response.text[:500] if llm_response.text else None
                         ),
-                        model_id="threat_intel_ingester",
+                        model_id=llm_response.model_used or "threat_intel_ingester",
                         error=(
                             str(llm_response.error)
                             if not llm_response.ok else None
