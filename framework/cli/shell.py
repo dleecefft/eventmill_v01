@@ -25,7 +25,7 @@ from ..session.models import Pillar, ToolExecutionStatus
 from ..plugins.loader import PluginLoader, LoadedPlugin
 from ..routing.router import Router, RouterConfig
 from ..artifacts.registry import ArtifactRegistry, create_artifact_registration_callback
-from ..llm.client import MCPLLMClient, ContextBuilder, TieredLLMClient
+from ..llm.client import MCPLLMClient, ContextBuilder, LLMDispatcher
 from ..plugins.protocol import ExecutionContext, ReferenceDataView, ArtifactRef, TimeoutClass
 from ..cloud.resolver import StorageResolver, StorageResolverConfig, create_local_resolver
 
@@ -150,7 +150,7 @@ class EventMillShell(cmd.Cmd):
         # Initialize components
         self.session_manager = SessionManager(self.workspace_path)
         self.plugin_loader = PluginLoader(self.plugins_path)
-        self.llm_client: MCPLLMClient | TieredLLMClient | None = None
+        self.llm_client: MCPLLMClient | LLMDispatcher | None = None
         self.router: Router | None = None
         self.artifact_registry: ArtifactRegistry | None = None
         self.context_builder = ContextBuilder()
@@ -1305,7 +1305,7 @@ class EventMillShell(cmd.Cmd):
         print("")
         print("  'connect'            — bind all models (tiered auto-routing)")
         print("  'connect <model_id>' — bind a specific model only")
-        print(f"  Routing: max_tokens ≤ {TieredLLMClient.LIGHT_THRESHOLD} → light (Flash), > {TieredLLMClient.LIGHT_THRESHOLD} → heavy (Pro)")
+        print(f"  Routing: max_tokens ≤ {LLMDispatcher.LIGHT_THRESHOLD} → light (Flash), > {LLMDispatcher.LIGHT_THRESHOLD} → heavy (Pro)")
     
     def do_connect(self, arg: str) -> None:
         """Connect to LLM.
@@ -1349,7 +1349,7 @@ class EventMillShell(cmd.Cmd):
                 print("  No models connected.")
                 return
 
-            self.llm_client = TieredLLMClient(clients=connected_clients)
+            self.llm_client = LLMDispatcher(clients=connected_clients)
 
             log_user_activity("connect_llm", {
                 "models": {tier: c.model_id for tier, c in connected_clients.items()},
@@ -1358,8 +1358,8 @@ class EventMillShell(cmd.Cmd):
 
             if len(connected_clients) > 1:
                 print(f"")
-                print(f"  Auto-routing: max_tokens ≤ {TieredLLMClient.LIGHT_THRESHOLD} → light, "
-                      f"> {TieredLLMClient.LIGHT_THRESHOLD} → heavy")
+                print(f"  Auto-routing: max_tokens ≤ {LLMDispatcher.LIGHT_THRESHOLD} → light, "
+                      f"> {LLMDispatcher.LIGHT_THRESHOLD} → heavy")
             return
 
         # Specific model requested — single-client mode
@@ -1637,7 +1637,7 @@ class EventMillShell(cmd.Cmd):
         """Return a short status string for a model entry in 'models' output."""
         if self.llm_client is None:
             return ""
-        if isinstance(self.llm_client, TieredLLMClient):
+        if isinstance(self.llm_client, LLMDispatcher):
             c = self.llm_client._clients.get(model["tier"])
             return "✓ connected" if (c and c.connected) else ""
         if isinstance(self.llm_client, MCPLLMClient):

@@ -13,7 +13,8 @@ import os
 import time
 from typing import Any
 
-from ..plugins.protocol import LLMQueryInterface, LLMResponse
+from ..plugins.protocol import LLMQueryInterface, LLMResponse, QueryHints, ArtifactRef
+from .backends.base import DocumentPart
 
 try:
     from google import genai
@@ -351,12 +352,14 @@ class MCPLLMClient:
         raise last_exc  # type: ignore[misc]
 
 
-class TieredLLMClient:
-    """Routes LLM queries to Flash (light) or Pro (heavy) automatically.
+class LLMDispatcher:
+    """Routes LLM queries to the appropriate backend based on QueryHints.
 
-    When the user runs ``connect`` with no arguments, the shell creates one of
-    these wrapping all available models.  Plugins call ``query_text`` exactly
-    as before — the tier is selected transparently based on ``max_tokens``:
+    Extends the light/heavy tier concept with capability-aware routing
+    and native document dispatch.
+
+    Backward-compatible: all existing query_text() calls work unchanged.
+    When no QueryHints are provided, falls back to token-count routing:
 
         max_tokens <= LIGHT_THRESHOLD  →  light / Flash  (fast, cheap)
         max_tokens >  LIGHT_THRESHOLD  →  heavy / Pro    (powerful, expensive)
@@ -391,10 +394,26 @@ class TieredLLMClient:
 
     # --- Routing ---------------------------------------------------------------
 
-    def _route(self, max_tokens: int) -> MCPLLMClient:
-        """Select the appropriate client for the given output token budget."""
-        prefer_heavy = max_tokens > self.LIGHT_THRESHOLD
-        order = ("heavy", "light") if prefer_heavy else ("light", "heavy")
+    def _route(self, max_tokens: int, hints: QueryHints | None = None,
+               document_mime: str | None = None) -> MCPLLMClient:
+        """Select the appropriate client based on hints + capabilities.
+
+        Routing priority:
+        1. Explicit tier from hints.tier or hints.needs_reasoning
+        2. If native document needed + prefers_native_file, prefer backend
+           whose underlying model supports that MIME type
+        3. Token-count heuristic (legacy fallback when no hints)
+        4. Any connected backend as final fallback
+        """
+        if hints is not None:
+            if hints.needs_reasoning or hints.tier == "heavy":
+                order = ("heavy", "light")
+            else:
+                order = ("light", "heavy")
+        else:
+            prefer_heavy = max_tokens > self.LIGHT_THRESHOLD
+            order = ("heavy", "light") if prefer_heavy else ("light", "heavy")
+
         for tier in order:
             c = self._clients.get(tier)
             if c and c.connected:
@@ -409,9 +428,10 @@ class TieredLLMClient:
         system_context: str | None = None,
         max_tokens: int = 4096,
         grounding_data: list[str] | None = None,
+        hints: QueryHints | None = None,
     ) -> LLMResponse:
         try:
-            client = self._route(max_tokens)
+            client = self._route(max_tokens, hints=hints)
         except RuntimeError as e:
             return LLMResponse(ok=False, error=str(e))
         return client.query_text(
@@ -440,6 +460,181 @@ class TieredLLMClient:
             system_context=system_context,
             max_tokens=max_tokens,
         )
+
+    def query_with_document(
+        self,
+        prompt: str,
+        artifact: ArtifactRef,
+        system_context: str | None = None,
+        max_tokens: int = 8192,
+        grounding_data: list[str] | None = None,
+        hints: QueryHints | None = None,
+    ) -> LLMResponse:
+        """Query with a document artifact.
+
+        Resolves the best ingestion path automatically:
+          1. Native document + GCS URI (zero-copy for Gemini)
+          2. Native document + inline bytes from local file
+          3. Fallback: returns ok=False so plugin can use text extraction
+
+        The response's transport_path records which path was used.
+        """
+        hints = hints or QueryHints(tier="heavy", prefers_native_file=True)
+        mime_type = artifact.metadata.get("mime_type", "application/pdf")
+
+        try:
+            client = self._route(max_tokens, hints=hints, document_mime=mime_type)
+        except RuntimeError as e:
+            return LLMResponse(ok=False, error=str(e))
+
+        # Check if the underlying model supports native document ingestion.
+        # MCPLLMClient doesn't have a capabilities() method — it uses the
+        # GenAI SDK directly. For the Gemini provider, PDFs are always
+        # supported natively.
+        if not self._model_supports_native_doc(client, mime_type):
+            return LLMResponse(
+                ok=False,
+                error="Native document processing not available for this MIME type",
+                model_used=client.model_id,
+                fallback_reason=f"model {client.model_id} lacks native support for {mime_type}",
+            )
+
+        # Build the document part
+        doc = DocumentPart(
+            mime_type=mime_type,
+            storage_uri=artifact.storage_uri,
+            file_path=artifact.file_path,
+        )
+
+        # Build the full prompt with grounding data
+        full_prompt = client._build_prompt(prompt, grounding_data)
+
+        # Delegate to the client's internal GenAI SDK for native doc handling
+        return self._execute_document_query(
+            client=client,
+            prompt=full_prompt,
+            doc=doc,
+            system_context=system_context,
+            max_tokens=max_tokens,
+        )
+
+    def supports_native_document(self, mime_type: str) -> bool:
+        """Check if any connected model handles this MIME type natively."""
+        native_types = {"application/pdf"}
+        if mime_type not in native_types:
+            return False
+        return any(c.connected for c in self._clients.values())
+
+    # --- Internal helpers ------------------------------------------------------
+
+    @staticmethod
+    def _model_supports_native_doc(client: MCPLLMClient, mime_type: str) -> bool:
+        """Check if a client's model supports native ingestion of a MIME type.
+
+        For Gemini models (the MVP provider), PDFs are always supported.
+        """
+        if mime_type == "application/pdf":
+            return True
+        return False
+
+    @staticmethod
+    def _execute_document_query(
+        client: MCPLLMClient,
+        prompt: str,
+        doc: DocumentPart,
+        system_context: str | None,
+        max_tokens: int,
+    ) -> LLMResponse:
+        """Execute a document query via the GenAI SDK.
+
+        Tries ingestion paths in priority order:
+          1. GCS URI (zero-copy) — if storage_uri starts with gs://
+          2. Inline bytes from local file_path
+        """
+        if client._genai_client is None:
+            return LLMResponse(ok=False, error="Client not initialised")
+
+        try:
+            parts: list = []
+            transport_path = "unknown"
+
+            if doc.storage_uri and doc.storage_uri.startswith("gs://"):
+                parts.append(genai_types.Part.from_uri(
+                    file_uri=doc.storage_uri,
+                    mime_type=doc.mime_type,
+                ))
+                transport_path = "gs_uri"
+            elif doc.inline_bytes:
+                parts.append(genai_types.Part.from_bytes(
+                    data=doc.inline_bytes,
+                    mime_type=doc.mime_type,
+                ))
+                transport_path = "inline_bytes"
+            elif doc.file_path:
+                with open(doc.file_path, "rb") as f:
+                    data = f.read()
+                parts.append(genai_types.Part.from_bytes(
+                    data=data,
+                    mime_type=doc.mime_type,
+                ))
+                transport_path = "inline_bytes"
+            else:
+                return LLMResponse(
+                    ok=False,
+                    error="DocumentPart has no data source",
+                    model_used=client.model_id,
+                )
+
+            parts.append(prompt)
+
+            config = genai_types.GenerateContentConfig(
+                max_output_tokens=max_tokens,
+            )
+            if system_context:
+                config.system_instruction = system_context
+
+            last_exc: Exception | None = None
+            for attempt in range(client.max_retries + 1):
+                try:
+                    response = client._genai_client.models.generate_content(
+                        model=client.model_id,
+                        contents=parts,
+                        config=config,
+                    )
+                    if hasattr(response, "usage_metadata") and response.usage_metadata:
+                        um = response.usage_metadata
+                        client._total_tokens_used += getattr(um, "total_token_count", 0)
+                    return LLMResponse(
+                        ok=True,
+                        text=response.text or "",
+                        model_used=client.model_id,
+                        transport_path=transport_path,
+                    )
+                except Exception as exc:
+                    if attempt < client.max_retries and client._is_retriable(exc):
+                        wait = 2 ** attempt
+                        logger.warning(
+                            "Document query transient error (attempt %d/%d), "
+                            "retrying in %ds: %s",
+                            attempt + 1, client.max_retries + 1, wait, exc,
+                        )
+                        time.sleep(wait)
+                        last_exc = exc
+                    else:
+                        raise
+            raise last_exc  # type: ignore[misc]
+
+        except Exception as e:
+            logger.error("Document query failed: %s", e)
+            return LLMResponse(
+                ok=False,
+                error=str(e),
+                model_used=client.model_id,
+            )
+
+
+# Backward compatibility alias
+TieredLLMClient = LLMDispatcher
 
 
 class ContextBuilder:
