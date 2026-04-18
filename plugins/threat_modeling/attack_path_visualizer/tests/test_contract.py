@@ -428,6 +428,31 @@ class TestMultiRoleDAG:
         # T1059 is convergence point — should get orange styling
         assert "fill:#ffe0b2" in mermaid
 
+    def test_entry_nodes_labeled_with_path_names(
+        self, multi_role_attack_graph, multi_role_mitre_mappings
+    ):
+        dag = _tool_mod._build_dag_from_attack_graph(
+            multi_role_attack_graph, multi_role_mitre_mappings
+        )
+        mermaid = _tool_mod._render_mermaid_dag(dag, "test")
+        # Entry nodes should have bold path name tags
+        assert "phishing-path" in mermaid
+        assert "persistence-path" in mermaid
+
+    def test_color_legend_subgraph_present(
+        self, multi_role_attack_graph, multi_role_mitre_mappings
+    ):
+        dag = _tool_mod._build_dag_from_attack_graph(
+            multi_role_attack_graph, multi_role_mitre_mappings
+        )
+        mermaid = _tool_mod._render_mermaid_dag(dag, "test")
+        assert "Entry Point" in mermaid
+        assert "Mid-chain" in mermaid
+        assert "Exit / Terminal" in mermaid
+        assert "Convergence" in mermaid
+        assert "style LE fill:#bbdefb" in mermaid
+        assert "style legend fill:#f5f5f5" in mermaid
+
     def test_node_key_helper(self):
         key = _tool_mod._node_key("T1078", "Initial Access")
         assert key == "T1078|initial-access"

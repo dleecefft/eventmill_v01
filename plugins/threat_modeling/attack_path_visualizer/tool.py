@@ -591,6 +591,8 @@ def _render_mermaid_dag(dag: AttackDAG, attack_type: str) -> str:
         "    direction TB",
     ]
 
+    entry_set = set(dag.entry_points)
+
     # Assign short node IDs and render node labels
     id_map: dict[str, str] = {}
     for i, (nk, node) in enumerate(dag.nodes.items()):
@@ -601,6 +603,10 @@ def _render_mermaid_dag(dag: AttackDAG, attack_type: str) -> str:
         if node.technique_name:
             label += f" - {node.technique_name[:30]}"
         label += "</small>"
+        # Annotate entry-point nodes with their path name(s)
+        if nk in entry_set and node.path_ids:
+            path_tag = " | ".join(node.path_ids)
+            label = f"<b>{path_tag}</b><br/>" + label
         lines.append(f'    {nid}(["{label}"])')
 
     # Render edges
@@ -614,12 +620,22 @@ def _render_mermaid_dag(dag: AttackDAG, attack_type: str) -> str:
     lines.append("    end")
     lines.append("")
 
+    # Color legend subgraph (rendered outside the attack subgraph)
+    lines.append('    subgraph legend[" "]')
+    lines.append("    direction LR")
+    lines.append('    LE["Entry Point"]')
+    lines.append('    LM["Mid-chain"]')
+    lines.append('    LX["Exit / Terminal"]')
+    lines.append('    LC["Convergence"]')
+    lines.append('    LG["Has Controls"]')
+    lines.append("    end")
+    lines.append("")
+
     # Style nodes by role
     # convergence/branch are plain technique_ids from the LLM;
     # entry/exit are composite keys computed by the builder.
     convergence_set = set(dag.convergence_points)
     branch_set = set(dag.branch_points)
-    entry_set = set(dag.entry_points)
     exit_set = set(dag.exit_points)
 
     for nk, node in dag.nodes.items():
@@ -635,9 +651,17 @@ def _render_mermaid_dag(dag: AttackDAG, attack_type: str) -> str:
         else:
             lines.append(f"    style {nid} fill:#ffffcc,stroke:#cccc00")
 
+    # Style legend nodes to match the role colors
+    lines.append("    style LE fill:#bbdefb,stroke:#1565c0")
+    lines.append("    style LM fill:#ffffcc,stroke:#cccc00")
+    lines.append("    style LX fill:#ffcdd2,stroke:#b71c1c")
+    lines.append("    style LC fill:#ffe0b2,stroke:#e65100")
+    lines.append("    style LG fill:#ccffcc,stroke:#00cc00")
+    lines.append("    style legend fill:#f5f5f5,stroke:#999")
+
     lines.append("```")
 
-    # Path legend
+    # Path descriptions (markdown below diagram)
     lines.append("")
     lines.append("**Paths:**")
     for p in dag.paths:
