@@ -582,14 +582,46 @@ def _render_mermaid_control_matrix(stages: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _render_mermaid_dag(dag: AttackDAG, attack_type: str) -> str:
-    """Render a multi-path attack graph as Mermaid flowchart."""
-    lines = [
-        "```mermaid",
-        "flowchart TB",
-        f'    subgraph attack["{attack_type.upper()} Attack Graph"]',
-        "    direction TB",
-    ]
+def _render_mermaid_dag(
+    dag: AttackDAG, attack_type: str
+) -> tuple[str, str]:
+    """Render a multi-path attack graph as Mermaid flowchart.
+
+    Returns ``(raw_mermaid, markdown)``:
+
+    * **raw_mermaid** — pure Mermaid code (no fences) with path
+      descriptions embedded as ``%%`` comments.  Suitable for ``.mmd``
+      files consumed directly by Mermaid CLI, VS Code Mermaid Preview,
+      or `mermaid.live <https://mermaid.live>`_.
+    * **markdown** — fenced ``\u0060\u0060\u0060mermaid`` block followed by a
+      human-readable path legend.  Suitable for GitHub / VS Code
+      markdown rendering.
+    """
+    # --- Path metadata used in both forms ---
+    path_meta: list[tuple[str, str]] = []
+    for p in dag.paths:
+        path_meta.append((p.get("path_id", "?"), p.get("description", "")))
+
+    conv_labels: list[str] = []
+    for ctid in dag.convergence_points:
+        for nk, node in dag.nodes.items():
+            if node.technique_id == ctid:
+                conv_labels.append(f"{ctid} ({node.tactic})")
+                break
+
+    # --- Build raw Mermaid lines (no fences) ---
+    mmd: list[str] = []
+
+    # Embed path descriptions as Mermaid comments at the top
+    for pid, desc in path_meta:
+        mmd.append(f"%% Path: {pid} - {desc}")
+    if conv_labels:
+        mmd.append(f"%% Convergence: {', '.join(conv_labels)}")
+    mmd.append("")
+
+    mmd.append("flowchart TB")
+    mmd.append(f'    subgraph attack["{attack_type.upper()} Attack Graph"]')
+    mmd.append("    direction TB")
 
     entry_set = set(dag.entry_points)
 
@@ -607,7 +639,7 @@ def _render_mermaid_dag(dag: AttackDAG, attack_type: str) -> str:
         if nk in entry_set and node.path_ids:
             path_tag = " | ".join(node.path_ids)
             label = f"<b>{path_tag}</b><br/>" + label
-        lines.append(f'    {nid}(["{label}"])')
+        mmd.append(f'    {nid}(["{label}"])')
 
     # Render edges
     for nk, node in dag.nodes.items():
@@ -615,25 +647,23 @@ def _render_mermaid_dag(dag: AttackDAG, attack_type: str) -> str:
         for target_nk in node.leads_to:
             if target_nk in id_map:
                 dst = id_map[target_nk]
-                lines.append(f"    {src} --> {dst}")
+                mmd.append(f"    {src} --> {dst}")
 
-    lines.append("    end")
-    lines.append("")
+    mmd.append("    end")
+    mmd.append("")
 
     # Color legend subgraph (rendered outside the attack subgraph)
-    lines.append('    subgraph legend[" "]')
-    lines.append("    direction LR")
-    lines.append('    LE["Entry Point"]')
-    lines.append('    LM["Mid-chain"]')
-    lines.append('    LX["Exit / Terminal"]')
-    lines.append('    LC["Convergence"]')
-    lines.append('    LG["Has Controls"]')
-    lines.append("    end")
-    lines.append("")
+    mmd.append('    subgraph legend[" "]')
+    mmd.append("    direction LR")
+    mmd.append('    LE["Entry Point"]')
+    mmd.append('    LM["Mid-chain"]')
+    mmd.append('    LX["Exit / Terminal"]')
+    mmd.append('    LC["Convergence"]')
+    mmd.append('    LG["Has Controls"]')
+    mmd.append("    end")
+    mmd.append("")
 
     # Style nodes by role
-    # convergence/branch are plain technique_ids from the LLM;
-    # entry/exit are composite keys computed by the builder.
     convergence_set = set(dag.convergence_points)
     branch_set = set(dag.branch_points)
     exit_set = set(dag.exit_points)
@@ -641,45 +671,39 @@ def _render_mermaid_dag(dag: AttackDAG, attack_type: str) -> str:
     for nk, node in dag.nodes.items():
         nid = id_map[nk]
         if node.technique_id in convergence_set:
-            lines.append(f"    style {nid} fill:#ffe0b2,stroke:#e65100")
+            mmd.append(f"    style {nid} fill:#ffe0b2,stroke:#e65100")
         elif nk in entry_set:
-            lines.append(f"    style {nid} fill:#bbdefb,stroke:#1565c0")
+            mmd.append(f"    style {nid} fill:#bbdefb,stroke:#1565c0")
         elif nk in exit_set:
-            lines.append(f"    style {nid} fill:#ffcdd2,stroke:#b71c1c")
+            mmd.append(f"    style {nid} fill:#ffcdd2,stroke:#b71c1c")
         elif node.controls:
-            lines.append(f"    style {nid} fill:#ccffcc,stroke:#00cc00")
+            mmd.append(f"    style {nid} fill:#ccffcc,stroke:#00cc00")
         else:
-            lines.append(f"    style {nid} fill:#ffffcc,stroke:#cccc00")
+            mmd.append(f"    style {nid} fill:#ffffcc,stroke:#cccc00")
 
     # Style legend nodes to match the role colors
-    lines.append("    style LE fill:#bbdefb,stroke:#1565c0")
-    lines.append("    style LM fill:#ffffcc,stroke:#cccc00")
-    lines.append("    style LX fill:#ffcdd2,stroke:#b71c1c")
-    lines.append("    style LC fill:#ffe0b2,stroke:#e65100")
-    lines.append("    style LG fill:#ccffcc,stroke:#00cc00")
-    lines.append("    style legend fill:#f5f5f5,stroke:#999")
+    mmd.append("    style LE fill:#bbdefb,stroke:#1565c0")
+    mmd.append("    style LM fill:#ffffcc,stroke:#cccc00")
+    mmd.append("    style LX fill:#ffcdd2,stroke:#b71c1c")
+    mmd.append("    style LC fill:#ffe0b2,stroke:#e65100")
+    mmd.append("    style LG fill:#ccffcc,stroke:#00cc00")
+    mmd.append("    style legend fill:#f5f5f5,stroke:#999")
 
-    lines.append("```")
+    raw_mermaid = "\n".join(mmd)
 
-    # Path descriptions (markdown below diagram)
-    lines.append("")
-    lines.append("**Paths:**")
-    for p in dag.paths:
-        pid = p.get("path_id", "?")
-        desc = p.get("description", "")
-        lines.append(f"- **{pid}**: {desc}")
+    # --- Build markdown form (fenced + path legend) ---
+    md_lines = [f"```mermaid", raw_mermaid, "```"]
+    md_lines.append("")
+    md_lines.append("**Paths:**")
+    for pid, desc in path_meta:
+        md_lines.append(f"- **{pid}**: {desc}")
+    if conv_labels:
+        md_lines.append("")
+        md_lines.append(f"**Convergence:** {', '.join(conv_labels)}")
 
-    if dag.convergence_points:
-        lines.append("")
-        conv_labels = []
-        for ctid in dag.convergence_points:
-            for nk, node in dag.nodes.items():
-                if node.technique_id == ctid:
-                    conv_labels.append(f"{ctid} ({node.tactic})")
-                    break
-        lines.append(f"**Convergence:** {', '.join(conv_labels)}")
+    markdown = "\n".join(md_lines)
 
-    return "\n".join(lines)
+    return raw_mermaid, markdown
 
 
 def _toposort_layers(dag: AttackDAG) -> list[list[str]]:
@@ -1056,16 +1080,30 @@ class AttackPathVisualizer:
 
         try:
             parts: list[str] = []
+            output_artifacts: list[dict[str, Any]] = []
 
             if dag:
                 # Multi-path DAG rendering
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                art_dir = Path("workspace") / "artifacts"
+                art_dir.mkdir(parents=True, exist_ok=True)
+
                 if fmt in ("ascii", "both"):
-                    parts.append(_render_ascii_dag(dag, attack_type))
+                    ascii_text = _render_ascii_dag(dag, attack_type)
+                    parts.append(ascii_text)
+                    ascii_path = art_dir / f"attack_path_ascii_{ts}.txt"
+                    ascii_path.write_text(ascii_text, encoding="utf-8")
+                    output_artifacts.append({
+                        "artifact_id": f"art_ascii_{ts}",
+                        "artifact_type": "text",
+                        "file_path": str(ascii_path),
+                    })
+
                 if fmt == "compact":
                     path_count = len(dag.paths)
                     node_count = len(dag.nodes)
                     conv = len(dag.convergence_points)
-                    parts.append(
+                    compact_text = (
                         f"[{attack_type.upper()}] "
                         f"{path_count} path(s), {node_count} techniques, "
                         f"{conv} convergence point(s): "
@@ -1074,8 +1112,40 @@ class AttackPathVisualizer:
                             for n in dag.nodes.values()
                         )
                     )
+                    parts.append(compact_text)
+                    compact_path = art_dir / f"attack_path_compact_{ts}.txt"
+                    compact_path.write_text(compact_text, encoding="utf-8")
+                    output_artifacts.append({
+                        "artifact_id": f"art_compact_{ts}",
+                        "artifact_type": "text",
+                        "file_path": str(compact_path),
+                    })
+
                 if fmt in ("mermaid", "both"):
-                    parts.append(_render_mermaid_dag(dag, attack_type))
+                    raw_mermaid, markdown = _render_mermaid_dag(
+                        dag, attack_type
+                    )
+                    parts.append(markdown)
+
+                    # .mmd — raw Mermaid code, directly usable in
+                    # Mermaid CLI, VS Code preview, or mermaid.live
+                    mmd_path = art_dir / f"attack_path_mermaid_{ts}.mmd"
+                    mmd_path.write_text(raw_mermaid, encoding="utf-8")
+                    output_artifacts.append({
+                        "artifact_id": f"art_mermaid_{ts}",
+                        "artifact_type": "text",
+                        "file_path": str(mmd_path),
+                    })
+
+                    # .md — fenced Mermaid + path legend, renders in
+                    # GitHub / VS Code markdown preview
+                    md_path = art_dir / f"attack_path_mermaid_{ts}.md"
+                    md_path.write_text(markdown, encoding="utf-8")
+                    output_artifacts.append({
+                        "artifact_id": f"art_mermaid_md_{ts}",
+                        "artifact_type": "text",
+                        "file_path": str(md_path),
+                    })
 
                 visualization = "\n".join(parts)
                 return ToolResult(
@@ -1090,6 +1160,7 @@ class AttackPathVisualizer:
                         "branch_points": dag.branch_points,
                         "source": f"artifact:{artifact_id}",
                     },
+                    output_artifacts=output_artifacts or None,
                 )
 
             else:
@@ -1151,6 +1222,15 @@ class AttackPathVisualizer:
 
         if missing:
             summary += f" {missing} required stage(s) missing."
+
+        # List output files
+        artifacts = result.output_artifacts or []
+        if artifacts:
+            file_list = ", ".join(
+                a.get("file_path", a.get("artifact_id", "?"))
+                for a in artifacts
+            )
+            summary += f" Output files: {file_list}."
 
         # Include compact flow if available, truncate if too long
         viz = data.get("visualization", "")

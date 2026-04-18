@@ -398,12 +398,12 @@ class TestMultiRoleDAG:
         dag = _tool_mod._build_dag_from_attack_graph(
             multi_role_attack_graph, multi_role_mitre_mappings
         )
-        mermaid = _tool_mod._render_mermaid_dag(dag, "multi-role test")
+        _raw, mermaid = _tool_mod._render_mermaid_dag(dag, "multi-role test")
         assert "Initial Access" in mermaid
         assert "Persistence" in mermaid
         assert "T1078" in mermaid
-        # No em-dash should appear
-        assert "\u2014" not in mermaid
+        # No em-dash should appear in raw or markdown
+        assert "\u2014" not in _raw
 
     def test_ascii_contains_both_tactic_labels(
         self, multi_role_attack_graph, multi_role_mitre_mappings
@@ -424,7 +424,7 @@ class TestMultiRoleDAG:
         dag = _tool_mod._build_dag_from_attack_graph(
             multi_role_attack_graph, multi_role_mitre_mappings
         )
-        mermaid = _tool_mod._render_mermaid_dag(dag, "test")
+        _raw, mermaid = _tool_mod._render_mermaid_dag(dag, "test")
         # T1059 is convergence point — should get orange styling
         assert "fill:#ffe0b2" in mermaid
 
@@ -434,7 +434,7 @@ class TestMultiRoleDAG:
         dag = _tool_mod._build_dag_from_attack_graph(
             multi_role_attack_graph, multi_role_mitre_mappings
         )
-        mermaid = _tool_mod._render_mermaid_dag(dag, "test")
+        _raw, mermaid = _tool_mod._render_mermaid_dag(dag, "test")
         # Entry nodes should have bold path name tags
         assert "phishing-path" in mermaid
         assert "persistence-path" in mermaid
@@ -445,13 +445,17 @@ class TestMultiRoleDAG:
         dag = _tool_mod._build_dag_from_attack_graph(
             multi_role_attack_graph, multi_role_mitre_mappings
         )
-        mermaid = _tool_mod._render_mermaid_dag(dag, "test")
+        raw, mermaid = _tool_mod._render_mermaid_dag(dag, "test")
         assert "Entry Point" in mermaid
         assert "Mid-chain" in mermaid
         assert "Exit / Terminal" in mermaid
         assert "Convergence" in mermaid
         assert "style LE fill:#bbdefb" in mermaid
         assert "style legend fill:#f5f5f5" in mermaid
+        # raw_mermaid should NOT have fences
+        assert "```mermaid" not in raw
+        # markdown form should have fences
+        assert "```mermaid" in mermaid
 
     def test_node_key_helper(self):
         key = _tool_mod._node_key("T1078", "Initial Access")
