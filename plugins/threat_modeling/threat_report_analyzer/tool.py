@@ -21,6 +21,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from framework.logging.structured import log_llm_interaction
+from framework.plugins.protocol import ArtifactRef, QueryHints
+
 
 @dataclass
 class ToolResult:
@@ -315,6 +318,11 @@ class ThreatReportAnalyzer:
         # --- Build chunks based on file type ---
         chunks: list[Chunk] = []
 
+        # --- Native PDF path: send full document to LLM directly ---
+        native_pdf_succeeded = False
+        native_summary: str | None = None
+        native_techniques: list[str] = []
+
         if file_ext == ".pdf":
             file_obj = self._resolve_report_path(report_path, context)
             if not file_obj:
@@ -333,16 +341,107 @@ class ThreatReportAnalyzer:
                         f"({size_bytes // 1024 // 1024} MB): {report_path}"
                     ),
                 )
-            chunks = self._split_pdf_into_chunks(file_obj)
-            if not chunks:
-                content = self._read_report_content(report_path, context)
-                if not content:
-                    return ToolResult(
-                        ok=False,
-                        error_code="PARSE_FAILED",
-                        message=f"PDF text extraction failed: {report_path}",
+
+            # Attempt native PDF ingestion before text extraction
+            if (context and hasattr(context, "llm_query") and context.llm_query
+                    and hasattr(context.llm_query, "supports_native_document")
+                    and context.llm_query.supports_native_document("application/pdf")):
+                _log.info(
+                    "Native PDF ingestion available — attempting "
+                    "query_with_document() for %s", report_name,
+                )
+                native_prompt = SUMMARIZATION_PROMPT_TEMPLATE.format(
+                    report_name=report_name,
+                    report_type=report_type,
+                    max_words=max_words,
+                    focus_areas=(
+                        ", ".join(focus_areas) if focus_areas
+                        else "General threat overview"
+                    ),
+                    content=(
+                        "[Full PDF document is attached — analyze the "
+                        "complete document directly instead of this "
+                        "placeholder text.]"
+                    ),
+                )
+                # Build a lightweight ArtifactRef for the resolved file
+                artifact_ref = ArtifactRef(
+                    artifact_id=f"tra_native_{report_name}",
+                    artifact_type="pdf_report",
+                    file_path=str(file_obj),
+                    metadata={"mime_type": "application/pdf"},
+                )
+                try:
+                    native_response = context.llm_query.query_with_document(
+                        prompt=native_prompt,
+                        artifact=artifact_ref,
+                        system_context=(
+                            "You are a Senior Threat Intelligence Analyst. "
+                            "Produce a well-structured markdown summary."
+                        ),
+                        max_tokens=max(2048, min(8192, max_words * 8)),
+                        hints=QueryHints(
+                            tier="heavy",
+                            prefers_native_file=True,
+                        ),
                     )
-                chunks = self._split_text_into_chunks(content)
+                    log_llm_interaction(
+                        prompt=f"[tra native_pdf] {native_prompt[:500]}",
+                        response_text=native_response.text,
+                        model_id=(
+                            native_response.model_used
+                            or "threat_report_analyzer"
+                        ),
+                        error=(
+                            str(native_response.error)
+                            if not native_response.ok else None
+                        ),
+                    )
+                    if native_response.ok and native_response.text:
+                        native_summary = native_response.text.strip()
+                        native_techniques = self._extract_techniques(native_summary)
+                        native_pdf_succeeded = True
+                        _log.info(
+                            "Native PDF summarization succeeded "
+                            "(transport=%s, model=%s, words=%d, techniques=%d)",
+                            native_response.transport_path,
+                            native_response.model_used,
+                            len(native_summary.split()),
+                            len(native_techniques),
+                        )
+                    else:
+                        _log.warning(
+                            "Native PDF query returned failure — "
+                            "falling back to chunked text path "
+                            "| ok=%s, error=%r, model=%s, "
+                            "transport=%s, fallback_reason=%s",
+                            native_response.ok,
+                            native_response.error,
+                            native_response.model_used,
+                            native_response.transport_path,
+                            native_response.fallback_reason,
+                        )
+                except Exception as e:
+                    _log.error(
+                        "Native PDF path exception — "
+                        "falling back to chunked text path "
+                        "| exception_type=%s, message=%s",
+                        type(e).__name__, e,
+                        exc_info=True,
+                    )
+
+            # Fall back to text extraction + chunking if native path didn't work
+            if not native_pdf_succeeded:
+                chunks = self._split_pdf_into_chunks(file_obj)
+                if not chunks:
+                    content = self._read_report_content(report_path, context)
+                    if not content:
+                        return ToolResult(
+                            ok=False,
+                            error_code="PARSE_FAILED",
+                            message=f"PDF text extraction failed: {report_path}",
+                        )
+                    chunks = self._split_text_into_chunks(content)
         else:
             content = self._read_report_content(report_path, context)
             if not content:
@@ -365,33 +464,45 @@ class ThreatReportAnalyzer:
                 )
             chunks = self._split_text_into_chunks(content)
 
-        # --- Summarize each chunk ---
-        chunk_summaries: list[dict[str, Any]] = []
+        # --- Use native summary or fall back to chunk-by-chunk ---
         chunk_artifacts: list[dict[str, Any]] = []
 
-        is_single_chunk = len(chunks) == 1
-        for chunk in chunks:
-            cs = self._summarize_chunk(
-                chunk, report_name, report_type, focus_areas, context,
-                max_words=max_words if is_single_chunk else None,
+        if native_pdf_succeeded and native_summary:
+            final_summary = native_summary
+            relevant_techniques = native_techniques
+            effective_chunk_count = 1
+            _log.info(
+                "Skipping chunked text path — native PDF "
+                "summarization succeeded"
             )
-            chunk_summaries.append(cs)
-            if len(chunks) > 1:
-                artifact = self._write_chunk_artifact(cs, report_path, context)
-                if artifact:
-                    chunk_artifacts.append(artifact)
-
-        # --- Synthesize ---
-        if len(chunk_summaries) == 1:
-            final_summary = chunk_summaries[0]["summary"]
-            relevant_techniques = chunk_summaries[0].get("techniques", [])
         else:
-            final_summary = self._synthesize_summaries(
-                chunk_summaries, report_name, focus_areas, max_words, context
-            )
-            relevant_techniques = list(
-                {t for cs in chunk_summaries for t in cs.get("techniques", [])}
-            )
+            # Summarize each chunk
+            chunk_summaries: list[dict[str, Any]] = []
+
+            is_single_chunk = len(chunks) == 1
+            for chunk in chunks:
+                cs = self._summarize_chunk(
+                    chunk, report_name, report_type, focus_areas, context,
+                    max_words=max_words if is_single_chunk else None,
+                )
+                chunk_summaries.append(cs)
+                if len(chunks) > 1:
+                    artifact = self._write_chunk_artifact(cs, report_path, context)
+                    if artifact:
+                        chunk_artifacts.append(artifact)
+
+            # Synthesize
+            if len(chunk_summaries) == 1:
+                final_summary = chunk_summaries[0]["summary"]
+                relevant_techniques = chunk_summaries[0].get("techniques", [])
+            else:
+                final_summary = self._synthesize_summaries(
+                    chunk_summaries, report_name, focus_areas, max_words, context
+                )
+                relevant_techniques = list(
+                    {t for cs in chunk_summaries for t in cs.get("techniques", [])}
+                )
+            effective_chunk_count = len(chunks)
 
         key_findings = self._extract_key_findings(final_summary)
         word_count = len(final_summary.split())
@@ -443,7 +554,7 @@ class ThreatReportAnalyzer:
                     {
                         "report_path": report_path,
                         "summary_path": summary_relative,
-                        "chunk_count": len(chunks),
+                        "chunk_count": effective_chunk_count,
                         "word_count": word_count,
                         "summary": final_summary,
                         "key_findings": key_findings,
@@ -456,7 +567,11 @@ class ThreatReportAnalyzer:
                 ],
             },
             output_artifacts=output_artifacts or None,
-            message=f"Summarized {report_path} ({len(chunks)} chunk(s), {word_count} words)",
+            message=(
+                f"Summarized {report_path} "
+                f"({'native PDF' if native_pdf_succeeded else f'{effective_chunk_count} chunk(s)'}, "
+                f"{word_count} words)"
+            ),
         )
 
     def _search_reports(self, payload: dict[str, Any], context: Any) -> ToolResult:
@@ -795,6 +910,12 @@ class ThreatReportAnalyzer:
         if context and hasattr(context, "llm_query") and context.llm_query:
             try:
                 response = context.llm_query.query_text(prompt=prompt, max_tokens=out_tokens)
+                log_llm_interaction(
+                    prompt=f"[tra chunk {chunk.index}] {prompt[:500]}",
+                    response_text=response.text,
+                    model_id=response.model_used or "threat_report_analyzer",
+                    error=str(response.error) if not response.ok else None,
+                )
                 if response.ok:
                     summary_text = response.text.strip()
                     techniques = self._extract_techniques(summary_text)
@@ -839,6 +960,12 @@ class ThreatReportAnalyzer:
         if context and hasattr(context, "llm_query") and context.llm_query:
             try:
                 response = context.llm_query.query_text(prompt=prompt, max_tokens=4096)
+                log_llm_interaction(
+                    prompt=f"[tra synthesis] {prompt[:500]}",
+                    response_text=response.text,
+                    model_id=response.model_used or "threat_report_analyzer",
+                    error=str(response.error) if not response.ok else None,
+                )
                 if response.ok:
                     return response.text.strip()
             except Exception as e:

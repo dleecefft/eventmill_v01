@@ -504,3 +504,226 @@ Added a `CRITICAL — TACTIC ASSIGNMENT IN ATTACK PATHS` block with:
 - Monitor production runs for tactic mismatch warnings.
 - Consider adding `context_paths` filtering to `attack_path_visualizer`
   to render per-path subgraphs on demand.
+
+---
+
+## Session 4 — Artifact Persistence, Export Pipeline & ASCII Rewrite
+
+**Date:** 2026-04-18 (continued)
+**Primary Files Modified:** `plugins/threat_modeling/attack_path_visualizer/tool.py`, `framework/cli/shell.py`
+**Supporting Files:** `plugins/threat_modeling/attack_path_visualizer/tests/test_contract.py`
+
+### Problem 1 — Visualizer output not written to disk
+
+The `attack_path_visualizer` rendered Mermaid and ASCII output as in-memory
+strings returned inside `ToolResult.result["visualization"]`.  The only way
+to get the Mermaid code into a file was to copy-paste from the CLI summary.
+This was a significant usability gap:
+
+- Analysts couldn't open `.mmd` files directly in VS Code Mermaid Preview
+  or paste into mermaid.live without manual extraction.
+- The `artifacts` shell command never listed visualizer output because no
+  artifact was registered.
+- The `export` command couldn't upload visualizer files to the common
+  storage bucket because there was nothing to export.
+
+### Fix A — `_render_mermaid_dag()` return type split
+
+Refactored `_render_mermaid_dag()` to return a `(raw_mermaid, markdown)` tuple:
+
+- **`raw_mermaid`** — Pure Mermaid code with no fences.  Path descriptions
+  embedded as `%%` comments.  Directly consumable by Mermaid CLI, VS Code
+  Mermaid Preview, or `mermaid.live`.  Written to `.mmd` files.
+- **`markdown`** — Fenced `` ```mermaid `` block plus a human-readable path
+  legend.  Renders in GitHub and VS Code markdown preview.  Written to `.md`
+  files.
+
+Replaced em-dash (`—`) with regular dash (` - `) in Mermaid `%%` comment
+lines to avoid encoding issues when `.mmd` files are opened on Windows
+terminals with CP1252 default encoding.
+
+### Fix B — `execute()` writes files and declares `output_artifacts`
+
+Updated the DAG rendering branch in `execute()` to write each format to
+`workspace/artifacts/` with timestamped filenames and declare them in the
+`ToolResult.output_artifacts` list:
+
+| Format   | File                                      | Extension |
+|----------|-------------------------------------------|-----------|
+| ASCII    | `attack_path_ascii_<ts>.txt`              | `.txt`    |
+| Mermaid  | `attack_path_mermaid_<ts>.mmd`            | `.mmd`    |
+| Mermaid  | `attack_path_mermaid_<ts>.md`             | `.md`     |
+| Compact  | `attack_path_compact_<ts>.txt`            | `.txt`    |
+| Both     | ASCII `.txt` + Mermaid `.mmd` + `.md`     | all three |
+
+Each entry carries `artifact_id`, `artifact_type` ("text"), and `file_path`.
+
+### Fix C — `summarize_for_llm()` lists output files
+
+Updated the summary to append the file paths from `output_artifacts` so the
+CLI shows where files were saved:
+
+```
+Output files: workspace/artifacts/attack_path_mermaid_20260418_211840.mmd,
+workspace/artifacts/attack_path_mermaid_20260418_211840.md.
+```
+
+### Problem 2 — Plugin `output_artifacts` not registered in session
+
+Even after Fix B, the files wouldn't appear in the `artifacts` command.
+Root cause: `do_run()` in `shell.py` had two artifact registration paths,
+and neither handled `ToolResult.output_artifacts`:
+
+1. **`context.register_artifact()`** — a callback tools can call during
+   execution.  The visualizer doesn't use this (it writes its own files).
+2. **`_auto_persist_result()`** — fallback that creates a single `.md` or
+   `.json` artifact when **no** artifacts were registered during execution.
+   This produced one combined file, losing the individual `.mmd`/`.md`
+   separation.
+
+Neither path iterated `result.output_artifacts` to register the files the
+plugin explicitly declared.
+
+### Fix D — `do_run()` output_artifacts registration
+
+Added a loop in `do_run()` (lines 1069-1078) that runs immediately after a
+successful tool execution and **before** the `_auto_persist_result` fallback
+check:
+
+```python
+for oa in (result.output_artifacts or []):
+    oa_path = Path(oa.get("file_path", ""))
+    if oa_path.exists():
+        self.session_manager.register_artifact(
+            artifact_type=oa.get("artifact_type", "text"),
+            file_path=str(oa_path),
+            source_tool=tool_name,
+            metadata={"plugin_artifact_id": oa.get("artifact_id", "")},
+        )
+```
+
+Because these artifacts are now registered before the
+`_artifacts_after - _artifacts_before` diff check, the auto-persist fallback
+correctly sees that artifacts already exist and does not create a duplicate
+combined file.
+
+**Result:** `artifacts` command now lists each visualizer file individually.
+`export <artifact_id>` works for any of them.
+
+### Problem 3 — ASCII DAG unreadable and mis-ordered
+
+The ASCII renderer (`_render_ascii_dag`) used `_toposort_layers()` to flatten
+all paths into a single topological ordering, then packed unrelated nodes
+from different paths side-by-side on the same row.  For a 4-path graph:
+
+- Layer 2 showed T1059.007 (dprk), T1078 (scattered-spider), T1557
+  (cozy-bear), T1574.002 (china-nexus) in four adjacent boxes.
+- Connector arrows (`│ ▼`) only connected visually to the first column.
+- No way to trace which chain belonged to which path.
+- Ordering didn't match the Mermaid view, which separated paths visually.
+
+### Fix E — Per-path vertical chain ASCII renderer
+
+Rewrote `_render_ascii_dag()` to render each path as its own vertical chain:
+
+- **Path header** — double-line `═` separator with path name and description.
+- **BFS walk** — starts from each path's entry node and follows `leads_to`
+  edges only within nodes belonging to that path.  This preserves the
+  kill-chain ordering per path.
+- **Node boxes** — 64-char fixed width, showing `[technique_id] tactic`,
+  technique name, and role tags (`▷ ENTRY`, `■ EXIT`, `◆ CONVERGE`).
+- **Cross-references** — nodes appearing in multiple paths show
+  `also in: <other-path-id>` so analysts can trace convergence without
+  the visual confusion of the merged layout.
+- **Connectors** — clean `│ ▼` between consecutive nodes in each chain.
+
+Removed the side-by-side multi-column layout, the fork/merge arrow drawing
+code, and the branch annotation logic that was producing misleading visuals.
+
+### Test Updates
+
+- `_render_mermaid_dag` call sites in `test_contract.py` updated to unpack
+  the `(raw_mermaid, markdown)` tuple.
+- New assertions: no em-dash in raw Mermaid output; raw form has no fences;
+  markdown form has fences.
+- ASCII tests still pass against the new per-path layout (same content, new
+  structure).
+- **311 tests passing** (244 plugin + 67 framework), 0 failures.
+
+---
+
+## Lessons Learned — Incomplete Design / Dead Ends
+
+### 1. Diagrams were never written to the workspace
+
+The original visualizer design treated Mermaid and ASCII output purely as
+CLI display text — it lived only in `ToolResult.result["visualization"]`.
+There was no file persistence, no artifact registration, and no export path.
+This meant:
+
+- An analyst running a 30-minute ingestion + visualization pipeline had to
+  copy-paste the Mermaid code from the terminal to use it anywhere else.
+- The `artifacts` and `export` shell commands — which were explicitly designed
+  for this purpose — couldn't see visualizer output at all.
+- The `_auto_persist_result` fallback did write *something*, but it was a
+  single combined `.md` file containing whichever text field it found first,
+  losing the `.mmd` / `.md` separation and the ASCII `.txt` entirely.
+
+**Takeaway:** Any tool that produces files analysts need outside the CLI
+should write them to `workspace/artifacts/` and declare them in
+`output_artifacts`.  The `_auto_persist_result` fallback is a safety net for
+tools that return structured data, not a substitute for intentional file
+output.
+
+### 2. `output_artifacts` on `ToolResult` was a dead letter
+
+The `ToolResult` dataclass had an `output_artifacts` field, and the protocol
+documentation described it as the way plugins declare produced files.  But
+`do_run()` in the shell never read it.  The field existed on the object,
+was populated by the plugin, and was silently ignored.  The only artifact
+registration paths were:
+
+- `context.register_artifact()` — a callback, not used by most plugins.
+- `_auto_persist_result()` — a fallback that creates one file, ignoring
+  `output_artifacts` entirely.
+
+This is a classic case of designing an API surface (`output_artifacts`) but
+never wiring it into the consumer (`do_run`).  The fix was 8 lines of code.
+
+**Takeaway:** When adding a field to a protocol/result type, trace the
+complete data flow from producer to consumer.  If nothing reads the field,
+it doesn't exist from the user's perspective.
+
+### 3. ASCII side-by-side layout was the wrong abstraction
+
+The original ASCII renderer tried to mirror a general-purpose DAG layout:
+topological layering with side-by-side nodes at each depth.  This works for
+small graphs with clear fork/merge structure, but attack graphs typically
+have 3-5 mostly independent paths that only share 1-2 convergence nodes.
+
+The side-by-side layout made the graph *harder* to read, not easier:
+
+- Unrelated nodes from different paths appeared adjacent, implying a
+  relationship that didn't exist.
+- Connector arrows only worked for the leftmost column; other columns had
+  no visual connection to their predecessors.
+- The Mermaid view rendered the same data clearly because its layout engine
+  naturally separated disconnected subgraphs — the ASCII code tried to
+  replicate this manually and failed.
+
+**Takeaway:** Match the visualization to the data shape.  Attack paths are
+essentially independent chains with occasional shared nodes.  Rendering them
+as independent chains with cross-reference annotations is simpler to
+implement and far easier to read than a unified topology grid.
+
+### 4. Em-dash encoding breaks were silent
+
+Mermaid `%%` comment lines used em-dash (`—`) from path descriptions
+produced by the LLM.  These displayed correctly in the terminal and in
+Markdown preview, but caused mojibake (`â€"`) when `.mmd` files were opened
+in editors defaulting to CP1252.  This was only caught when inspecting the
+raw `.mmd` file output — a scenario that didn't exist until files were
+written to disk (see lesson 1).
+
+**Takeaway:** Once output goes to files, encoding assumptions change.
+Stick to ASCII-safe characters in machine-readable formats like `.mmd`.
