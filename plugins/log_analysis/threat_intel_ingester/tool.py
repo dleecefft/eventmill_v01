@@ -677,14 +677,32 @@ def _reconcile_mitre_mappings(
                 # Validate tactic against allowed tactics for this technique
                 entry_tactic = entry.get("tactic", "")
                 allowed = mitre_db[tid].get("tactics", [])
-                if entry_tactic and allowed and entry_tactic not in allowed:
-                    tactic_mismatch_count += 1
-                    logger.warning(
-                        "[RECONCILE] Tactic mismatch: %s assigned "
-                        "tactic %r but ATT&CK allows %s — "
-                        "keeping LLM assignment, may be hallucinated",
-                        tid, entry_tactic, allowed,
-                    )
+                if entry_tactic and allowed:
+                    # Case-insensitive lookup: LLM may write
+                    # "Command and Control" vs DB's "Command And Control"
+                    allowed_lower = {t.lower(): t for t in allowed}
+                    if entry_tactic in allowed:
+                        # Exact match — nothing to do
+                        pass
+                    elif entry_tactic.lower() in allowed_lower:
+                        # Case-only mismatch — auto-correct to DB casing
+                        canonical = allowed_lower[entry_tactic.lower()]
+                        logger.info(
+                            "[RECONCILE] Auto-corrected tactic casing for "
+                            "%s: %r -> %r",
+                            tid, entry_tactic, canonical,
+                        )
+                        entry["tactic"] = canonical
+                    else:
+                        # Genuine mismatch — flag in output
+                        tactic_mismatch_count += 1
+                        entry["tactic_mismatch"] = True
+                        logger.warning(
+                            "[RECONCILE] Tactic mismatch: %s assigned "
+                            "tactic %r but ATT&CK allows %s — "
+                            "keeping LLM assignment, flagged in output",
+                            tid, entry_tactic, allowed,
+                        )
             else:
                 entry["mitre_validated"] = False
                 unvalidated_count += 1
@@ -1593,13 +1611,18 @@ class ThreatIntelIngester:
                 "Check logs for LLM failure details."
             )
 
-        # Output artifact
+        # Output artifact + quick chart command
         artifacts = result.output_artifacts or []
         if artifacts:
             art = artifacts[0]
+            aid = art['artifact_id']
             parts.append(
-                f"Output artifact: {art['artifact_id']} "
+                f"Output artifact: {aid} "
                 f"({art['artifact_type']})."
+            )
+            parts.append(
+                f"Quick chart: run attack_path_visualizer "
+                f'{{\"artifact_id\": \"{aid}\", \"format\": \"mermaid\"}}'
             )
 
         return " ".join(parts)

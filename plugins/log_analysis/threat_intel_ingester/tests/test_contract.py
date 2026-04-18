@@ -738,6 +738,35 @@ class TestSummarizeMultiRole:
         assert "2 MITRE techniques" in summary
         assert "unique" not in summary
 
+    def test_quick_chart_command_in_summary(self, tool_instance):
+        """Summary should include a copy-paste run command for attack_path_visualizer."""
+        result = MockToolResult(
+            ok=True,
+            result={
+                "report_metadata": {
+                    "title": "Test", "page_count": 1,
+                    "artifact_type": "pdf_report",
+                },
+                "iocs": [],
+                "mitre_mappings": [],
+                "summary": {
+                    "total_iocs": 0, "ioc_breakdown": {},
+                    "high_priority_count": 0,
+                    "mitre_technique_count": 0,
+                    "unique_technique_count": 0,
+                    "confidence_distribution": {},
+                },
+            },
+            output_artifacts=[
+                {"artifact_id": "art_abc123", "artifact_type": "json_events"},
+            ],
+        )
+        summary = tool_instance.summarize_for_llm(result)
+        assert "Quick chart:" in summary
+        assert "attack_path_visualizer" in summary
+        assert "art_abc123" in summary
+        assert '"format": "mermaid"' in summary
+
 
 # ---------------------------------------------------------------------------
 # Test 14: Tactic progression fix
@@ -895,3 +924,65 @@ class TestTacticProgression:
         tactics = {m["tactic"] for m in t1078_entries}
         assert "Initial Access" in tactics
         assert len(tactics) == 2  # two distinct tactics
+
+
+# ---------------------------------------------------------------------------
+# Test 15: Tactic case-sensitivity and mismatch flagging
+# ---------------------------------------------------------------------------
+
+
+class TestTacticValidation:
+    """Verify case-insensitive tactic comparison and tactic_mismatch flag."""
+
+    def test_auto_corrects_tactic_casing(self):
+        """'Command and Control' should be auto-corrected to 'Command And Control'."""
+        all_mitre = [
+            {"technique_id": "T1219", "technique_name": "Remote Access Software",
+             "tactic": "Command and Control", "confidence": "inferred",
+             "report_context": "test"},
+        ]
+        result = _tool_mod._reconcile_mitre_mappings(all_mitre, {"paths": []})
+        entry = result[0]
+        assert entry["tactic"] == "Command And Control"
+        assert entry.get("mitre_validated") is True
+        assert "tactic_mismatch" not in entry
+
+    def test_exact_match_no_flag(self):
+        """Exact tactic match should not add tactic_mismatch."""
+        all_mitre = [
+            {"technique_id": "T1190", "technique_name": "Exploit Public-Facing Application",
+             "tactic": "Initial Access", "confidence": "inferred",
+             "report_context": "test"},
+        ]
+        result = _tool_mod._reconcile_mitre_mappings(all_mitre, {"paths": []})
+        entry = result[0]
+        assert entry["tactic"] == "Initial Access"
+        assert entry.get("mitre_validated") is True
+        assert "tactic_mismatch" not in entry
+
+    def test_genuine_mismatch_flagged(self):
+        """T1078 with 'Lateral Movement' should get tactic_mismatch=True."""
+        all_mitre = [
+            {"technique_id": "T1078", "technique_name": "Valid Accounts",
+             "tactic": "Lateral Movement", "confidence": "inferred",
+             "report_context": "test"},
+        ]
+        result = _tool_mod._reconcile_mitre_mappings(all_mitre, {"paths": []})
+        entry = result[0]
+        assert entry["tactic"] == "Lateral Movement"  # kept as-is
+        assert entry.get("mitre_validated") is True
+        assert entry.get("tactic_mismatch") is True
+
+    def test_mismatch_absent_when_no_db(self):
+        """When MITRE DB is empty, tactic_mismatch should not be set."""
+        import unittest.mock as mock
+        all_mitre = [
+            {"technique_id": "T1078", "technique_name": "Valid Accounts",
+             "tactic": "Lateral Movement", "confidence": "inferred",
+             "report_context": "test"},
+        ]
+        with mock.patch.object(_tool_mod, "_get_mitre_db", return_value={}):
+            result = _tool_mod._reconcile_mitre_mappings(all_mitre, {"paths": []})
+        entry = result[0]
+        assert "tactic_mismatch" not in entry
+        assert "mitre_validated" not in entry

@@ -32,17 +32,51 @@ For **PDF reports**, the plugin now supports **native PDF ingestion via the Gemi
    - **Backfill** technique IDs referenced in attack graphs but missing from mappings
    - **Validate** every technique ID and mark non-ATT&CK IDs with `(non-ATT&CK ID)`
      and `"mitre_validated": false` so analysts know when an ID was LLM-generated
-   - **Validate tactics** against each technique's allowed tactics, logging
-     warnings for mismatches that may indicate LLM hallucinations
+   - **Validate tactics** against each technique's allowed tactics. Case
+     differences are auto-corrected (e.g. "Command and Control" →
+     "Command And Control"). Genuine mismatches are flagged with
+     `"tactic_mismatch": true` in the output entry (see below).
 
    ### Multi-Role Tactic Mappings
 
-   The `mitre_mappings` array uses `(technique_id, tactic)` as the identity key.
+   The `mitre_mappings` array uses **`(technique_id, tactic)` as the identity
+   key**. Consumers **must** consider both fields together — filtering or
+   grouping by `technique_id` alone flattens the tactical context and loses
+   the per-path role distinctions that the attack graph encodes.
+
    When the same technique serves different roles in different attack paths
    (e.g., T1078 as "Initial Access" in one path and "Persistence" in another),
    it appears as multiple entries with a `context_paths` field listing the
    attack-graph path IDs where each role was observed. Techniques with a
    single role produce a single entry as before — the change is purely additive.
+
+   A **kill-chain progression rule** automatically reassigns entry-point-only
+   tactics (Initial Access, Reconnaissance, Resource Development) on non-first
+   attack-graph steps to the best alternative from the technique's valid
+   tactics, preventing the MITRE matrix from being artificially flattened by
+   repeated "Initial Access" labels.
+
+   ### Tactic Mismatch Labeling
+
+   When the reconciler detects that an assigned tactic is **not** in the
+   technique's official ATT&CK tactic list (even after case-insensitive
+   comparison), the entry is flagged:
+
+   ```json
+   {
+     "technique_id": "T1078",
+     "tactic": "Lateral Movement",
+     "mitre_validated": true,
+     "tactic_mismatch": true
+   }
+   ```
+
+   - `mitre_validated: true` — the technique ID exists in ATT&CK.
+   - `tactic_mismatch: true` — the tactic is **not** in the technique's
+     allowed list. The mapping may still describe real attacker behavior, but
+     the tactic label may be an LLM hallucination. Analysts should treat these
+     entries with extra scrutiny.
+   - **Absent** `tactic_mismatch` — tactic matches an allowed ATT&CK tactic.
 
    Re-run the script after a new ATT&CK version is released to pick up new
    techniques. The plugin works without the file but skips enrichment and
@@ -171,8 +205,12 @@ If the LLM connection is unavailable, the plugin falls back to regex-only extrac
 ## Example summarize_for_llm() Output
 
 ```
-Ingested pdf_report (12 pages): APT29 Campaign Analysis. Attributed to APT29 (high confidence), campaign: SolarWinds Follow-on. Extracted 47 IOCs: 23 ips, 12 domains, 8 hash_sha256s, 4 cves. 3 IOCs flagged as high-priority. Mapped to 5 unique techniques across 7 tactical roles: T1566.001 (Spearphishing Attachment), T1059.001 (PowerShell), T1078 (Initial Access, Persistence), T1486 (Data Encrypted for Impact), T1048.003 (Exfiltration Over Unencrypted Protocol). Attack graph: 2 path(s) identified, converging at T1059.001. Output artifact: art_0002 (json_events).
+Ingested pdf_report (12 pages): APT29 Campaign Analysis. Attributed to APT29 (high confidence), campaign: SolarWinds Follow-on. Extracted 47 IOCs: 23 ips, 12 domains, 8 hash_sha256s, 4 cves. 3 IOCs flagged as high-priority. Mapped to 5 unique techniques across 7 tactical roles: T1566.001 (Spearphishing Attachment), T1059.001 (PowerShell), T1078 (Initial Access, Persistence), T1486 (Data Encrypted for Impact), T1048.003 (Exfiltration Over Unencrypted Protocol). Attack graph: 2 path(s) identified, converging at T1059.001. Output artifact: art_0002 (json_events). Quick chart: run attack_path_visualizer {"artifact_id": "art_0002", "format": "mermaid"}
 ```
+
+The **Quick chart** command at the end lets an analyst immediately generate a
+Mermaid attack path diagram from the ingester output. Copy the command, adjust
+the artifact ID if needed, and paste it into the Event Mill shell.
 
 ## Limitations
 
