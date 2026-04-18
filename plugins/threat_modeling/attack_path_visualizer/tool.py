@@ -744,17 +744,15 @@ def _toposort_layers(dag: AttackDAG) -> list[list[str]]:
 
 
 def _render_ascii_dag(dag: AttackDAG, attack_type: str) -> str:
-    """Render a multi-path attack graph as unified ASCII topology.
+    """Render a multi-path attack graph as per-path ASCII chains.
 
-    Nodes are arranged in topological layers so branching and convergence
-    are visually apparent.  Each technique appears exactly once.
+    Each path is rendered as its own vertical chain, matching the visual
+    flow of the Mermaid output.  Shared nodes (convergence points) are
+    annotated with cross-references to the other paths that share them.
     """
-    box_width = 100
+    box_width = 64
     lines: list[str] = []
-    # convergence/branch are plain technique_ids from the LLM;
-    # entry/exit are composite keys computed by the builder.
     convergence_set = set(dag.convergence_points)
-    branch_set = set(dag.branch_points)
     entry_set = set(dag.entry_points)
     exit_set = set(dag.exit_points)
 
@@ -765,176 +763,94 @@ def _render_ascii_dag(dag: AttackDAG, attack_type: str) -> str:
     lines.append("|" + f" ATTACK GRAPH - {attack_type.upper()} ".center(header_w) + "|")
     lines.append("|" + f" {len(dag.paths)} path(s), {len(dag.nodes)} techniques ".center(header_w) + "|")
     lines.append("+" + "=" * header_w + "+")
-    lines.append("")
 
-    # --- Path legend ---
-    for p in dag.paths:
-        pid = p.get("path_id", "?")
-        desc = p.get("description", "")
-        lines.append(f"  Path: {pid}" + (f" - {desc}" if desc else ""))
-    lines.append("")
+    # --- Render each path as a separate vertical chain ---
+    for path_dict in dag.paths:
+        pid = path_dict.get("path_id", "?")
+        desc = path_dict.get("description", "")
 
-    # --- Topological layers ---
-    layers = _toposort_layers(dag)
+        lines.append("")
+        lines.append("  " + "\u2550" * box_width)
+        lines.append(f"  PATH: {pid}")
+        if desc:
+            # Wrap long descriptions
+            while desc:
+                lines.append(f"  {desc[:box_width]}")
+                desc = desc[box_width:]
+        lines.append("  " + "\u2550" * box_width)
 
-    for layer_idx, layer_tids in enumerate(layers):
-        # Determine layer annotation
-        layer_nodes = [dag.nodes[tid] for tid in layer_tids]
-        is_convergence = any(
-            dag.nodes[nk].technique_id in convergence_set
-            for nk in layer_tids
-        )
-        is_branch = any(
-            dag.nodes[nk].technique_id in branch_set
-            for nk in layer_tids
-        )
-        is_entry = all(nk in entry_set for nk in layer_tids)
-        is_exit = all(nk in exit_set for nk in layer_tids)
+        # Collect node keys belonging to this path
+        path_node_set = {nk for nk, n in dag.nodes.items() if pid in n.path_ids}
 
-        if len(layer_tids) > 1:
-            # Multiple nodes on this layer — show them side-by-side
-            node_width = max(40, (box_width - 4 * len(layer_tids)) // len(layer_tids))
-        else:
-            node_width = box_width
+        # Find this path's entry node(s)
+        path_entries = [nk for nk in path_node_set if nk in entry_set]
+        if not path_entries:
+            # Fallback: nodes with no in-path predecessors
+            targeted = set()
+            for nk in path_node_set:
+                for t in dag.nodes[nk].leads_to:
+                    if t in path_node_set:
+                        targeted.add(t)
+            path_entries = [nk for nk in path_node_set if nk not in targeted]
 
-        # --- Incoming connector from previous layer ---
-        if layer_idx > 0:
-            prev_tids = layers[layer_idx - 1]
-            # Count edges from previous layer into this layer
-            edges_in: list[tuple[str, str]] = []
-            for ptid in prev_tids:
-                for target in dag.nodes[ptid].leads_to:
-                    if target in layer_tids:
-                        edges_in.append((ptid, target))
+        # BFS walk from entries following leads_to within path nodes
+        ordered: list[str] = []
+        visited: set[str] = set()
+        queue = list(path_entries)
+        while queue:
+            nk = queue.pop(0)
+            if nk in visited:
+                continue
+            visited.add(nk)
+            ordered.append(nk)
+            for target in dag.nodes[nk].leads_to:
+                if target in path_node_set and target not in visited:
+                    queue.append(target)
 
-            if is_convergence and len(prev_tids) > 1:
-                # Multiple sources converging — draw merge arrows
-                half = box_width // 2
-                lines.append(" " * 10 + "\u2502" + " " * (half - 11) + "\u2502")
-                lines.append(
-                    " " * 10
-                    + "\u2514"
-                    + "\u2500" * ((half - 12) // 2)
-                    + "\u252c"
-                    + "\u2500" * ((half - 12) // 2)
-                    + "\u2518"
-                )
-                lines.append(" " * 10 + " " * ((half - 12) // 2) + " \u25bc")
-            elif len(layer_tids) > 1 and is_branch:
-                # Previous layer fans out — draw fork arrows
-                half = box_width // 2
-                lines.append(" " * (half // 2 + 8) + "\u2502")
-                lines.append(
-                    " " * 10
-                    + "\u250c"
-                    + "\u2500" * ((half - 12) // 2)
-                    + "\u2534"
-                    + "\u2500" * ((half - 12) // 2)
-                    + "\u2510"
-                )
-                lines.append(
-                    " " * 10
-                    + "\u25bc"
-                    + " " * (half - 12)
-                    + "\u25bc"
-                )
-            else:
-                center_pad = " " * (node_width // 2 + 2)
-                lines.append(f"  {center_pad}\u2502")
-                lines.append(f"  {center_pad}\u25bc")
+        # Append any remaining unvisited path nodes
+        for nk in path_node_set:
+            if nk not in visited:
+                ordered.append(nk)
 
-        # --- Layer annotation ---
-        annotation = ""
-        if is_entry:
-            annotation = " \u25b7 ENTRY"
-        if is_exit:
-            annotation = " \u25a0 EXIT"
-        if is_convergence:
-            annotation += " \u25c6 CONVERGE"
-        if is_branch:
-            annotation += " \u25c7 BRANCH"
-
-        if len(layer_tids) == 1:
-            # --- Single node layer ---
-            nk = layer_tids[0]
+        for idx, nk in enumerate(ordered):
             node = dag.nodes[nk]
-            tactic = node.tactic or "?"
-            name = node.technique_name or ""
-            path_labels = ", ".join(node.path_ids) if node.path_ids else ""
 
+            # Connector between nodes
+            if idx > 0:
+                lines.append(f"  {'':6s}\u2502")
+                lines.append(f"  {'':6s}\u25bc")
+
+            # Annotation tags
+            tags: list[str] = []
+            if nk in entry_set:
+                tags.append("\u25b7 ENTRY")
+            if nk in exit_set:
+                tags.append("\u25a0 EXIT")
+            if node.technique_id in convergence_set:
+                tags.append("\u25c6 CONVERGE")
+            tag_str = " ".join(tags)
+
+            # Box
             lines.append("  +" + "-" * box_width + "+")
-            header = f" [{node.technique_id}] {tactic}: {name}"
-            if annotation:
-                header += annotation
+            header = f" [{node.technique_id}] {node.tactic or '?'}"
+            if tag_str:
+                header += f"  {tag_str}"
             lines.append("  |" + header.ljust(box_width) + "|")
-            if path_labels:
-                lines.append("  |" + f"    Paths: {path_labels}".ljust(box_width) + "|")
-            if node.leads_to:
-                target_tids = [
-                    dag.nodes[t].technique_id
-                    for t in node.leads_to if t in dag.nodes
-                ]
-                targets = ", ".join(target_tids)
-                lines.append("  |" + f"    \u2514\u2500\u2500\u25b6 {targets}".ljust(box_width) + "|")
+            if node.technique_name:
+                lines.append("  |" + f"   {node.technique_name[:box_width - 4]}".ljust(box_width) + "|")
+            # Cross-reference for shared nodes
+            other_paths = [p for p in node.path_ids if p != pid]
+            if other_paths:
+                xref = ", ".join(other_paths)[:box_width - 16]
+                lines.append("  |" + f"   also in: {xref}".ljust(box_width) + "|")
+            # Controls
             for ctrl in node.controls[:3]:
                 cn = ctrl.get("control_name", "?")
                 eff = ctrl.get("effectiveness_rating", "?")
-                lines.append("  |" + f"    \u2713 {cn} ({eff})".ljust(box_width) + "|")
+                lines.append("  |" + f"   \u2713 {cn} ({eff})"[:box_width].ljust(box_width) + "|")
             for gap in node.gaps_detected[:2]:
-                lines.append("  |" + f"    \u2717 GAP: {gap}".ljust(box_width) + "|")
+                lines.append("  |" + f"   \u2717 GAP: {gap}"[:box_width].ljust(box_width) + "|")
             lines.append("  +" + "-" * box_width + "+")
-
-        else:
-            # --- Multiple nodes side-by-side ---
-            # Build column content for each node
-            columns: list[list[str]] = []
-            for nk in layer_tids:
-                node = dag.nodes[nk]
-                tactic = node.tactic or "?"
-                name = node.technique_name or ""
-                col: list[str] = []
-                col.append(f"[{node.technique_id}] {tactic}")
-                if name:
-                    col.append(f"  {name[:node_width - 4]}")
-                if node.leads_to:
-                    target_tids = [
-                        dag.nodes[t].technique_id
-                        for t in node.leads_to if t in dag.nodes
-                    ]
-                    col.append(f"  \u2514\u25b6 {', '.join(target_tids)}")
-                for ctrl in node.controls[:2]:
-                    cn = ctrl.get("control_name", "?")
-                    eff = ctrl.get("effectiveness_rating", "?")
-                    col.append(f"  \u2713 {cn[:node_width-10]} ({eff})")
-                for gap in node.gaps_detected[:1]:
-                    col.append(f"  \u2717 GAP: {gap[:node_width-12]}")
-                columns.append(col)
-
-            # Pad columns to same height
-            max_rows = max(len(c) for c in columns)
-            for col in columns:
-                while len(col) < max_rows:
-                    col.append("")
-
-            # Print annotation line
-            if annotation:
-                lines.append(f"  {annotation.strip()}")
-
-            # Print top border
-            top_border = "  " + "   ".join("+" + "-" * node_width + "+" for _ in columns)
-            lines.append(top_border)
-
-            # Print rows
-            for row_idx in range(max_rows):
-                row_parts = []
-                for col in columns:
-                    cell = col[row_idx][:node_width]
-                    row_parts.append("|" + (" " + cell).ljust(node_width) + "|")
-                lines.append("  " + "   ".join(row_parts))
-
-            # Print bottom border
-            bot_border = "  " + "   ".join("+" + "-" * node_width + "+" for _ in columns)
-            lines.append(bot_border)
 
     # --- Unprotected stages warning ---
     lines.append("")
