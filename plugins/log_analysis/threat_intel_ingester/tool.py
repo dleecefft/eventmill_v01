@@ -218,8 +218,8 @@ def extract_iocs_regex(
 # Chunked LLM processing helpers
 # ---------------------------------------------------------------------------
 
-_MAX_IOC_PER_CHUNK: int = 30        # IOC candidates per LLM call
-_MAX_TEXT_CHARS_PER_CHUNK: int = 3_500  # Report text chars per LLM call
+_MAX_IOC_PER_CHUNK: int = 50        # IOC candidates per LLM call
+_MAX_TEXT_CHARS_PER_CHUNK: int = 6_000  # Report text chars per LLM call
 
 
 def _chunk_text(text: str, max_chars: int = _MAX_TEXT_CHARS_PER_CHUNK) -> list[str]:
@@ -297,15 +297,92 @@ def _merge_llm_chunk_results(chunk_results: list[dict]) -> dict:
 
 
 def _parse_llm_json(response_text: str) -> dict | None:
-    """Strip markdown code fences and parse JSON from LLM response."""
+    """Strip markdown code fences and parse JSON from LLM response.
+
+    Logs the exact parse error on failure.  If the JSON appears truncated
+    (common when the model hits its output-token limit), attempts
+    best-effort repair by closing unmatched brackets.
+    """
+    _log = logging.getLogger("eventmill.plugin.threat_intel_ingester")
     raw_resp = response_text.strip()
-    if raw_resp.startswith("```"):
+
+    had_fences = raw_resp.startswith("```")
+    if had_fences:
         raw_resp = re.sub(r"^```(?:json)?\s*\n?", "", raw_resp)
         raw_resp = re.sub(r"\n?```\s*$", "", raw_resp)
+
+    text = raw_resp.strip()
+    resp_len = len(text)
+
+    # --- Fast path: direct parse ---
     try:
-        return json.loads(raw_resp.strip())
-    except (json.JSONDecodeError, ValueError):
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        _log.warning(
+            "JSON parse error at char %d (line %d col %d): %s "
+            "| response_length=%d, had_fences=%s, "
+            "last_100_chars=%r",
+            exc.pos, exc.lineno, exc.colno, exc.msg,
+            resp_len, had_fences,
+            text[-100:] if resp_len > 100 else text,
+        )
+    except ValueError as exc:
+        _log.warning(
+            "JSON ValueError: %s | response_length=%d",
+            exc, resp_len,
+        )
+
+    # --- Slow path: repair truncated JSON ---
+    repaired = _repair_truncated_json(text)
+    if repaired is not None:
+        _log.info(
+            "Recovered truncated JSON via bracket repair "
+            "(original_length=%d, keys=%s)",
+            resp_len, list(repaired.keys()),
+        )
+        return repaired
+
+    _log.warning(
+        "JSON repair also failed "
+        "| response_length=%d, starts_with_brace=%s",
+        resp_len, text[:1] == '{',
+    )
+    return None
+
+
+def _repair_truncated_json(text: str) -> dict | None:
+    """Best-effort repair of JSON truncated by LLM output-token limits.
+
+    Scans backward from the end of *text* looking for the last ``}`` or
+    ``]`` that, when followed by the right number of closing brackets,
+    produces a valid JSON object.  Tries up to 30 candidate positions.
+    """
+    if not text.startswith('{'):
         return None
+
+    attempts = 0
+    for i in range(len(text) - 1, max(0, len(text) - 4000), -1):
+        if text[i] not in ('}', ']'):
+            continue
+        if attempts >= 30:
+            break
+        attempts += 1
+
+        candidate = text[:i + 1]
+        need_brackets = candidate.count('[') - candidate.count(']')
+        need_braces = candidate.count('{') - candidate.count('}')
+        if need_brackets < 0 or need_braces < 0:
+            continue
+
+        closer = ']' * need_brackets + '}' * need_braces
+        try:
+            obj = json.loads(candidate + closer)
+            if isinstance(obj, dict):
+                return obj
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +686,7 @@ class ThreatIntelIngester:
                             "You are a threat intelligence analyst. "
                             "Respond only with valid JSON."
                         ),
-                        max_tokens=8192,
+                        max_tokens=16384,
                         grounding_data=grounding,
                         hints=QueryHints(
                             tier="heavy",
@@ -661,20 +738,40 @@ class ThreatIntelIngester:
                             native_pdf_succeeded = True
                         else:
                             logger.warning(
-                                "Native PDF response not valid JSON "
-                                "— falling back to chunked text path"
+                                "Native PDF JSON parse failed — "
+                                "falling back to chunked text path "
+                                "| response_length=%d, model=%s, "
+                                "transport=%s, token_usage=%s, "
+                                "first_200=%r, last_200=%r",
+                                len(native_response.text),
+                                native_response.model_used,
+                                native_response.transport_path,
+                                native_response.token_usage,
+                                native_response.text[:200],
+                                native_response.text[-200:],
                             )
                     else:
                         logger.warning(
-                            "Native PDF query failed (ok=%s, error=%s) "
-                            "— falling back to chunked text path",
-                            native_response.ok, native_response.error,
+                            "Native PDF query returned failure — "
+                            "falling back to chunked text path "
+                            "| ok=%s, error=%r, model=%s, "
+                            "transport=%s, fallback_reason=%s, "
+                            "has_text=%s, text_length=%d",
+                            native_response.ok,
+                            native_response.error,
+                            native_response.model_used,
+                            native_response.transport_path,
+                            native_response.fallback_reason,
+                            native_response.text is not None,
+                            len(native_response.text or ""),
                         )
                 except Exception as e:
-                    logger.warning(
-                        "Native PDF path exception: %s: %s "
-                        "— falling back to chunked text path",
+                    logger.error(
+                        "Native PDF path exception — "
+                        "falling back to chunked text path "
+                        "| exception_type=%s, message=%s",
                         type(e).__name__, e,
+                        exc_info=True,
                     )
 
             # Split large inputs into chunks to stay within LLM context limits.
@@ -701,6 +798,9 @@ class ThreatIntelIngester:
             )
 
             chunk_results: list[dict] = []
+            chunk_json_failures = 0
+            chunk_llm_failures = 0
+            chunk_exceptions = 0
             for i in range(n_chunks):
                 ioc_batch = ioc_batches[i] if i < len(ioc_batches) else []
                 text_chunk = text_chunks[i] if i < len(text_chunks) else ""
@@ -739,7 +839,7 @@ class ThreatIntelIngester:
                             "You are a threat intelligence analyst. "
                             "Respond only with valid JSON."
                         ),
-                        max_tokens=3000,
+                        max_tokens=4096,
                         grounding_data=grounding,
                         hints=QueryHints(
                             tier="light",
@@ -785,10 +885,16 @@ class ThreatIntelIngester:
                             )
                             chunk_results.append(parsed)
                         else:
+                            chunk_json_failures += 1
                             logger.warning(
-                                "[DIAG] Chunk %d/%d: JSON parse FAILED. "
-                                "First 500 chars: %.500s",
-                                i + 1, n_chunks, llm_response.text[:500],
+                                "[DIAG] Chunk %d/%d: JSON parse FAILED "
+                                "| response_length=%d, model=%s, "
+                                "first_200=%r, last_200=%r",
+                                i + 1, n_chunks,
+                                len(llm_response.text),
+                                llm_response.model_used,
+                                llm_response.text[:200],
+                                llm_response.text[-200:],
                             )
                     else:
                         logger.warning(
@@ -797,16 +903,27 @@ class ThreatIntelIngester:
                             i + 1, n_chunks, llm_response.ok,
                             bool(llm_response.text), llm_response.error,
                         )
+                        chunk_llm_failures += 1
                         logger.warning(
-                            "[DIAG] Chunk %d/%d FAILED RESPONSE text first 500: %.500s",
+                            "[DIAG] Chunk %d/%d FAILED RESPONSE "
+                            "| model=%s, error=%r, "
+                            "has_text=%s, text_length=%d, "
+                            "first_200=%r",
                             i + 1, n_chunks,
-                            (llm_response.text or "(none)")[:500],
+                            llm_response.model_used,
+                            llm_response.error,
+                            llm_response.text is not None,
+                            len(llm_response.text or ""),
+                            (llm_response.text or "")[:200],
                         )
 
                 except Exception as e:
-                    logger.warning(
-                        "[DIAG] Chunk %d/%d EXCEPTION: %s: %s",
+                    chunk_exceptions += 1
+                    logger.error(
+                        "[DIAG] Chunk %d/%d EXCEPTION "
+                        "| type=%s, message=%s",
                         i + 1, n_chunks, type(e).__name__, e,
+                        exc_info=True,
                     )
 
             logger.info(
@@ -834,8 +951,11 @@ class ThreatIntelIngester:
                 attack_graph = merged.get("attack_graph", {})
             else:
                 logger.warning(
-                    "[DIAG] All %d LLM chunks failed — falling back to regex-only.",
-                    n_chunks,
+                    "[DIAG] All %d LLM chunks failed — "
+                    "json_parse_failures=%d, llm_call_failures=%d, "
+                    "exceptions=%d — falling back to regex-only.",
+                    n_chunks, chunk_json_failures,
+                    chunk_llm_failures, chunk_exceptions,
                 )
 
         # If LLM refinement didn't produce results, use regex baseline
