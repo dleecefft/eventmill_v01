@@ -745,7 +745,46 @@ class EventMillShell(cmd.Cmd):
         print(f"  File: {file_path.name}")
         if source_info:
             print(f"  Source: {source_info}")
-    
+
+        # Auto-parse PCAP files (mirrors event_mill v1 load_pcap behaviour)
+        if artifact_type == "pcap":
+            self._auto_parse_pcap(file_path)
+
+    def _auto_parse_pcap(self, file_path: Path) -> None:
+        """Automatically parse a PCAP with scapy so downstream tools work immediately.
+
+        Mirrors event_mill v1 where ``load_pcap`` was a single atomic operation.
+        Uses the process-global session storage so the loader's module and the
+        shell's module see the same PcapSession singleton.
+        """
+        try:
+            from plugins.network_forensics.pcap_metadata_summary.tool import (
+                parse_pcap_file,
+                set_pcap_session,
+                _format_bytes,
+                _format_duration,
+                is_internal,
+            )
+
+            print(f"  Parsing PCAP with scapy...")
+            session = parse_pcap_file(str(file_path))
+            set_pcap_session(session)
+
+            duration = session.duration_seconds
+            internal = sum(1 for ip in session.unique_ips if is_internal(ip))
+            external = len(session.unique_ips) - internal
+
+            print(
+                f"  ✓ {session.packet_count:,} packets, "
+                f"{len(session.unique_ips)} IPs ({internal} internal, {external} external), "
+                f"duration {_format_duration(duration)}"
+            )
+            print(f"  PCAP ready — use 'run pcap_metadata_summary {{\"mode\": \"summary\"}}' or any pcap tool.")
+        except ImportError:
+            print("  Note: pcap_metadata_summary plugin not available; manual 'run' with mode=load required.")
+        except Exception as e:
+            print(f"  Warning: auto-parse failed ({e}); use 'run pcap_metadata_summary {{\"mode\": \"load\", \"file_path\": \"{file_path.name}\"}}' manually.")
+
     def do_artifacts(self, arg: str) -> None:
         """List loaded artifacts in the current session.
         
