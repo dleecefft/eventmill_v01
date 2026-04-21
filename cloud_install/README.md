@@ -58,10 +58,14 @@ This will:
 Then configure:
 
 ```bash
-nano ~/.eventmill/deploy.env     # Set project ID, region, secret names
+nano ~/.eventmill/deploy.env     # Set GOOGLE_CLOUD_PROJECT and EVENTMILL_BUCKET_PREFIX (required)
 gcloud auth login                # Authenticate to GCP
 gcloud config set project YOUR_PROJECT_ID
 ```
+
+> **Important:** `EVENTMILL_BUCKET_PREFIX` must match the prefix used when running
+> `provision-gcp-project.sh`. Storage resolution will silently use the wrong buckets
+> if this value is missing or mismatched.
 
 ## Deploy Commands
 
@@ -98,6 +102,23 @@ gcloud builds submit \
     .
 ```
 
+To override the bucket prefix or region at build time, pass substitutions:
+
+```bash
+gcloud builds submit \
+    --project="${GOOGLE_CLOUD_PROJECT}" \
+    --config=cloud_install/cloudbuild.yaml \
+    --substitutions="_BUCKET_PREFIX=evtm_v01,_REGION=us-central1" \
+    .
+```
+
+Substitution defaults (edit `cloudbuild.yaml` to change permanently):
+
+| Substitution | Default | Description |
+|---|---|---|
+| `_REGION` | `northamerica-northeast2` | Cloud Run region |
+| `_BUCKET_PREFIX` | `eventmill` | GCS bucket prefix — must match provisioned buckets |
+
 ## Files
 
 | File | Purpose |
@@ -124,10 +145,10 @@ bash cloud_install/provision-secrets.sh
 ```
 
 This creates everything the project needs: APIs enabled (including
-`apikeys.googleapis.com` for key creation), a dedicated service account
-with least-privilege IAM roles, GCS buckets (per-pillar + common) with
-lifecycle rules, Artifact Registry, and Secret Manager entries for dual
-Gemini API keys.
+`apikeys.googleapis.com` for key creation and `logging.googleapis.com` for
+audit logging), a dedicated service account with least-privilege IAM roles,
+GCS buckets (per-pillar + common) with lifecycle rules, Artifact Registry,
+and Secret Manager entries for dual Gemini API keys.
 
 ## Storage Architecture
 
@@ -283,6 +304,32 @@ deleting them.
 
 ## Local Image Testing (on deploy server)
 
+Before running, set at minimum:
+
+```bash
+export EVENTMILL_BUCKET_PREFIX="evtm_v01"   # must match provisioned buckets
+export GOOGLE_CLOUD_PROJECT="your-project-id"
+export GEMINI_FLASH_API_KEY="your-flash-key"
+export GEMINI_PRO_API_KEY="your-pro-key"
+export TTYD_USERNAME="admin"
+export TTYD_PASSWORD="changeme"
+```
+
+For GCS access, choose one credential approach and uncomment the matching
+volume in `docker-compose.cloudrun.yml`:
+
+```bash
+# Option A — Application Default Credentials (recommended)
+gcloud auth application-default login
+# Then uncomment in docker-compose.cloudrun.yml:
+# - ${HOME}/.config/gcloud:/home/eventmill/.config/gcloud:ro
+
+# Option B — Service account key file
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/sa-key.json"
+# Then uncomment in docker-compose.cloudrun.yml:
+# - ${GOOGLE_APPLICATION_CREDENTIALS:-/dev/null}:/app/credentials/sa-key.json:ro
+```
+
 ```bash
 docker compose -f cloud_install/docker-compose.cloudrun.yml up --build
 # Open http://deploy-server:8080 in browser
@@ -294,14 +341,14 @@ docker compose -f cloud_install/docker-compose.cloudrun.yml up --build
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GOOGLE_CLOUD_PROJECT` | Yes | GCP project ID |
+| `GOOGLE_CLOUD_PROJECT` | **Yes** | GCP project ID |
+| `EVENTMILL_BUCKET_PREFIX` | **Yes** | Bucket naming prefix — must match `provision-gcp-project.sh` (default: `eventmill`) |
 | `CLOUD_RUN_REGION` | No | Deploy region (default: `northamerica-northeast2`) |
-| `EVENTMILL_BUCKET_PREFIX` | No | Bucket naming prefix (default: `eventmill`) |
-| `GCS_LOG_BUCKET` | No | Legacy single-bucket override (backward compat) |
-| `EVENTMILL_SECRET_GEMINI_FLASH` | No | Secret Manager name for Flash API key |
-| `EVENTMILL_SECRET_GEMINI_PRO` | No | Secret Manager name for Pro API key |
-| `EVENTMILL_SECRET_TTYD_USER` | No | Secret Manager name for ttyd username |
-| `EVENTMILL_SECRET_TTYD_CRED` | No | Secret Manager name for ttyd password |
+| `GCS_LOG_BUCKET` | No | Legacy single-bucket override — leave empty for new deployments |
+| `EVENTMILL_SECRET_GEMINI_FLASH` | No | Secret Manager name for Flash API key (default: `eventmill-gemini-flash-api`) |
+| `EVENTMILL_SECRET_GEMINI_PRO` | No | Secret Manager name for Pro API key (default: `eventmill-gemini-pro-api`) |
+| `EVENTMILL_SECRET_TTYD_USER` | No | Secret Manager name for ttyd username (default: `eventmill-ttyd-user`) |
+| `EVENTMILL_SECRET_TTYD_CRED` | No | Secret Manager name for ttyd password (default: `eventmill-ttyd-cred`) |
 | `EVENTMILL_LOG_LEVEL` | No | Logging level (default: `INFO`) |
 
 ### Runtime environment (set by deploy scripts)
@@ -315,3 +362,4 @@ docker compose -f cloud_install/docker-compose.cloudrun.yml up --build
 | `TTYD_PASSWORD` | ttyd basic auth password |
 | `EVENTMILL_BUCKET_PREFIX` | Bucket prefix for pillar-based storage resolution |
 | `GCS_LOG_BUCKET` | Legacy bucket override for log_analysis pillar |
+| `GOOGLE_CLOUD_PROJECT` | Auto-set by Cloud Run — used by GCS client for project resolution |

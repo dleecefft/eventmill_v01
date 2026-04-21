@@ -8,21 +8,26 @@ This is the primary user interface for Event Mill.
 from __future__ import annotations
 
 import cmd
+import json
 import os
 import random
+import shlex
 import signal
 import sys
+import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from ..logging.structured import get_logger, setup_logging, log_user_activity, log_llm_interaction, set_user_context
 from ..session.manager import SessionManager
 from ..session.models import Pillar, ToolExecutionStatus
-from ..plugins.loader import PluginLoader
+from ..plugins.loader import PluginLoader, LoadedPlugin
 from ..routing.router import Router, RouterConfig
 from ..artifacts.registry import ArtifactRegistry, create_artifact_registration_callback
-from ..llm.client import MCPLLMClient, ContextBuilder
-from ..plugins.protocol import ExecutionContext, ReferenceDataView
+from ..llm.client import MCPLLMClient, ContextBuilder, LLMDispatcher
+from ..plugins.protocol import ExecutionContext, ReferenceDataView, ArtifactRef, TimeoutClass
+from ..reference_data.mitre_attack import get_mitre_db
 from ..cloud.resolver import StorageResolver, StorageResolverConfig, create_local_resolver
 
 logger = get_logger("cli")
@@ -48,7 +53,7 @@ _BANNERS = [
     ║  ██╔══╝  ╚██╗ ██╔╝██╔══╝  ██║╚██╗██║   ██║          ║
     ║  ███████╗ ╚████╔╝ ███████╗██║ ╚████║   ██║          ║
     ║  ╚══════╝  ╚═══╝  ╚══════╝╚═╝  ╚═══╝   ╚═╝          ║
-    ║              M  I  L  L                               ║
+    ║              M  I  L  L                             ║
     ╚══════════════════════════════════════════════════════╝
 """,
     r"""
@@ -63,7 +68,7 @@ _BANNERS = [
     ┌─────────────────────────────────────────┐
     │  ╺━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸  │
     │     E V E N T   M I L L   v0.1.0       │
-    │   event record analysis platform        │
+    │   event record analysis platform       │
     │  ╺━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╸  │
     └─────────────────────────────────────────┘
 """,
@@ -146,7 +151,7 @@ class EventMillShell(cmd.Cmd):
         # Initialize components
         self.session_manager = SessionManager(self.workspace_path)
         self.plugin_loader = PluginLoader(self.plugins_path)
-        self.llm_client: MCPLLMClient | None = None
+        self.llm_client: MCPLLMClient | LLMDispatcher | None = None
         self.router: Router | None = None
         self.artifact_registry: ArtifactRegistry | None = None
         self.context_builder = ContextBuilder()
@@ -498,7 +503,96 @@ class EventMillShell(cmd.Cmd):
         
         for b in buckets:
             print(f"  {b['pillar']:25s} {b['bucket']:40s} {b['type']}")
-    
+
+    def do_export(self, arg: str) -> None:
+        """Export a session artifact to the common storage bucket.
+
+        Writes to common/exports/<source_tool>/ by default — mirroring the
+        common/generated/ convention used by threat_report_analyzer.  Intended
+        for troubleshooting or handing off JSON/MMD outputs to external tools.
+        Not required for normal in-container workflows.
+
+        Usage: export <artifact_id> [subfolder]
+
+        artifact_id — ID from the 'artifacts' command (e.g. art_04d30b48)
+        subfolder   — Optional path appended inside exports/<source_tool>/.
+                      Useful for tagging by incident (e.g. incident-2025-04).
+
+        Destination layout:
+          common/exports/<source_tool>/<filename>
+          common/exports/<source_tool>/<subfolder>/<filename>   (with subfolder)
+
+        Examples:
+          export art_04d30b48
+          export art_04d30b48 incident-2025-04
+        """
+        if not self.session_manager.get_current_session():
+            print("  No active session. Use 'session new' first.")
+            return
+
+        if not self.storage_resolver:
+            print("  Storage resolver not initialized.")
+            return
+
+        parts = shlex.split(arg) if arg.strip() else []
+        if not parts:
+            print("  Usage: export <artifact_id> [subfolder]")
+            return
+
+        artifact_id = parts[0]
+        subfolder = parts[1] if len(parts) > 1 else None
+
+        # Resolve artifact
+        artifact = self.session_manager.get_artifact(artifact_id)
+        if artifact is None:
+            print(f"  Artifact '{artifact_id}' not found. Use 'artifacts' to list.")
+            return
+
+        local_path = Path(artifact.file_path)
+        if not local_path.exists():
+            print(f"  Artifact file missing on disk: {local_path}")
+            return
+
+        # Build destination folder: exports/<source_tool>[/<subfolder>]
+        source_tool = getattr(artifact, "source_tool", None) or "unknown"
+        dest_folder = f"exports/{source_tool}"
+        if subfolder:
+            dest_folder = f"{dest_folder}/{subfolder}"
+
+        # Pillar is only needed by the resolver to name the pillar bucket;
+        # since target="common" it won't be used for routing, but must be valid.
+        session = self.session_manager.get_current_session()
+        pillar = session.active_pillar or "log_analysis"
+
+        filename = local_path.name
+        common_bucket = self.storage_resolver.config.common_bucket()
+
+        print(f"  Exporting {artifact_id} ({artifact.artifact_type})")
+        print(f"  Destination: {common_bucket}/{dest_folder}/{filename}")
+
+        try:
+            resolved = self.storage_resolver.upload(
+                local_path=local_path,
+                filename=filename,
+                pillar=pillar,
+                workspace_folder=dest_folder,
+                target="common",
+                metadata={
+                    "artifact_id": artifact_id,
+                    "artifact_type": artifact.artifact_type,
+                    "source_tool": source_tool,
+                },
+            )
+            print(f"  ✓ Uploaded: {resolved.uri}")
+            log_user_activity("export_artifact", {
+                "artifact_id": artifact_id,
+                "destination": resolved.uri,
+                "source_tool": source_tool,
+            })
+        except Exception as e:
+            print(f"  ✗ Export failed: {e}")
+            logger.error("Artifact export failed: %s", e)
+
     def do_files(self, arg: str) -> None:
         """List files available in the current pillar's storage.
         
@@ -560,7 +654,10 @@ class EventMillShell(cmd.Cmd):
             print("  No active session. Use 'new' to create one.")
             return
         
-        parts = arg.strip().split(maxsplit=1)
+        try:
+            parts = shlex.split(arg.strip())
+        except ValueError:
+            parts = arg.strip().split(maxsplit=1)
         if not parts:
             print("  Usage: load <file_path_or_name> [artifact_type]")
             return
@@ -691,14 +788,121 @@ class EventMillShell(cmd.Cmd):
             print("  No tools available.")
             return
         
-        print(f"  {'Tool':30s} {'Pillar':20s} {'Stability':12s} Description")
-        print(f"  {'─' * 30} {'─' * 20} {'─' * 12} {'─' * 30}")
+        print(f"  {'Display Name':30s} {'Invoke As':30s} {'Pillar':20s} {'Stability':12s} Description")
+        print(f"  {'─' * 30} {'─' * 30} {'─' * 20} {'─' * 12} {'─' * 50}")
         
         for p in plugins:
             m = p.manifest
-            desc = m.description_short[:40] if m.description_short else "—"
-            print(f"  {m.display_name:30s} {m.pillar:20s} {m.stability:12s} {desc}")
+            desc = m.description_short[:80] if m.description_short else "—"
+            invoke = f"run {m.tool_name}"
+            print(f"  {m.display_name:30s} {invoke:30s} {m.pillar:20s} {m.stability:12s} {desc}")
     
+    def do_help(self, arg: str) -> None:
+        """Show help for a command or tool.
+
+        Usage: help [command_or_tool_name]
+
+        For tool-specific usage, pass the tool name:
+          help threat_report_analyzer
+        """
+        if arg:
+            plugin = self.plugin_loader.get(arg.strip())
+            if plugin:
+                self._print_tool_help(plugin)
+                return
+        super().do_help(arg)
+
+    def _print_tool_help(self, plugin: LoadedPlugin) -> None:
+        """Print help for a tool by rendering its README.md."""
+        m = plugin.manifest
+        readme_path = m.plugin_dir / "README.md"
+
+        print()
+        print(f"  {'─' * 60}")
+        print(f"  {m.display_name}  ({m.tool_name})")
+        print(f"  Pillar: {m.pillar}   Stability: {m.stability}")
+        print(f"  Invoke: run {m.tool_name} {{\"action\": \"...\"}}") 
+        print(f"  {'─' * 60}")
+        print()
+
+        if readme_path.exists():
+            rendered = self._render_markdown_plain(readme_path.read_text(encoding="utf-8"))
+            print(rendered)
+        else:
+            print(f"  {m.description_short}")
+            print()
+            print("  No README.md available for this tool.")
+        print()
+
+    @staticmethod
+    def _render_markdown_plain(text: str) -> str:
+        """Convert Markdown to readable plain-text for terminal display."""
+        import re
+        import textwrap
+
+        lines = text.splitlines()
+        out: list[str] = []
+        in_code = False
+
+        for line in lines:
+            # Toggle fenced code block
+            if line.startswith("```"):
+                in_code = not in_code
+                if in_code:
+                    out.append("")
+                else:
+                    out.append("")
+                continue
+
+            if in_code:
+                out.append(f"    {line}")
+                continue
+
+            # H1
+            if line.startswith("# "):
+                title = line[2:].strip()
+                out.append(f"\n  {title}")
+                out.append(f"  {'═' * len(title)}")
+                continue
+            # H2
+            if line.startswith("## "):
+                title = line[3:].strip()
+                out.append(f"\n  {title}")
+                out.append(f"  {'─' * len(title)}")
+                continue
+            # H3
+            if line.startswith("### "):
+                title = line[4:].strip()
+                out.append(f"\n  {title}:")
+                continue
+
+            # Strip inline bold/italic/code markers
+            line = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
+            line = re.sub(r"\*(.+?)\*", r"\1", line)
+            line = re.sub(r"`(.+?)`", r"\1", line)
+
+            # Table separator rows — skip
+            if re.match(r"^\|[-| :]+\|$", line.strip()):
+                continue
+
+            # Table rows and list items — indent and pass through
+            if line.startswith("|") or line.startswith("- ") or line.startswith("* ") or re.match(r"^\d+\. ", line):
+                out.append(f"  {line}")
+                continue
+
+            # Blank lines
+            if not line.strip():
+                out.append("")
+                continue
+
+            # Paragraph text — word-wrap at 78
+            wrapped = textwrap.fill(
+                line, width=78, initial_indent="  ", subsequent_indent="  "
+            )
+            out.append(wrapped)
+
+        return "\n".join(out)
+
     def do_run(self, arg: str) -> None:
         """Run a tool on the current session.
         
@@ -737,9 +941,9 @@ class EventMillShell(cmd.Cmd):
                 print(f"  Artifact not found: {payload['artifact_id']}")
                 return
             # Inject file_path (most plugins) and path (log_navigator)
+            # Keep artifact_id — plugins using registry lookup still need it
             payload.setdefault("file_path", str(art_path))
             payload.setdefault("path", str(art_path))
-            del payload["artifact_id"]
         
         # Get plugin instance
         instance = plugin.get_instance()
@@ -752,24 +956,58 @@ class EventMillShell(cmd.Cmd):
                 print(f"    - {error}")
             return
         
+        # Snapshot registered artifacts before execution to detect new ones afterwards
+        _artifacts_before = {a.artifact_id for a in self.session_manager.list_artifacts()}
+
         # Build execution context
         session = self.session_manager.get_current_session()
-        artifact_refs = []
+        # Session artifacts carry the user-visible IDs shown by 'artifacts' command
+        artifact_refs = [
+            ArtifactRef(
+                artifact_id=sa.artifact_id,
+                artifact_type=sa.artifact_type,
+                file_path=sa.file_path,
+                source_tool=getattr(sa, "source_tool", None),
+                metadata=getattr(sa, "metadata", None) or {},
+            )
+            for sa in self.session_manager.list_artifacts()
+        ]
+        # Append tool-produced artifacts from registry that aren't already present
         if self.artifact_registry:
-            artifact_refs = self.artifact_registry.list_all()
+            existing_ids = {a.artifact_id for a in artifact_refs}
+            for ra in self.artifact_registry.list_all():
+                if ra.artifact_id not in existing_ids:
+                    artifact_refs.append(ra)
         
+        def _register_artifact(
+            artifact_type: str,
+            file_path: str,
+            source_tool: str,
+            metadata: dict,
+        ) -> ArtifactRef:
+            """Persist tool-produced artifacts in session_manager (visible in 'artifacts') and return a canonical ArtifactRef."""
+            session_art = self.session_manager.register_artifact(
+                artifact_type=artifact_type,
+                file_path=str(file_path),
+                source_tool=source_tool,
+                metadata=metadata or {},
+            )
+            return ArtifactRef(
+                artifact_id=session_art.artifact_id,
+                artifact_type=session_art.artifact_type,
+                file_path=str(file_path),
+                source_tool=source_tool,
+                metadata=metadata or {},
+            )
+
         context = ExecutionContext(
             session_id=session.session_id,
             selected_pillar=session.active_pillar or "",
             artifacts=artifact_refs,
             llm_enabled=self.llm_client is not None and self.llm_client.connected,
             llm_query=self.llm_client,
-            register_artifact=(
-                create_artifact_registration_callback(self.artifact_registry)
-                if self.artifact_registry
-                else None
-            ),
-            reference_data=ReferenceDataView(),
+            register_artifact=_register_artifact,
+            reference_data=ReferenceDataView({"mitre_techniques": get_mitre_db()}),
         )
         
         # Track execution
@@ -777,12 +1015,77 @@ class EventMillShell(cmd.Cmd):
             tool_name=tool_name,
         )
         
-        print(f"  Running {plugin.manifest.display_name}...")
+        timeout = TimeoutClass.get_limit(plugin.manifest.timeout_class)
+        print(f"  Running {plugin.manifest.display_name} (timeout {timeout}s)...")
         
         try:
-            result = instance.execute(payload, context)
+            # Execute with thread-based timeout to prevent indefinite hangs
+            _result_holder: list = [None]
+            _error_holder: list = [None]
+
+            def _run_plugin():
+                try:
+                    _result_holder[0] = instance.execute(payload, context)
+                except Exception as exc:
+                    _error_holder[0] = exc
+
+            worker = threading.Thread(target=_run_plugin, daemon=True)
+            worker.start()
+
+            # Poll with a visible elapsed-time ticker instead of a single
+            # silent join.  The periodic output also keeps the WebSocket
+            # alive through Cloud Run's load-balancer.
+            _tick = 10  # seconds between progress updates
+            _elapsed = 0
+            while _elapsed < timeout:
+                worker.join(timeout=min(_tick, timeout - _elapsed))
+                _elapsed += _tick
+                if not worker.is_alive():
+                    break
+                print(f"  \u23f3 {_elapsed}s / {timeout}s ...", flush=True)
+
+            if worker.is_alive():
+                print(f"  \u2718 Timed out after {timeout}s")
+                self.session_manager.complete_execution(
+                    execution=execution,
+                    status=ToolExecutionStatus.FAILED,
+                    summary=f"Execution timed out after {timeout}s",
+                )
+                log_user_activity("run_tool", {
+                    "tool_name": tool_name,
+                    "execution_id": execution.execution_id,
+                    "status": "timeout",
+                })
+                return
+
+            if _error_holder[0] is not None:
+                raise _error_holder[0]
+
+            result = _result_holder[0]
+            if result is None:
+                raise RuntimeError("Plugin returned None instead of ToolResult")
             
             if result.ok:
+                # Register output_artifacts declared by the plugin
+                for oa in (result.output_artifacts or []):
+                    oa_path = Path(oa.get("file_path", ""))
+                    if oa_path.exists():
+                        self.session_manager.register_artifact(
+                            artifact_type=oa.get("artifact_type", "text"),
+                            file_path=str(oa_path),
+                            source_tool=tool_name,
+                            metadata={"plugin_artifact_id": oa.get("artifact_id", "")},
+                        )
+
+                # Auto-persist output if the tool didn't register an artifact itself
+                _artifacts_after = {a.artifact_id for a in self.session_manager.list_artifacts()}
+                if not (_artifacts_after - _artifacts_before) and result.result is not None:
+                    self._auto_persist_result(
+                        result=result,
+                        tool_name=tool_name,
+                        artifacts_produced=getattr(plugin.manifest, "artifacts_produced", []) or [],
+                    )
+
                 summary = instance.summarize_for_llm(result)
                 self.session_manager.complete_execution(
                     execution=execution,
@@ -835,7 +1138,67 @@ class EventMillShell(cmd.Cmd):
             
             print(f"  ✗ Error: {e}")
             logger.exception("Tool execution failed: %s", tool_name)
-    
+
+    def _auto_persist_result(
+        self,
+        result: Any,
+        tool_name: str,
+        artifacts_produced: list[str],
+    ) -> None:
+        """Write a tool's ToolResult.result to disk and register it with the session.
+
+        Called when a tool completes successfully but did not call
+        context.register_artifact() itself.  Produces a single output artifact
+        whose type is taken from the first entry of the manifest's
+        artifacts_produced list (defaulting to 'json_events').
+
+        Text-oriented tools (artifact_type == 'text') receive a .md file whose
+        content is the first string field found among common display keys
+        (visualization, content, summary, analysis, report, output).
+        All other tools receive a .json file containing the full result dict.
+        """
+        workspace = Path(os.environ.get("EVENTMILL_WORKSPACE", "./workspace"))
+        output_dir = workspace / "artifacts"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        artifact_type = artifacts_produced[0] if artifacts_produced else "json_events"
+        result_data = result.result or {}
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Choose format: markdown for text artifacts, JSON for everything else
+        if artifact_type == "text":
+            text_content: str | None = None
+            for key in ("visualization", "content", "summary", "analysis", "report", "output"):
+                val = result_data.get(key)
+                if isinstance(val, str) and val.strip():
+                    text_content = val
+                    break
+            if text_content is None:
+                text_content = json.dumps(result_data, indent=2, default=str)
+            content = text_content
+            ext = ".md"
+        else:
+            content = json.dumps(result_data, indent=2, default=str)
+            ext = ".json"
+
+        filename = f"{tool_name}_{ts}{ext}"
+        output_file = output_dir / filename
+
+        try:
+            output_file.write_text(content, encoding="utf-8")
+            session_art = self.session_manager.register_artifact(
+                artifact_type=artifact_type,
+                file_path=str(output_file),
+                source_tool=tool_name,
+                metadata={"auto_persisted": True},
+            )
+            logger.info(
+                "Auto-persisted output for %s → %s (%s)",
+                tool_name, session_art.artifact_id, artifact_type,
+            )
+        except Exception as exc:
+            logger.warning("Auto-persist failed for %s: %s", tool_name, exc)
+
     def do_history(self, arg: str) -> None:
         """Show tool execution history for the current session.
         
@@ -944,15 +1307,17 @@ class EventMillShell(cmd.Cmd):
             print("  Set GEMINI_FLASH_API_KEY and/or GEMINI_PRO_API_KEY environment variables.")
             return
         
-        print(f"  {'Model':20s} {'Tier':10s} {'ID':30s}")
-        print(f"  {'─' * 20} {'─' * 10} {'─' * 30}")
+        print(f"  {'Model':20s} {'Tier':10s} {'Status':14s} {'ID':30s}")
+        print(f"  {'─' * 20} {'─' * 10} {'─' * 14} {'─' * 30}")
         
         for model in self._available_models:
-            print(f"  {model['name']:20s} {model['tier']:10s} {model['id']:30s}")
+            status = self._model_connected_status(model)
+            print(f"  {model['name']:20s} {model['tier']:10s} {status:14s} {model['id']:30s}")
         
         print("")
-        print("  Use 'connect <model_id>' to connect to a specific model.")
-        print("  Tier 'light' = fast/cheap, 'heavy' = powerful/expensive")
+        print("  'connect'            — bind all models (tiered auto-routing)")
+        print("  'connect <model_id>' — bind a specific model only")
+        print(f"  Routing: max_tokens ≤ {LLMDispatcher.LIGHT_THRESHOLD} → light (Flash), > {LLMDispatcher.LIGHT_THRESHOLD} → heavy (Pro)")
     
     def do_connect(self, arg: str) -> None:
         """Connect to LLM.
@@ -968,52 +1333,81 @@ class EventMillShell(cmd.Cmd):
             return
         
         model_id = arg.strip()
+        transport = os.environ.get("EVENTMILL_MCP_TRANSPORT", "stdio")
         
-        # Find the model configuration
-        selected_model = None
-        if model_id:
-            # Match by ID or name
+        if not model_id:
+            # No model specified — connect ALL available models as a tiered pair
+            connected_clients: dict[str, MCPLLMClient] = {}
+            failed: list[str] = []
+
             for m in self._available_models:
-                if m["id"] == model_id or m["name"].lower() == model_id.lower():
-                    selected_model = m
-                    break
-            if not selected_model:
-                print(f"  Model not found: {model_id}")
-                print("  Use 'models' to see available models.")
+                api_key = os.environ.get(m["env_var"])
+                if not api_key:
+                    failed.append(f"  ✗ {m['name']}: {m['env_var']} not set")
+                    continue
+                client = MCPLLMClient(model_id=m["id"], transport=transport)
+                client._api_key_env_var = m["env_var"]
+                if client.connect(api_key=api_key):
+                    connected_clients[m["tier"]] = client
+                    print(f"  ✓ {m['name']} ({m['id']})")
+                    print(f"    Tier: {m['tier']}")
+                else:
+                    failed.append(f"  ✗ {m['name']}: connection failed — check API key and google-generativeai install")
+
+            for msg in failed:
+                print(msg)
+
+            if not connected_clients:
+                print("  No models connected.")
                 return
-        else:
-            # Default to first available (prefer Flash for light operations)
-            selected_model = self._available_models[0]
-        
-        # Get the API key from environment
+
+            self.llm_client = LLMDispatcher(clients=connected_clients)
+
+            log_user_activity("connect_llm", {
+                "models": {tier: c.model_id for tier, c in connected_clients.items()},
+                "tiered": True,
+            })
+
+            if len(connected_clients) > 1:
+                print(f"")
+                print(f"  Auto-routing: max_tokens ≤ {LLMDispatcher.LIGHT_THRESHOLD} → light, "
+                      f"> {LLMDispatcher.LIGHT_THRESHOLD} → heavy")
+            return
+
+        # Specific model requested — single-client mode
+        selected_model = None
+        for m in self._available_models:
+            if m["id"] == model_id or m["name"].lower() == model_id.lower():
+                selected_model = m
+                break
+        if not selected_model:
+            print(f"  Model not found: {model_id}")
+            print("  Use 'models' to see available models.")
+            return
+
         api_key = os.environ.get(selected_model["env_var"])
         if not api_key:
             print(f"  API key not found in {selected_model['env_var']}")
             return
-        
-        transport = os.environ.get("EVENTMILL_MCP_TRANSPORT", "stdio")
-        
+
         self.llm_client = MCPLLMClient(
             model_id=selected_model["id"],
             transport=transport,
         )
-        
-        # Store the API key reference and connect
         self.llm_client._api_key_env_var = selected_model["env_var"]
-        
+
         if not self.llm_client.connect(api_key=api_key):
             print(f"  ✗ Failed to connect to {selected_model['name']}")
             print("    Check that google-generativeai is installed and the API key is valid.")
             self.llm_client = None
             return
-        
-        # Log activity
+
         log_user_activity("connect_llm", {
             "model_id": selected_model["id"],
             "model_name": selected_model["name"],
             "tier": selected_model["tier"],
         })
-        
+
         print(f"  ✓ Connected to {selected_model['name']} ({selected_model['id']})")
         print(f"    Tier: {selected_model['tier']}")
     
@@ -1251,6 +1645,17 @@ class EventMillShell(cmd.Cmd):
     # Helpers
     # -------------------------------------------------------------------
     
+    def _model_connected_status(self, model: dict) -> str:
+        """Return a short status string for a model entry in 'models' output."""
+        if self.llm_client is None:
+            return ""
+        if isinstance(self.llm_client, LLMDispatcher):
+            c = self.llm_client._clients.get(model["tier"])
+            return "✓ connected" if (c and c.connected) else ""
+        if isinstance(self.llm_client, MCPLLMClient):
+            return "✓ connected" if (self.llm_client.model_id == model["id"] and self.llm_client.connected) else ""
+        return ""
+
     def _infer_artifact_type(self, file_path: Path) -> str:
         """Infer artifact type from file extension.
         
@@ -1268,6 +1673,10 @@ class EventMillShell(cmd.Cmd):
             ".pdf": "pdf_report",
             ".html": "html_report",
             ".htm": "html_report",
+            ".md": "text",
+            ".markdown": "text",
+            ".docx": "docx_report",
+            ".doc": "docx_report",
             ".png": "image",
             ".jpg": "image",
             ".jpeg": "image",

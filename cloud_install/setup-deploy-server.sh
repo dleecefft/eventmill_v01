@@ -79,14 +79,19 @@ if [ ! -f "${CONFIG_DIR}/deploy.env" ]; then
 # Source this file before running deploy scripts:
 #   source ~/.eventmill/deploy.env
 
-# Required
+# Required: GCP project ID
 export GOOGLE_CLOUD_PROJECT="your-project-id"
+
+# Required: Bucket prefix — must match the value used when running provision-gcp-project.sh
+# Buckets created will be: {prefix}-log-analysis, {prefix}-threat-modeling,
+#                          {prefix}-network-forensics, {prefix}-common
+export EVENTMILL_BUCKET_PREFIX="eventmill"
 
 # Region (default: northamerica-northeast2)
 export CLOUD_RUN_REGION="northamerica-northeast2"
 
-# GCS bucket for log artifacts (optional)
-export GCS_LOG_BUCKET="digevtrecintake"
+# Legacy single-bucket override (backward compatibility only — leave empty for new deployments)
+export GCS_LOG_BUCKET=""
 
 # Secret names in GCP Secret Manager
 # Dual Gemini keys — display names match the env vars for traceability
@@ -96,7 +101,7 @@ export EVENTMILL_SECRET_GCS_SA="eventmill-gcs-sa"
 export EVENTMILL_SECRET_TTYD_USER="eventmill-ttyd-user"
 export EVENTMILL_SECRET_TTYD_CRED="eventmill-ttyd-cred"
 
-# ttyd web terminal credentials (used by deploy-cloudrun.sh quick deploy)
+# ttyd web terminal credentials (used by deploy-cloudrun.sh quick deploy only)
 export TTYD_USERNAME="analyst"
 export TTYD_PASSWORD="changeme"
 

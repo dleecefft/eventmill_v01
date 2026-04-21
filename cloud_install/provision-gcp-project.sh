@@ -129,6 +129,10 @@ gcloud services enable secretmanager.googleapis.com --project="${PROJECT_ID}" --
 echo "   Enabling Generative Language API (generativelanguage.googleapis.com)..."
 gcloud services enable generativelanguage.googleapis.com --project="${PROJECT_ID}" --quiet
 
+# Cloud Logging — used by Event Mill for structured audit logging (google-cloud-logging)
+echo "   Enabling Cloud Logging API (logging.googleapis.com)..."
+gcloud services enable logging.googleapis.com --project="${PROJECT_ID}" --quiet
+
 # API Keys — required for programmatic API key creation and restriction
 echo "   Enabling API Keys API (apikeys.googleapis.com)..."
 gcloud services enable apikeys.googleapis.com --project="${PROJECT_ID}" --quiet
@@ -253,6 +257,15 @@ echo ""
 # Disabled pillars (cloud_investigation, risk_assessment) do not get
 # buckets until they are enabled.  Add them here when ready.
 #
+# Common bucket subdirectory layout (used by threat_report_analyzer):
+#   {BUCKET_PREFIX}-common/mitre/               MITRE ATT&CK JSON/STIX bundles
+#   {BUCKET_PREFIX}-common/capec/               CAPEC XML/JSON files
+#   {BUCKET_PREFIX}-common/cisa/                CISA KEV and advisory files
+#   {BUCKET_PREFIX}-common/vendor_advisories/   Vendor security bulletins
+#   {BUCKET_PREFIX}-common/threat_actors/       Threat actor profiles
+#   {BUCKET_PREFIX}-common/campaigns/           Threat campaign reports
+#   {BUCKET_PREFIX}-common/vulnerabilities/     CVE and vulnerability reports
+#
 # Automated ingestion systems write to the appropriate pillar bucket.
 # Which automations write to which buckets is site-specific and managed
 # by the implementation team outside of Event Mill.
@@ -321,6 +334,47 @@ if [ -n "${GCS_LOG_BUCKET}" ] && [ "${GCS_LOG_BUCKET}" != "${BUCKET_PREFIX}-log-
     echo "   Legacy bucket override detected: ${GCS_LOG_BUCKET}"
     create_bucket_if_missing "${GCS_LOG_BUCKET}" /tmp/eventmill-lifecycle-90d.json "legacy log bucket"
 fi
+
+# ---------------------------------------------------------------------------
+# Initialize common bucket folder structure for threat_report_analyzer
+# ---------------------------------------------------------------------------
+# Creates a .keep placeholder in each subdirectory so the folder hierarchy
+# is visible in the GCS console and operators know where to upload reports.
+# Each subdirectory maps to a source type in ThreatReportAnalyzer.REPORT_DIRECTORIES.
+# ---------------------------------------------------------------------------
+
+init_common_folder() {
+    local folder=$1
+    local dest="gs://${BUCKET_PREFIX}-common/${folder}/.keep"
+    if gsutil ls "${dest}" > /dev/null 2>&1; then
+        echo "   ✓ Folder already initialized: gs://${BUCKET_PREFIX}-common/${folder}/"
+    else
+        echo -n "" | gsutil cp - "${dest}" > /dev/null 2>&1
+        echo "   ✓ Initialized folder:         gs://${BUCKET_PREFIX}-common/${folder}/"
+    fi
+}
+
+echo "   Initializing threat intel folder structure in common bucket..."
+for folder in mitre capec cisa vendor_advisories threat_actors campaigns vulnerabilities; do
+    init_common_folder "${folder}"
+done
+
+# Generated artifacts: tool-produced outputs stored back into the common bucket.
+# Convention: common/generated/{tool_name}/{source_relative_path}.summary.md
+# Tools read source data from the top-level subdirs above; they write processed
+# artifacts here.  Other tools (e.g. risk_assessment_analyzer, log_investigator)
+# discover pre-built summaries by scanning common/generated/ instead of re-running
+# the LLM.
+echo ""
+echo "   Initializing generated artifacts namespace in common bucket..."
+init_common_folder "generated/threat_report_analyzer"
+
+# Exports: operator-initiated artifact exports via the 'export' CLI command.
+# Convention: common/exports/{source_tool}/{filename}
+# Per-tool subdirectories are created automatically on first write — only the
+# root placeholder is seeded here so the folder is visible in the GCS console.
+echo "   Initializing exports namespace in common bucket..."
+init_common_folder "exports"
 
 echo ""
 
@@ -457,10 +511,14 @@ echo "Bucket prefix:    ${BUCKET_PREFIX}"
 echo "Artifact Reg:     ${REGION}-docker.pkg.dev/${PROJECT_ID}/eventmill"
 echo ""
 echo "Storage buckets:"
-echo "   gs://${BUCKET_PREFIX}-log-analysis         (log analysis)"
-echo "   gs://${BUCKET_PREFIX}-network-forensics    (network forensics)"
-echo "   gs://${BUCKET_PREFIX}-threat-modeling       (threat modeling)"
-echo "   gs://${BUCKET_PREFIX}-common                (shared reference data)"
+echo "   gs://${BUCKET_PREFIX}-log-analysis              (log analysis)"
+echo "   gs://${BUCKET_PREFIX}-network-forensics         (network forensics)"
+echo "   gs://${BUCKET_PREFIX}-threat-modeling           (threat modeling)"
+echo "   gs://${BUCKET_PREFIX}-common                    (shared reference data)"
+echo "   gs://${BUCKET_PREFIX}-common/generated/         (tool-generated artifacts)"
+echo "   gs://${BUCKET_PREFIX}-common/generated/threat_report_analyzer/"
+echo "   gs://${BUCKET_PREFIX}-common/exports/           (operator exports via 'export' CLI command)"
+echo "   gs://${BUCKET_PREFIX}-common/exports/<tool>/    (created on first write per tool)"
 echo ""
 echo "Secrets created (placeholder values):"
 echo "   - eventmill-gemini-flash-api  (Flash / light tier)"
@@ -483,8 +541,16 @@ echo ""
 echo "  3. Upload files to the appropriate pillar bucket:"
 echo "     gsutil cp /path/to/logs/*.log gs://${BUCKET_PREFIX}-log-analysis/"
 echo "     gsutil cp /path/to/pcaps/*.pcap gs://${BUCKET_PREFIX}-network-forensics/"
-echo "     gsutil cp /path/to/threat-intel/*.json gs://${BUCKET_PREFIX}-common/"
 echo ""
-echo "  4. Use workspace folders to organize by incident:"
+echo "  4. Upload threat intelligence reports to common bucket (by source type):"
+echo "     gsutil cp /path/to/attack.json                   gs://${BUCKET_PREFIX}-common/mitre/"
+echo "     gsutil cp /path/to/capec.xml                    gs://${BUCKET_PREFIX}-common/capec/"
+echo "     gsutil cp /path/to/cisa-advisory.json           gs://${BUCKET_PREFIX}-common/cisa/"
+echo "     gsutil cp /path/to/vendor-bulletin.pdf          gs://${BUCKET_PREFIX}-common/vendor_advisories/"
+echo "     gsutil cp /path/to/actor-profile.json           gs://${BUCKET_PREFIX}-common/threat_actors/"
+echo "     gsutil cp /path/to/campaign-report.md           gs://${BUCKET_PREFIX}-common/campaigns/"
+echo "     gsutil cp /path/to/cve-report.json              gs://${BUCKET_PREFIX}-common/vulnerabilities/"
+echo ""
+echo "  5. Use workspace folders to organize by incident:"
 echo "     gsutil cp /path/to/logs/*.log gs://${BUCKET_PREFIX}-log-analysis/incident-2024-03/"
 echo ""
