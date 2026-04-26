@@ -1429,26 +1429,44 @@ class EventMillShell(cmd.Cmd):
             print(f"  API key not found in {selected_model['env_var']}")
             return
 
-        self.llm_client = MCPLLMClient(
+        primary_client = MCPLLMClient(
             model_id=selected_model["id"],
             transport=transport,
         )
-        self.llm_client._api_key_env_var = selected_model["env_var"]
+        primary_client._api_key_env_var = selected_model["env_var"]
 
-        if not self.llm_client.connect(api_key=api_key):
+        if not primary_client.connect(api_key=api_key):
             print(f"  ✗ Failed to connect to {selected_model['name']}")
             print("    Check that google-generativeai is installed and the API key is valid.")
             self.llm_client = None
             return
 
+        print(f"  ✓ Connected to {selected_model['name']} ({selected_model['id']})")
+        print(f"    Tier: {selected_model['tier']}")
+
+        # Silently try to connect the other tier for quota fallback
+        connected_clients: dict[str, MCPLLMClient] = {selected_model["tier"]: primary_client}
+        other_models = [m for m in self._available_models if m["tier"] != selected_model["tier"]]
+        for m in other_models:
+            other_key = os.environ.get(m["env_var"], "")
+            if other_key:
+                fallback_client = MCPLLMClient(model_id=m["id"], transport=transport)
+                fallback_client._api_key_env_var = m["env_var"]
+                if fallback_client.connect(api_key=other_key):
+                    connected_clients[m["tier"]] = fallback_client
+                    print(f"  ✓ {m['name']} available as quota fallback")
+
+        if len(connected_clients) > 1:
+            self.llm_client = LLMDispatcher(clients=connected_clients)
+        else:
+            self.llm_client = primary_client
+
         log_user_activity("connect_llm", {
             "model_id": selected_model["id"],
             "model_name": selected_model["name"],
             "tier": selected_model["tier"],
+            "fallback_tiers": [t for t in connected_clients if t != selected_model["tier"]],
         })
-
-        print(f"  ✓ Connected to {selected_model['name']} ({selected_model['id']})")
-        print(f"    Tier: {selected_model['tier']}")
     
     def do_ask(self, arg: str) -> None:
         """Ask a question about the current investigation using the connected LLM.

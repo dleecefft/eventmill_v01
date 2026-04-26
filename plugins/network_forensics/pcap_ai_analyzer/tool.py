@@ -211,12 +211,41 @@ class PcapAiAnalyzer:
                 pcap_summary_data=static_output,
             )
 
+            # Pre-call token estimate:
+            # PCAP summaries contain dense structured data (IPs, ports, numbers, JSON)
+            # which tokenizes at ~3 chars/token vs ~4 for plain English.
+            # Split prompt into template prose vs injected PCAP data for a blended estimate,
+            # then apply a 1.4x correction factor — empirically calibrated against actual usage.
+            pcap_data_len = len(static_output)
+            prose_len = len(prompt) - pcap_data_len
+            est_input_tokens = int(((prose_len // 4) + (pcap_data_len // 3)) * 1.4)
+            # Output estimate: structured AI analysis responses run ~50% of input tokens
+            est_output_tokens = min(int(est_input_tokens * 0.50), 4096)
+            est_total_tokens = est_input_tokens + est_output_tokens
+            print(
+                f"\n  🔢 Token estimate: ~{est_input_tokens:,} input"
+                f" + ~{est_output_tokens:,} output"
+                f" = ~{est_total_tokens:,} total (pre-call)"
+            )
+
             # Step 3: Query LLM
             response = context.llm_query.query_text(
                 prompt=prompt,
                 system_context=PCAP_SYSTEM_IDENTITY,
                 max_tokens=4096,
             )
+
+            # Post-call actuals — compare against estimate
+            if response.token_usage:
+                actual_in = response.token_usage.get("prompt_tokens", 0)
+                actual_out = response.token_usage.get("completion_tokens", 0)
+                actual_total = response.token_usage.get("total_tokens", actual_in + actual_out)
+                accuracy = (actual_in / est_input_tokens * 100) if est_input_tokens else 0
+                print(
+                    f"  📊 Actual tokens: {actual_in:,} input + {actual_out:,} output"
+                    f" = {actual_total:,} total"
+                    f"  (estimate accuracy: {accuracy:.0f}%)"
+                )
 
             if not response.ok:
                 return ToolResult(
