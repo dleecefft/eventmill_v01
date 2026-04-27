@@ -1457,7 +1457,10 @@ class EventMillShell(cmd.Cmd):
                     print(f"  ✓ {m['name']} available as quota fallback")
 
         if len(connected_clients) > 1:
-            self.llm_client = LLMDispatcher(clients=connected_clients)
+            self.llm_client = LLMDispatcher(
+                clients=connected_clients,
+                preferred_tier=selected_model["tier"],
+            )
         else:
             self.llm_client = primary_client
 

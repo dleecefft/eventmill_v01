@@ -62,7 +62,7 @@ YOUR ROLE:
 
 TRIAGE_PROMPT = """{system_identity}
 {alert_condition}
-CURRENT TASK:
+{investigation_context}CURRENT TASK:
 You are a SOC Analyst conducting initial triage on a parsed network traffic capture.
 
 SUMMARY DATA:
@@ -88,7 +88,7 @@ End with:
 
 THREAT_HUNT_PROMPT = """{system_identity}
 {alert_condition}
-CURRENT TASK:
+{investigation_context}CURRENT TASK:
 You are a proactive Threat Hunter analyzing parsed PCAP data for advanced persistent threats (APTs)
 or stealthy network intrusions.
 
@@ -111,7 +111,7 @@ End with:
 
 REPORTING_PROMPT = """{system_identity}
 {alert_condition}
-CURRENT TASK:
+{investigation_context}CURRENT TASK:
 You are a Senior Incident Responder preparing documentation for the SOC.
 
 SUMMARY DATA:
@@ -202,12 +202,16 @@ class PcapAiAnalyzer:
             # Step 1: Get static output
             static_output = self._get_static_output(session, mode, payload)
 
-            # Step 2: Build prompt
+            # Step 2: Load investigation context from any markdown/text artifact
+            investigation_context = self._load_investigation_context(context)
+
+            # Step 3: Build prompt
             prompt_template, _ = MODE_CONFIG[mode]
             alert_condition = self._get_alert_condition(condition_orange)
             prompt = prompt_template.format(
                 system_identity=PCAP_SYSTEM_IDENTITY,
                 alert_condition=alert_condition,
+                investigation_context=investigation_context,
                 pcap_summary_data=static_output,
             )
 
@@ -228,7 +232,7 @@ class PcapAiAnalyzer:
                 f" = ~{est_total_tokens:,} total (pre-call)"
             )
 
-            # Step 3: Query LLM
+            # Step 4: Query LLM
             response = context.llm_query.query_text(
                 prompt=prompt,
                 system_context=PCAP_SYSTEM_IDENTITY,
@@ -304,6 +308,57 @@ class PcapAiAnalyzer:
     # -------------------------------------------------------------------
     # Helpers
     # -------------------------------------------------------------------
+
+    @staticmethod
+    def _load_investigation_context(context: Any) -> str:
+        """Return an INVESTIGATION CONTEXT block if a markdown/text artifact is loaded.
+
+        Looks for text artifacts (loaded via 'load notes.md') whose filename ends
+        in .md, .markdown, or .txt.  Returns an empty string if nothing is found
+        so the prompt placeholder is safely replaced with nothing.
+        """
+        if not context or not hasattr(context, "artifacts"):
+            return ""
+
+        md_exts = {".md", ".markdown", ".txt"}
+        loaded: list[tuple[str, str]] = []  # (filename, content)
+        seen_paths: set[str] = set()  # deduplicate by resolved file path
+
+        for artifact in context.artifacts:
+            if getattr(artifact, "artifact_type", "") != "text":
+                continue
+            file_path = getattr(artifact, "file_path", None)
+            if not file_path:
+                continue
+            import os
+            resolved = os.path.realpath(file_path)
+            if resolved in seen_paths:
+                continue
+            seen_paths.add(resolved)
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext not in md_exts:
+                continue
+            try:
+                with open(file_path, "r", encoding="utf-8") as fh:
+                    content = fh.read().strip()
+                if content:
+                    loaded.append((os.path.basename(file_path), content))
+            except Exception:
+                pass  # Silently skip unreadable files
+
+        if not loaded:
+            return ""
+
+        parts = ["INVESTIGATION CONTEXT (analyst-provided notes):"]
+        for filename, content in loaded:
+            parts.append(f"--- {filename} ---")
+            parts.append(content)
+        parts.append("--- END INVESTIGATION CONTEXT ---\n")
+        block = "\n".join(parts) + "\n"
+
+        filenames = ", ".join(f for f, _ in loaded)
+        print(f"  📋 Investigation context loaded: {filenames}")
+        return block
 
     @staticmethod
     def _get_alert_condition(condition_orange: bool) -> str:

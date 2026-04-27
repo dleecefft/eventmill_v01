@@ -410,8 +410,12 @@ class LLMDispatcher:
 
     LIGHT_THRESHOLD: int = 3500
 
-    def __init__(self, clients: dict[str, MCPLLMClient]) -> None:
+    def __init__(self, clients: dict[str, MCPLLMClient],
+                 preferred_tier: str | None = None) -> None:
         self._clients = clients
+        # When set, this tier is preferred over the token-count heuristic.
+        # Lets explicit 'connect gemini-2.5-flash' keep Flash as primary.
+        self._preferred_tier = preferred_tier
 
     # --- Protocol compatibility -------------------------------------------------
 
@@ -451,6 +455,10 @@ class LLMDispatcher:
                 order = ("heavy", "light")
             else:
                 order = ("light", "heavy")
+        elif self._preferred_tier:
+            # User explicitly chose a model — honour that over token-count heuristic
+            other = "light" if self._preferred_tier == "heavy" else "heavy"
+            order = (self._preferred_tier, other)
         else:
             prefer_heavy = max_tokens > self.LIGHT_THRESHOLD
             order = ("heavy", "light") if prefer_heavy else ("light", "heavy")

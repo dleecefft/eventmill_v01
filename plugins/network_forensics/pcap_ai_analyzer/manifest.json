@@ -4,11 +4,11 @@
   "pillar": "network_forensics",
   "display_name": "PCAP AI Analyzer",
   "description_short": "AI-enhanced PCAP analysis with Condition Orange support.",
-  "description_long": "Wraps all static PCAP analysis and threat hunt tools with LLM intelligence. Provides three analysis tiers: triage (SOC Tier 1/2 prioritization and C2 beacon hunting), threat hunt (MITRE ATT&CK mapping, hypothesis generation, evidence gathering), and reporting (executive summary, IOC extraction, shift handover). Supports Condition Orange mode for heightened alert investigations where false negatives are more costly than false positives.",
+  "description_long": "Wraps all static PCAP analysis and threat hunt tools with LLM intelligence. Provides three analysis tiers: triage (SOC Tier 1/2 prioritization and C2 beacon hunting), threat hunt (MITRE ATT&CK mapping, hypothesis generation, evidence gathering), and reporting (executive summary, IOC extraction, shift handover). Supports Condition Orange mode for heightened alert investigations where false negatives are more costly than false positives. If a markdown or text file is loaded in the session (via 'load notes.md'), its content is automatically injected into the prompt as INVESTIGATION CONTEXT.",
   "author": "Event Mill Contributors",
   "entry_point": "tool.py",
   "class_name": "PcapAiAnalyzer",
-  "artifacts_consumed": ["pcap", "json_events"],
+  "artifacts_consumed": ["pcap", "json_events", "text"],
   "artifacts_produced": ["json_events", "text"],
   "capabilities": [
     "network_forensics:ai_analysis",
