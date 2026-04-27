@@ -21,7 +21,8 @@ SERVICE_NAME="event-mill"
 IMAGE_NAME="${REGION}-docker.pkg.dev/${PROJECT_ID}/eventmill/${SERVICE_NAME}"
 
 # Storage bucket prefix (pillar-based isolation)
-BUCKET_PREFIX="${EVENTMILL_BUCKET_PREFIX:-eventmill}"
+# Default matches provision-gcp-project.sh: {project_id}-eventmill
+BUCKET_PREFIX="${EVENTMILL_BUCKET_PREFIX:-${PROJECT_ID}-eventmill}"
 
 # Legacy single-bucket override (backward compatibility)
 GCS_LOG_BUCKET="${GCS_LOG_BUCKET:-}"

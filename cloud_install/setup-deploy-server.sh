@@ -85,7 +85,8 @@ export GOOGLE_CLOUD_PROJECT="your-project-id"
 # Required: Bucket prefix — must match the value used when running provision-gcp-project.sh
 # Buckets created will be: {prefix}-log-analysis, {prefix}-threat-modeling,
 #                          {prefix}-network-forensics, {prefix}-common
-export EVENTMILL_BUCKET_PREFIX="eventmill"
+# Default convention: {project_id}-eventmill (set after GOOGLE_CLOUD_PROJECT is known)
+export EVENTMILL_BUCKET_PREFIX="${GOOGLE_CLOUD_PROJECT}-eventmill"
 
 # Region (default: northamerica-northeast2)
 export CLOUD_RUN_REGION="northamerica-northeast2"

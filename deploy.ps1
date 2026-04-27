@@ -32,9 +32,11 @@ Write-Host ""
 Write-Host "Step 2: Deploying to Cloud Run..." -ForegroundColor Green
 $ImageUri = $Region + "-docker.pkg.dev/" + $Project + "/eventmill/" + $Service + ":latest"
 $ServiceAccount = "eventmill-runner@" + $Project + ".iam.gserviceaccount.com"
+$BucketPrefix = if ($env:EVENTMILL_BUCKET_PREFIX) { $env:EVENTMILL_BUCKET_PREFIX } else { "$Project-eventmill" }
 Write-Host "  Image: $ImageUri" -ForegroundColor Yellow
+Write-Host "  Bucket prefix: $BucketPrefix" -ForegroundColor Yellow
 
-gcloud run deploy $Service "--region=$Region" "--project=$Project" "--image=$ImageUri" "--platform=managed" "--port=8080" "--memory=1Gi" "--cpu=2" "--timeout=3600" "--min-instances=0" "--max-instances=3" "--concurrency=10" "--service-account=$ServiceAccount" "--set-env-vars=EVENTMILL_BUCKET_PREFIX=eventmill,EVENTMILL_LOG_LEVEL=INFO" "--allow-unauthenticated"
+gcloud run deploy $Service "--region=$Region" "--project=$Project" "--image=$ImageUri" "--platform=managed" "--port=8080" "--memory=1Gi" "--cpu=2" "--timeout=3600" "--min-instances=0" "--max-instances=3" "--concurrency=10" "--service-account=$ServiceAccount" "--set-env-vars=EVENTMILL_BUCKET_PREFIX=$BucketPrefix,EVENTMILL_LOG_LEVEL=INFO" "--allow-unauthenticated"
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Deployment failed!" -ForegroundColor Red
