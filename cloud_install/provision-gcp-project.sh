@@ -38,7 +38,8 @@ REGION="${CLOUD_RUN_REGION:-northamerica-northeast2}"
 # CHANGE THIS: Bucket prefix for Event Mill storage
 # Convention: {prefix}-{pillar-slug} and {prefix}-common
 # All bucket names must be globally unique across all of GCP
-BUCKET_PREFIX="${EVENTMILL_BUCKET_PREFIX:-eventmill}"
+# Default uses project ID as prefix to guarantee global uniqueness
+BUCKET_PREFIX="${EVENTMILL_BUCKET_PREFIX:-${PROJECT_ID}-eventmill}"
 
 # Legacy single-bucket override (backward compatibility)
 GCS_LOG_BUCKET="${GCS_LOG_BUCKET:-}"
@@ -330,8 +331,8 @@ create_bucket_if_missing() {
             echo ""
             echo "ERROR: Failed to create gs://${bucket_name}."
             echo "Most likely cause: the bucket name is already taken globally."
-            echo "Set a unique prefix and re-run, for example:"
-            echo "  export EVENTMILL_BUCKET_PREFIX=${PROJECT_ID}-eventmill"
+            echo "Override the prefix and re-run, for example:"
+            echo "  export EVENTMILL_BUCKET_PREFIX=${PROJECT_ID}-em2"
             exit 1
         fi
     fi
