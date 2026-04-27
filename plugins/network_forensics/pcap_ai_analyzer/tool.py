@@ -227,7 +227,7 @@ class PcapAiAnalyzer:
             prose_len = len(prompt) - pcap_data_len
             est_input_tokens = int(((prose_len // 4) + (pcap_data_len // 3)) * 1.4)
             # Output estimate: structured AI analysis responses run ~50% of input tokens
-            est_output_tokens = min(int(est_input_tokens * 0.50), 4096)
+            est_output_tokens = min(int(est_input_tokens * 0.50), 16384)
             est_total_tokens = est_input_tokens + est_output_tokens
             print(
                 f"\n  🔢 Token estimate: ~{est_input_tokens:,} input"
@@ -239,7 +239,7 @@ class PcapAiAnalyzer:
             response = context.llm_query.query_text(
                 prompt=prompt,
                 system_context=PCAP_SYSTEM_IDENTITY,
-                max_tokens=4096,
+                max_tokens=16384,
             )
 
             # Post-call actuals — compare against estimate
