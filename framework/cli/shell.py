@@ -444,7 +444,10 @@ class EventMillShell(cmd.Cmd):
         
         print(f"  Pillar set to: {pillar} ({len(tools)} tools available)")
         self._update_prompt()
-    
+
+    def complete_pillar(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        return [p for p in sorted(Pillar.ALL) if p.startswith(text)]
+
     # -------------------------------------------------------------------
     # Workspace Commands
     # -------------------------------------------------------------------
@@ -941,6 +944,14 @@ class EventMillShell(cmd.Cmd):
             out.append(wrapped)
 
         return "\n".join(out)
+
+    def complete_run(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        # Complete tool names (first argument only)
+        parts = line.split()
+        if len(parts) <= 1 or (len(parts) == 2 and not line.endswith(" ")):
+            all_tools = [p.tool_name for p in self.plugin_loader.list_all()]
+            return [t for t in sorted(all_tools) if t.startswith(text)]
+        return []
 
     def do_run(self, arg: str) -> None:
         """Run a tool on the current session.
