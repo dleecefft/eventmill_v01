@@ -44,8 +44,8 @@ echo ""
 echo "📦 Building container image..."
 gcloud builds submit \
     --project="${PROJECT_ID}" \
-    --tag="${IMAGE_NAME}" \
-    --dockerfile=cloud_install/Dockerfile.cloudrun \
+    --config=build-event-mill.yaml \
+    --substitutions="_REGION=${REGION}" \
     .
 
 # ---------------------------------------------------------------------------
