@@ -945,7 +945,12 @@ class EventMillShell(cmd.Cmd):
     def do_run(self, arg: str) -> None:
         """Run a tool on the current session.
         
-        Usage: run <tool_name> [json_payload]
+        Usage: run <tool_name> [--key value ...] | [json_payload]
+
+        Examples:
+          run log_investigator --severity orange --file_path auth.log
+          run log_investigator {"severity": "orange", "file_path": "auth.log"}
+          run log_investigator --verbose          (boolean flag, sets value to True)
         """
         if not self.session_manager.get_current_session():
             print("  No active session. Use 'new' to create one.")
@@ -953,7 +958,7 @@ class EventMillShell(cmd.Cmd):
         
         parts = arg.strip().split(maxsplit=1)
         if not parts:
-            print("  Usage: run <tool_name> [json_payload]")
+            print("  Usage: run <tool_name> [--key value ...] | [json_payload]")
             return
         
         tool_name = parts[0]
@@ -963,15 +968,36 @@ class EventMillShell(cmd.Cmd):
             print(f"  Tool not found: {tool_name}")
             return
         
-        # Parse payload
-        import json
-        payload = {}
+        # Parse payload — supports JSON object or --flag style arguments
+        payload: dict[str, Any] = {}
         if len(parts) > 1:
-            try:
-                payload = json.loads(parts[1])
-            except json.JSONDecodeError as e:
-                print(f"  Invalid JSON payload: {e}")
-                return
+            raw = parts[1].strip()
+            if raw.startswith("{"):
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError as e:
+                    print(f"  Invalid JSON payload: {e}")
+                    return
+            else:
+                # --flag style: --key value  or  --flag (sets key=True)
+                tokens = shlex.split(raw)
+                i = 0
+                while i < len(tokens):
+                    tok = tokens[i]
+                    if tok.startswith("--"):
+                        key = tok[2:]
+                        if not key:
+                            print(f"  Invalid flag: {tok!r}. Use --key or --key value.")
+                            return
+                        if i + 1 < len(tokens) and not tokens[i + 1].startswith("--"):
+                            payload[key] = tokens[i + 1]
+                            i += 2
+                        else:
+                            payload[key] = True
+                            i += 1
+                    else:
+                        print(f"  Unexpected token {tok!r}. Use --key value flags or JSON format.")
+                        return
         
         # Resolve artifact_id → file_path for plugins that need a file
         if "artifact_id" in payload:
