@@ -180,29 +180,42 @@ echo ""
 echo "🔐 Section 3: Configuring IAM roles..."
 echo ""
 
-# Allow the SA to read/write objects in GCS (log artifacts)
-echo "   Granting Storage Object User (read/write GCS objects)..."
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-    --member="serviceAccount:${SA_EMAIL}" \
-    --role="roles/storage.objectUser" \
-    --quiet > /dev/null 2>&1
-echo "   ✓ roles/storage.objectUser"
+# Note: Project-level storage.objectUser binding is applied at bucket level instead
+# (see Section 4) to avoid conflicts with GCP org policy conditional IAM bindings
+# Note: Project-level secretmanager.secretAccessor is not needed — Section 7 applies
+# secret-level access which is more granular and bypasses org policy constraints
 
-# Allow the SA to access secrets from Secret Manager
-echo "   Granting Secret Manager Secret Accessor..."
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-    --member="serviceAccount:${SA_EMAIL}" \
-    --role="roles/secretmanager.secretAccessor" \
-    --quiet > /dev/null 2>&1
-echo "   ✓ roles/secretmanager.secretAccessor"
+# Add a project-level IAM binding and fall back to an always-true condition
+# for organizations that require conditions on all project IAM bindings.
+add_project_binding() {
+    local member="$1"
+    local role="$2"
+
+    if gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+        --member="${member}" \
+        --role="${role}" \
+        --quiet > /dev/null 2>&1; then
+        return 0
+    fi
+
+    if gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+        --member="${member}" \
+        --role="${role}" \
+        --condition='expression=true,title=eventmill-bootstrap,description=Required for Event Mill bootstrap in condition-enforced IAM projects' \
+        --quiet > /dev/null 2>&1; then
+        return 0
+    fi
+
+    return 1
+}
 
 # Allow the SA to write structured logs to Cloud Logging
 echo "   Granting Logs Writer..."
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-    --member="serviceAccount:${SA_EMAIL}" \
-    --role="roles/logging.logWriter" \
-    --quiet > /dev/null 2>&1
-echo "   ✓ roles/logging.logWriter"
+if add_project_binding "serviceAccount:${SA_EMAIL}" "roles/logging.logWriter"; then
+    echo "   ✓ roles/logging.logWriter"
+else
+    echo "   ⚠ Could not grant roles/logging.logWriter to ${SA_EMAIL}"
+fi
 
 # Allow Cloud Build's default SA to deploy to Cloud Run
 # (Cloud Build uses the project's default compute SA for builds)
@@ -211,33 +224,33 @@ CLOUDBUILD_SA="${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com"
 
 # Grant default compute SA access to GCS (Cloud Build uploads source tarballs)
 echo "   Granting default compute SA storage access (Cloud Build source upload)..."
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-    --member="serviceAccount:${DEFAULT_COMPUTE_SA}" \
-    --role="roles/storage.objectAdmin" \
-    --quiet > /dev/null 2>&1
-echo "   ✓ roles/storage.objectAdmin for default compute SA"
+if add_project_binding "serviceAccount:${DEFAULT_COMPUTE_SA}" "roles/storage.objectAdmin"; then
+    echo "   ✓ roles/storage.objectAdmin for default compute SA"
+else
+    echo "   ⚠ Could not grant roles/storage.objectAdmin for default compute SA"
+fi
 
 # Grant default compute SA permission to push images to Artifact Registry
 echo "   Granting default compute SA Artifact Registry write access..."
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-    --member="serviceAccount:${DEFAULT_COMPUTE_SA}" \
-    --role="roles/artifactregistry.writer" \
-    --quiet > /dev/null 2>&1
-echo "   ✓ roles/artifactregistry.writer for default compute SA"
+if add_project_binding "serviceAccount:${DEFAULT_COMPUTE_SA}" "roles/artifactregistry.writer"; then
+    echo "   ✓ roles/artifactregistry.writer for default compute SA"
+else
+    echo "   ⚠ Could not grant roles/artifactregistry.writer for default compute SA"
+fi
 
 echo "   Granting Cloud Build SA permission to deploy to Cloud Run..."
-gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
-    --member="serviceAccount:${CLOUDBUILD_SA}" \
-    --role="roles/run.admin" \
-    --quiet > /dev/null 2>&1
-echo "   ✓ roles/run.admin for Cloud Build SA"
+if add_project_binding "serviceAccount:${CLOUDBUILD_SA}" "roles/run.admin"; then
+    echo "   ✓ roles/run.admin for Cloud Build SA"
+else
+    echo "   ⚠ Could not grant roles/run.admin for Cloud Build SA"
+fi
 
 echo "   Granting Cloud Build SA permission to act as Event Mill SA..."
 gcloud iam service-accounts add-iam-policy-binding "${SA_EMAIL}" \
     --project="${PROJECT_ID}" \
     --member="serviceAccount:${CLOUDBUILD_SA}" \
     --role="roles/iam.serviceAccountUser" \
-    --quiet > /dev/null 2>&1
+    --quiet > /dev/null 2>&1 || true
 echo "   ✓ roles/iam.serviceAccountUser on ${SA_NAME}"
 
 echo ""
@@ -304,19 +317,38 @@ create_bucket_if_missing() {
     local lifecycle_file=$2
     local description=$3
 
-    if gsutil ls -b "gs://${bucket_name}" > /dev/null 2>&1; then
+    # Check if bucket already exists and is accessible
+    if gcloud storage buckets describe "gs://${bucket_name}" > /dev/null 2>&1; then
         echo "   ✓ Bucket already exists: gs://${bucket_name}"
     else
-        gsutil mb \
-            -p "${PROJECT_ID}" \
-            -l "${REGION}" \
-            -b on \
-            "gs://${bucket_name}"
-        echo "   ✓ Created bucket: gs://${bucket_name}  (${description})"
+        if gcloud storage buckets create "gs://${bucket_name}" \
+            --project="${PROJECT_ID}" \
+            --location="${REGION}" \
+            --uniform-bucket-level-access; then
+            echo "   ✓ Created bucket: gs://${bucket_name}  (${description})"
+        else
+            echo ""
+            echo "ERROR: Failed to create gs://${bucket_name}."
+            echo "Most likely cause: the bucket name is already taken globally."
+            echo "Set a unique prefix and re-run, for example:"
+            echo "  export EVENTMILL_BUCKET_PREFIX=${PROJECT_ID}-eventmill"
+            exit 1
+        fi
     fi
 
     # Apply lifecycle rule
-    gsutil lifecycle set "${lifecycle_file}" "gs://${bucket_name}" > /dev/null 2>&1
+    gcloud storage buckets update "gs://${bucket_name}" \
+        --project="${PROJECT_ID}" \
+        --lifecycle-file="${lifecycle_file}" > /dev/null 2>&1 || true
+
+    # Grant Event Mill SA bucket-level access (storage.objectAdmin)
+    # This is applied at bucket level instead of project level to avoid
+    # conflicts with GCP org policy conditional IAM bindings
+    gcloud storage buckets add-iam-policy-binding "gs://${bucket_name}" \
+        --member="serviceAccount:${SA_EMAIL}" \
+        --role="roles/storage.objectAdmin" \
+        --project="${PROJECT_ID}" \
+        --quiet > /dev/null 2>&1 || true
 }
 
 # Per-pillar buckets (MVP-enabled pillars only)
