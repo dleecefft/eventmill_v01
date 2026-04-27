@@ -75,7 +75,7 @@ images:
 
 substitutions:
   _REGION: northamerica-northeast2
-  _BUCKET_PREFIX: eventmill
+  _BUCKET_PREFIX: ''   # set at submit time: --substitutions=_BUCKET_PREFIX=${GOOGLE_CLOUD_PROJECT}-eventmill
 
 options:
   logging: CLOUD_LOGGING_ONLY
