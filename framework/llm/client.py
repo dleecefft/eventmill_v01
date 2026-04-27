@@ -152,24 +152,31 @@ class MCPLLMClient:
             # MCP query execution will be implemented when
             # the mcp package is integrated. For now, return
             # a placeholder indicating the query would be sent.
-            response_text = self._execute_mcp_query(
+            response_text, prompt_tokens, completion_tokens = self._execute_mcp_query(
                 prompt=full_prompt,
                 system_context=system_context,
                 max_tokens=max_tokens,
             )
-            
+
             return LLMResponse(
                 ok=True,
                 text=response_text,
-                token_usage={"prompt_tokens": 0, "completion_tokens": 0},
+                token_usage={
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                },
             )
         except Exception as e:
-            logger.error("LLM query failed: %s", e)
+            if self._is_quota_exhausted(e):
+                logger.debug("Quota exhausted on %s (handled by dispatcher)", self.model_id)
+            else:
+                logger.error("LLM query failed: %s", e)
             return LLMResponse(
                 ok=False,
                 error=str(e),
             )
-    
+
     def query_multimodal(
         self,
         prompt: str,
@@ -218,7 +225,10 @@ class MCPLLMClient:
                 token_usage={"prompt_tokens": 0, "completion_tokens": 0},
             )
         except Exception as e:
-            logger.error("Multimodal LLM query failed: %s", e)
+            if self._is_quota_exhausted(e):
+                logger.debug("Quota exhausted on %s (handled by dispatcher)", self.model_id)
+            else:
+                logger.error("Multimodal LLM query failed: %s", e)
             return LLMResponse(
                 ok=False,
                 error=str(e),
@@ -243,8 +253,21 @@ class MCPLLMClient:
         return "\n".join(parts)
     
     @staticmethod
+    def _is_quota_exhausted(exc: Exception) -> bool:
+        """Return True for permanent quota exhaustion (free-tier daily/per-minute cap).
+        These errors will NOT recover on retry — fail fast so the dispatcher can
+        fall back to another model.
+        """
+        msg = str(exc)
+        return "RESOURCE_EXHAUSTED" in msg and "free_tier" in msg
+
+    @staticmethod
     def _is_retriable(exc: Exception) -> bool:
-        """Return True for transient API errors that warrant a retry."""
+        """Return True for transient API errors that warrant a retry.
+        Quota exhaustion is excluded — it will not recover within the retry window.
+        """
+        if MCPLLMClient._is_quota_exhausted(exc):
+            return False
         msg = str(exc)
         return any(marker in msg for marker in (
             "503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED",
@@ -256,21 +279,24 @@ class MCPLLMClient:
         prompt: str,
         system_context: str | None,
         max_tokens: int,
-    ) -> str:
+    ) -> tuple[str, int, int]:
         """Execute a text query via Google GenAI SDK (MCP bridge).
-        
+
+        Returns:
+            Tuple of (response_text, prompt_tokens, completion_tokens).
+
         Uses google.genai directly until full MCP transport
         is integrated.
         """
         if self._genai_client is None:
             raise RuntimeError("Client not initialised — call connect() first")
-        
+
         config = genai_types.GenerateContentConfig(
             max_output_tokens=max_tokens,
         )
         if system_context:
             config.system_instruction = system_context
-        
+
         last_exc: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
@@ -280,26 +306,36 @@ class MCPLLMClient:
                     config=config,
                 )
                 text = response.text or ""
+                prompt_tokens = 0
+                completion_tokens = 0
                 if hasattr(response, "usage_metadata") and response.usage_metadata:
                     um = response.usage_metadata
-                    self._total_tokens_used += getattr(um, "total_token_count", 0)
-                return text
+                    prompt_tokens = getattr(um, "prompt_token_count", 0)
+                    completion_tokens = getattr(um, "candidates_token_count", 0)
+                    total = getattr(um, "total_token_count", prompt_tokens + completion_tokens)
+                    self._total_tokens_used += total
+                return text, prompt_tokens, completion_tokens
             except Exception as exc:
+                if self._is_quota_exhausted(exc):
+                    logger.warning(
+                        "Quota exhausted on %s — will try fallback model",
+                        self.model_id,
+                    )
+                    raise
                 if attempt < self.max_retries and self._is_retriable(exc):
                     wait = 2 ** attempt  # 1 s, 2 s, 4 s …
                     logger.warning(
-                        "LLM transient error (attempt %d/%d), retrying in %ds: %s",
+                        "LLM transient error (attempt %d/%d), retrying in %ds",
                         attempt + 1,
                         self.max_retries + 1,
                         wait,
-                        exc,
                     )
                     time.sleep(wait)
                     last_exc = exc
                 else:
                     raise
         raise last_exc  # type: ignore[misc]
-    
+
     def _execute_mcp_multimodal_query(
         self,
         prompt: str,
@@ -336,14 +372,19 @@ class MCPLLMClient:
                 )
                 return response.text or ""
             except Exception as exc:
+                if self._is_quota_exhausted(exc):
+                    logger.warning(
+                        "Quota exhausted on %s — will try fallback model",
+                        self.model_id,
+                    )
+                    raise
                 if attempt < self.max_retries and self._is_retriable(exc):
                     wait = 2 ** attempt
                     logger.warning(
-                        "LLM multimodal transient error (attempt %d/%d), retrying in %ds: %s",
+                        "LLM multimodal transient error (attempt %d/%d), retrying in %ds",
                         attempt + 1,
                         self.max_retries + 1,
                         wait,
-                        exc,
                     )
                     time.sleep(wait)
                     last_exc = exc
@@ -369,8 +410,12 @@ class LLMDispatcher:
 
     LIGHT_THRESHOLD: int = 3500
 
-    def __init__(self, clients: dict[str, MCPLLMClient]) -> None:
+    def __init__(self, clients: dict[str, MCPLLMClient],
+                 preferred_tier: str | None = None) -> None:
         self._clients = clients
+        # When set, this tier is preferred over the token-count heuristic.
+        # Lets explicit 'connect gemini-2.5-flash' keep Flash as primary.
+        self._preferred_tier = preferred_tier
 
     # --- Protocol compatibility -------------------------------------------------
 
@@ -410,6 +455,10 @@ class LLMDispatcher:
                 order = ("heavy", "light")
             else:
                 order = ("light", "heavy")
+        elif self._preferred_tier:
+            # User explicitly chose a model — honour that over token-count heuristic
+            other = "light" if self._preferred_tier == "heavy" else "heavy"
+            order = (self._preferred_tier, other)
         else:
             prefer_heavy = max_tokens > self.LIGHT_THRESHOLD
             order = ("heavy", "light") if prefer_heavy else ("light", "heavy")
@@ -419,6 +468,18 @@ class LLMDispatcher:
             if c and c.connected:
                 return c
         raise RuntimeError("No LLM client connected — run 'connect' first")
+
+    @staticmethod
+    def _is_quota_error(error: str) -> bool:
+        """Return True when the error string indicates quota exhaustion."""
+        return "RESOURCE_EXHAUSTED" in error or "quota" in error.lower()
+
+    def _fallback_client(self, primary: MCPLLMClient) -> MCPLLMClient | None:
+        """Return the other connected tier, or None if unavailable."""
+        for tier, c in self._clients.items():
+            if c is not primary and c.connected:
+                return c
+        return None
 
     # --- LLMQueryInterface methods ---------------------------------------------
 
@@ -434,12 +495,31 @@ class LLMDispatcher:
             client = self._route(max_tokens, hints=hints)
         except RuntimeError as e:
             return LLMResponse(ok=False, error=str(e))
-        return client.query_text(
+        result = client.query_text(
             prompt=prompt,
             system_context=system_context,
             max_tokens=max_tokens,
             grounding_data=grounding_data,
         )
+        if not result.ok and self._is_quota_error(result.error or ""):
+            fallback = self._fallback_client(client)
+            if fallback:
+                logger.warning(
+                    "Quota exhausted on %s — falling back to %s",
+                    client.model_id,
+                    fallback.model_id,
+                )
+                print(
+                    f"\n  ⚠️  Quota exhausted on {client.model_id} "
+                    f"— retrying with {fallback.model_id}"
+                )
+                result = fallback.query_text(
+                    prompt=prompt,
+                    system_context=system_context,
+                    max_tokens=max_tokens,
+                    grounding_data=grounding_data,
+                )
+        return result
 
     def query_multimodal(
         self,
@@ -453,13 +533,33 @@ class LLMDispatcher:
             client = self._route(max_tokens)
         except RuntimeError as e:
             return LLMResponse(ok=False, error=str(e))
-        return client.query_multimodal(
+        result = client.query_multimodal(
             prompt=prompt,
             image_data=image_data,
             image_format=image_format,
             system_context=system_context,
             max_tokens=max_tokens,
         )
+        if not result.ok and self._is_quota_error(result.error or ""):
+            fallback = self._fallback_client(client)
+            if fallback:
+                logger.warning(
+                    "Quota exhausted on %s — falling back to %s",
+                    client.model_id,
+                    fallback.model_id,
+                )
+                print(
+                    f"\n  ⚠️  Quota exhausted on {client.model_id} "
+                    f"— retrying with {fallback.model_id}"
+                )
+                result = fallback.query_multimodal(
+                    prompt=prompt,
+                    image_data=image_data,
+                    image_format=image_format,
+                    system_context=system_context,
+                    max_tokens=max_tokens,
+                )
+        return result
 
     def query_with_document(
         self,
