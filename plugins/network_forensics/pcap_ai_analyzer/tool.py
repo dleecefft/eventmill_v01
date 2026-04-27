@@ -14,7 +14,10 @@ Ported from Event Mill v1.0 pcap_hunting.py (ai_hunt_*) and system_context.py
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("eventmill.plugins.pcap_ai_analyzer")
@@ -275,6 +278,25 @@ class PcapAiAnalyzer:
                 + "\n" + "=" * 60 + "\n"
                 + ai_text
             )
+
+            # Write full output to a markdown file so it's always accessible
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            workspace = Path(os.environ.get("EVENTMILL_WORKSPACE", "./workspace"))
+            output_dir = workspace / "artifacts"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            md_filename = f"pcap_ai_analyzer_{mode}_{ts}.md"
+            md_path = output_dir / md_filename
+            md_path.write_text(combined, encoding="utf-8")
+            print(f"  📄 Full report saved: {md_path}")
+
+            # Register the markdown file as an artifact
+            if hasattr(context, "register_artifact"):
+                context.register_artifact(
+                    artifact_type="text",
+                    file_path=str(md_path),
+                    source_tool="pcap_ai_analyzer",
+                    metadata={"mode": mode, "condition_orange": condition_orange},
+                )
 
             return ToolResult(
                 ok=True,
