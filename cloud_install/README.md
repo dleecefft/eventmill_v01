@@ -164,7 +164,7 @@ Event Mill uses **per-pillar GCS buckets** for data isolation plus a shared
 {EVENTMILL_BUCKET_PREFIX}-common               ← shared reference data
 ```
 
-Default prefix: `eventmill`. Set `EVENTMILL_BUCKET_PREFIX` to customise.
+Default prefix: `{your-project-id}-eventmill` (auto-derived from `GOOGLE_CLOUD_PROJECT`). Set `EVENTMILL_BUCKET_PREFIX` to override.
 
 ### Workspace Folders
 
@@ -307,8 +307,8 @@ deleting them.
 Before running, set at minimum:
 
 ```bash
-export EVENTMILL_BUCKET_PREFIX="evtm_v01"   # must match provisioned buckets
 export GOOGLE_CLOUD_PROJECT="your-project-id"
+export EVENTMILL_BUCKET_PREFIX="${GOOGLE_CLOUD_PROJECT}-eventmill"   # default — matches provision-gcp-project.sh
 export GEMINI_FLASH_API_KEY="your-flash-key"
 export GEMINI_PRO_API_KEY="your-pro-key"
 export TTYD_USERNAME="admin"
@@ -342,7 +342,7 @@ docker compose -f cloud_install/docker-compose.cloudrun.yml up --build
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `GOOGLE_CLOUD_PROJECT` | **Yes** | GCP project ID |
-| `EVENTMILL_BUCKET_PREFIX` | **Yes** | Bucket naming prefix — must match `provision-gcp-project.sh` (default: `eventmill`) |
+| `EVENTMILL_BUCKET_PREFIX` | No | Bucket naming prefix — must match `provision-gcp-project.sh` (default: `${GOOGLE_CLOUD_PROJECT}-eventmill`) |
 | `CLOUD_RUN_REGION` | No | Deploy region (default: `northamerica-northeast2`) |
 | `GCS_LOG_BUCKET` | No | Legacy single-bucket override — leave empty for new deployments |
 | `EVENTMILL_SECRET_GEMINI_FLASH` | No | Secret Manager name for Flash API key (default: `eventmill-gemini-flash-api`) |
