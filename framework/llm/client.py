@@ -306,6 +306,10 @@ class MCPLLMClient:
                     config=config,
                 )
                 text = response.text or ""
+                # Debug: log finish reason
+                if hasattr(response, "candidates") and response.candidates:
+                    fr = response.candidates[0].finish_reason
+                    print(f"  🔎 Finish reason: {fr}")
                 prompt_tokens = 0
                 completion_tokens = 0
                 if hasattr(response, "usage_metadata") and response.usage_metadata:
