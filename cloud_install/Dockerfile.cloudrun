@@ -90,7 +90,7 @@ EXPOSE 8080
 #                     are dropped after ~60-90 s.
 #
 # For public access without auth (Cloud Run IAM handles access):
-CMD ["sh", "-c", "ttyd -W -p ${PORT} --ping-interval 30 -t fontSize=16 python -m framework.cli.shell"]
+# CMD ["sh", "-c", "ttyd -W -p ${PORT} --ping-interval 30 -t fontSize=16 python -m framework.cli.shell"]
 #
 # For basic auth (set TTYD_USERNAME and TTYD_PASSWORD as secrets):
-# CMD ["sh", "-c", "ttyd -W -p ${PORT} -c ${TTYD_USERNAME}:${TTYD_PASSWORD} --ping-interval 30 -t fontSize=16 python -m framework.cli.shell"]
+CMD ["sh", "-c", "ttyd -W -p ${PORT} -c ${TTYD_USERNAME}:${TTYD_PASSWORD} --ping-interval 30 -t fontSize=16 python -m framework.cli.shell"]

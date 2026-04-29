@@ -114,6 +114,12 @@ class PcapSession:
         # TLS metadata
         self.tls_handshakes: List[Dict] = []
 
+        # OT / ICS protocol transactions
+        self.ot_transactions: List[Dict] = []
+
+        # Cleartext credential detections (values are redacted)
+        self.cleartext_creds: List[Dict] = []
+
         # Unique IPs
         self.src_ips: Counter = Counter()
         self.dst_ips: Counter = Counter()
@@ -370,7 +376,240 @@ def parse_pcap_file(file_path: str) -> PcapSession:
                 except Exception:
                     pass
 
+            # ---------------------------------------------------------------
+            # OT / ICS protocol extraction (port-based heuristic)
+            # ---------------------------------------------------------------
+            _extract_ot_transaction(pkt, session, src_ip, dst_ip, sport, dport, proto, ts)
+
+            # ---------------------------------------------------------------
+            # Cleartext credential detection (redacted values)
+            # ---------------------------------------------------------------
+            _extract_cleartext_creds(pkt, session, src_ip, dst_ip, dport, ts)
+
     return session
+
+
+# ---------------------------------------------------------------------------
+# OT / ICS protocol port map
+# ---------------------------------------------------------------------------
+
+_OT_PORT_PROTOCOL: Dict[int, str] = {
+    502: "Modbus",
+    102: "S7comm",
+    44818: "EtherNet/IP-CIP",
+    20000: "DNP3",
+    4840: "OPC-UA",
+    47808: "BACnet",
+    2404: "IEC-104",
+    789: "Red-Lion",
+    1911: "Niagara-Fox",
+    9600: "OMRON-FINS",
+    18245: "GE-SRTP",
+}
+
+# Modbus function code names
+_MODBUS_FUNC_NAMES: Dict[int, str] = {
+    1: "Read Coils", 2: "Read Discrete Inputs",
+    3: "Read Holding Registers", 4: "Read Input Registers",
+    5: "Write Single Coil", 6: "Write Single Register",
+    8: "Diagnostics", 15: "Write Multiple Coils",
+    16: "Write Multiple Registers", 22: "Mask Write Register",
+    23: "Read/Write Multiple Registers", 43: "Read Device ID",
+}
+
+_MODBUS_WRITE_FUNCS = {5, 6, 15, 16, 22, 23}
+_MODBUS_DIAG_FUNCS = {8, 43}
+
+
+def _extract_ot_transaction(
+    pkt: Any, session: "PcapSession",
+    src_ip: str, dst_ip: str,
+    sport: int, dport: int, proto: str, ts: float,
+) -> None:
+    """Extract OT/ICS protocol metadata from a packet via port heuristics."""
+    # Determine if either port matches a known OT service
+    ot_port = 0
+    ot_proto = ""
+    if dport in _OT_PORT_PROTOCOL:
+        ot_port = dport
+        ot_proto = _OT_PORT_PROTOCOL[dport]
+    elif sport in _OT_PORT_PROTOCOL:
+        ot_port = sport
+        ot_proto = _OT_PORT_PROTOCOL[sport]
+    else:
+        return
+
+    entry: Dict[str, Any] = {
+        "protocol": ot_proto,
+        "port": ot_port,
+        "src": src_ip,
+        "dst": dst_ip,
+        "ts": ts,
+    }
+
+    # Attempt deeper Modbus parsing from raw payload
+    if ot_proto == "Modbus" and proto == "TCP":
+        try:
+            if pkt.haslayer(Raw):
+                raw = bytes(pkt[Raw].load)
+                # Modbus/TCP: 7-byte MBAP header + at least 1 byte PDU
+                if len(raw) >= 8:
+                    unit_id = raw[6]
+                    func_code = raw[7]
+                    is_exception = bool(func_code & 0x80)
+                    base_func = func_code & 0x7F
+                    entry["unit_id"] = unit_id
+                    entry["function_code"] = base_func
+                    entry["function_name"] = _MODBUS_FUNC_NAMES.get(base_func, f"FC-{base_func}")
+                    entry["is_exception"] = is_exception
+                    entry["is_write"] = base_func in _MODBUS_WRITE_FUNCS
+                    entry["is_diagnostic"] = base_func in _MODBUS_DIAG_FUNCS
+                    if is_exception and len(raw) >= 9:
+                        entry["exception_code"] = raw[8]
+        except Exception:
+            pass
+
+    # S7comm — extract PDU type from TPKT/COTP payload
+    if ot_proto == "S7comm" and proto == "TCP":
+        try:
+            if pkt.haslayer(Raw):
+                raw = bytes(pkt[Raw].load)
+                # Look for S7comm magic 0x32 after TPKT(4)+COTP(variable)
+                s7_idx = raw.find(b'\x32')
+                if s7_idx >= 0 and s7_idx + 2 < len(raw):
+                    pdu_type = raw[s7_idx + 1]
+                    pdu_names = {1: "Job", 2: "Ack", 3: "Ack-Data", 7: "Userdata"}
+                    entry["pdu_type"] = pdu_names.get(pdu_type, f"0x{pdu_type:02x}")
+                    if s7_idx + 8 < len(raw):
+                        func = raw[s7_idx + 7] if pdu_type in (1, 3) else None
+                        if func is not None:
+                            s7_funcs = {
+                                4: "Read", 5: "Write", 0x28: "PLC-Stop",
+                                0x29: "PLC-Start", 0x1A: "Upload", 0x1B: "Download",
+                            }
+                            entry["function"] = s7_funcs.get(func, f"0x{func:02x}")
+                            entry["is_write"] = func in (5, 0x1B)
+                            entry["is_control"] = func in (0x28, 0x29)
+        except Exception:
+            pass
+
+    # DNP3 — extract function code from transport/application layer
+    if ot_proto == "DNP3" and proto == "TCP":
+        try:
+            if pkt.haslayer(Raw):
+                raw = bytes(pkt[Raw].load)
+                # DNP3 starts with 0x0564
+                if len(raw) >= 12 and raw[0:2] == b'\x05\x64':
+                    # Application layer function code at offset 12+
+                    if len(raw) > 12:
+                        app_ctrl = raw[12] if len(raw) > 12 else None
+                        if app_ctrl is not None and len(raw) > 13:
+                            func_code = raw[13]
+                            dnp3_funcs = {
+                                0: "Confirm", 1: "Read", 2: "Write",
+                                3: "Select", 4: "Operate", 5: "Direct-Operate",
+                                13: "Cold-Restart", 14: "Warm-Restart",
+                                18: "Stop-Application", 19: "Start-Application",
+                                129: "Response", 130: "Unsolicited-Response",
+                            }
+                            entry["function_code"] = func_code
+                            entry["function_name"] = dnp3_funcs.get(func_code, f"FC-{func_code}")
+                            entry["is_write"] = func_code in (2, 3, 4, 5)
+                            entry["is_control"] = func_code in (5, 13, 14, 18, 19)
+        except Exception:
+            pass
+
+    # Cap stored OT transactions at 50,000 to limit memory
+    if len(session.ot_transactions) < 50000:
+        session.ot_transactions.append(entry)
+
+
+# ---------------------------------------------------------------------------
+# Cleartext credential patterns (values are REDACTED for safety)
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+_CRED_PATTERNS: List[tuple] = [
+    # (protocol, port_set, compiled_regex_on_payload, description)
+]
+
+# Built lazily on first call
+_CRED_PATTERNS_BUILT = False
+
+
+def _build_cred_patterns() -> None:
+    global _CRED_PATTERNS, _CRED_PATTERNS_BUILT
+    if _CRED_PATTERNS_BUILT:
+        return
+    _CRED_PATTERNS = [
+        ("FTP", {21}, _re.compile(rb'^(USER |PASS )', _re.IGNORECASE), "FTP login command"),
+        ("Telnet", {23}, _re.compile(rb'(login:|password:|username:)', _re.IGNORECASE), "Telnet login prompt"),
+        ("HTTP-BasicAuth", {80, 8080, 8443, 8000}, _re.compile(rb'Authorization:\s*Basic\s+', _re.IGNORECASE), "HTTP Basic Auth header"),
+        ("HTTP-FormPost", {80, 8080, 8443, 8000}, _re.compile(rb'(password=|passwd=|pwd=|user=|username=|login=)', _re.IGNORECASE), "HTTP form credential field"),
+        ("SMTP", {25, 587}, _re.compile(rb'^(AUTH LOGIN|AUTH PLAIN)', _re.IGNORECASE), "SMTP authentication"),
+        ("SNMPv1/v2c", {161, 162}, None, "SNMP community string (unauthenticated)"),
+        ("LDAP-SimpleBind", {389}, _re.compile(rb'\x80.{0,4}(\x04)', _re.DOTALL), "LDAP simple bind"),
+        ("POP3", {110}, _re.compile(rb'^(USER |PASS )', _re.IGNORECASE), "POP3 login"),
+        ("IMAP", {143}, _re.compile(rb'LOGIN\s+', _re.IGNORECASE), "IMAP LOGIN command"),
+        ("VNC", {5900, 5901, 5902}, None, "VNC authentication handshake"),
+    ]
+    _CRED_PATTERNS_BUILT = True
+
+
+def _extract_cleartext_creds(
+    pkt: Any, session: "PcapSession",
+    src_ip: str, dst_ip: str,
+    dport: int, ts: float,
+) -> None:
+    """Detect cleartext credentials in packet payloads. Values are REDACTED."""
+    if not pkt.haslayer(Raw):
+        return
+
+    _build_cred_patterns()
+
+    try:
+        raw_payload = bytes(pkt[Raw].load)
+    except Exception:
+        return
+
+    if len(raw_payload) < 4:
+        return
+
+    # Cap stored detections at 500
+    if len(session.cleartext_creds) >= 500:
+        return
+
+    sport = 0
+    if pkt.haslayer(TCP):
+        sport = pkt[TCP].sport
+    elif pkt.haslayer(UDP):
+        sport = pkt[UDP].sport
+
+    for proto_name, ports, pattern, description in _CRED_PATTERNS:
+        if dport not in ports and sport not in ports:
+            continue
+        # For SNMP and VNC, any traffic on the port is flagged
+        if pattern is None:
+            session.cleartext_creds.append({
+                "protocol": proto_name,
+                "description": description,
+                "src": src_ip,
+                "dst": dst_ip,
+                "port": dport if dport in ports else sport,
+                "ts": ts,
+            })
+            return
+        if pattern.search(raw_payload):
+            session.cleartext_creds.append({
+                "protocol": proto_name,
+                "description": description,
+                "src": src_ip,
+                "dst": dst_ip,
+                "port": dport if dport in ports else sport,
+                "ts": ts,
+            })
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +811,15 @@ class PcapMetadataSummary:
         lines.append(f"  DNS queries:     {len(s.dns_queries):,}")
         lines.append(f"  HTTP requests:   {len(s.http_requests):,}")
         lines.append(f"  TLS handshakes:  {len(s.tls_handshakes):,}")
+        if s.ot_transactions:
+            ot_protos = Counter(t["protocol"] for t in s.ot_transactions)
+            lines.append("")
+            lines.append("  OT/ICS Protocols:")
+            for p, c in ot_protos.most_common():
+                lines.append(f"    {p:<16} {c:>6,} transactions")
+        if s.cleartext_creds:
+            lines.append(f"")
+            lines.append(f"  ⚠️  Cleartext credentials detected: {len(s.cleartext_creds)}")
 
         return ToolResult(ok=True, result={"text": "\n".join(lines)})
 
@@ -600,6 +848,28 @@ class PcapMetadataSummary:
         lines.append(f"  DNS queries:       {len(s.dns_queries):,}")
         lines.append(f"  HTTP requests:     {len(s.http_requests):,}")
         lines.append(f"  TLS handshakes:    {len(s.tls_handshakes):,}")
+        if s.ot_transactions:
+            lines.append("")
+            lines.append("  OT/ICS Protocols:")
+            ot_protos = Counter(t["protocol"] for t in s.ot_transactions)
+            for p, c in ot_protos.most_common():
+                lines.append(f"    {p:<16} {c:>6,} transactions")
+            # Write vs read breakdown for protocols that support it
+            writes = [t for t in s.ot_transactions if t.get("is_write")]
+            controls = [t for t in s.ot_transactions if t.get("is_control")]
+            exceptions = [t for t in s.ot_transactions if t.get("is_exception")]
+            if writes:
+                lines.append(f"    ⚠️  Write operations:   {len(writes):,}")
+            if controls:
+                lines.append(f"    🔴 Control commands:   {len(controls):,}")
+            if exceptions:
+                lines.append(f"    ⚠️  Exception responses: {len(exceptions):,}")
+        if s.cleartext_creds:
+            lines.append("")
+            lines.append(f"  ⚠️  CLEARTEXT CREDENTIALS: {len(s.cleartext_creds)} detection(s)")
+            cred_protos = Counter(c["protocol"] for c in s.cleartext_creds)
+            for p, c in cred_protos.most_common():
+                lines.append(f"    {p:<20} {c:>4} occurrence(s)")
         return ToolResult(ok=True, result={"text": "\n".join(lines)})
 
     # ----- conversations -----

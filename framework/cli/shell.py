@@ -782,6 +782,13 @@ class EventMillShell(cmd.Cmd):
                 f"{len(session.unique_ips)} IPs ({internal} internal, {external} external), "
                 f"duration {_format_duration(duration)}"
             )
+            if session.ot_transactions:
+                from collections import Counter as _Counter
+                ot_protos = _Counter(t["protocol"] for t in session.ot_transactions)
+                ot_summary = ", ".join(f"{p}:{c}" for p, c in ot_protos.most_common(5))
+                print(f"  ✓ OT/ICS protocols: {ot_summary}")
+            if session.cleartext_creds:
+                print(f"  ⚠️  Cleartext credentials detected: {len(session.cleartext_creds)}")
             print(f"  PCAP ready — use 'run pcap_metadata_summary {{\"mode\": \"summary\"}}' or any pcap tool.")
         except ImportError:
             print("  Note: pcap_metadata_summary plugin not available; manual 'run' with mode=load required.")

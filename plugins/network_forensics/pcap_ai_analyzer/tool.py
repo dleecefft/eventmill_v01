@@ -60,6 +60,45 @@ YOUR ROLE:
 """
 
 # ---------------------------------------------------------------------------
+# OT / ICS System Identity
+# ---------------------------------------------------------------------------
+
+PCAP_OT_SYSTEM_IDENTITY = """SYSTEM IDENTITY:
+You are an AI-powered OT/ICS Network Forensics Analyst specializing in Industrial Control System
+security within a Critical Infrastructure Security Operations Center.
+
+CRITICAL UNDERSTANDING:
+- You are analyzing PARSED metadata from network traffic captures (PCAP files) containing
+  Operational Technology (OT) and Industrial Control System (ICS) protocols.
+- These are EXPORTED captures, not live traffic. You cannot interact with the control network.
+- Your analysis covers both IT protocols traversing the OT network AND native ICS protocols
+  (Modbus/TCP, DNP3, S7comm, EtherNet/IP-CIP, OPC-UA, BACnet, IEC-104, etc.).
+- OT networks have DIFFERENT baselines than IT: predictable polling cycles, fixed device roles,
+  minimal DNS, rare new connections. Any deviation is significant.
+- You can only READ and ANALYZE — you CANNOT take remediation actions.
+
+YOUR ROLE:
+1. ANALYZE: Identify anomalous OT protocol behavior — unauthorized writes, unexpected function
+   codes, rogue devices, polling disruptions, and IT-to-OT zone crossover traffic.
+2. CORRELATE: Connect indicators across ICS protocols, cleartext credentials, network flows,
+   and any IT traffic on the OT segment.
+3. ASSESS: Evaluate potential SAFETY IMPACT — can the observed activity affect physical
+   processes (valve positions, breaker states, setpoints, safety instrumented systems)?
+4. REFERENCE: Map findings to MITRE ATT&CK for ICS framework (not Enterprise).
+5. RECOMMEND: Suggest specific next steps aligned with IEC 62443 zones/conduits model.
+
+KEY OT SECURITY PRINCIPLES:
+- The Purdue Model defines network segmentation levels (0-5). Traffic crossing levels
+  (especially Level 3 IT → Level 1/0 control) is inherently suspicious.
+- In OT, AVAILABILITY and SAFETY outweigh confidentiality. A write to a safety PLC register
+  is more critical than data exfiltration.
+- Many ICS protocols have NO authentication by design (Modbus, older DNP3, BACnet).
+  Unauthorized access is trivial — the question is whether it happened.
+- Cleartext credentials on OT networks are a severe finding — they enable lateral movement
+  from IT to safety-critical systems.
+"""
+
+# ---------------------------------------------------------------------------
 # Prompt templates (three tiers)
 # ---------------------------------------------------------------------------
 
@@ -136,16 +175,132 @@ End with:
 - Top 1-3 bullet points: most urgent IOCs and immediate actions
 """
 
-# Mode → (prompt_template, underlying_hunt_type)
-MODE_CONFIG: dict[str, tuple[str, str | None]] = {
-    "triage_summary": (TRIAGE_PROMPT, None),        # Uses pcap_metadata_summary
-    "hunt_talkers": (TRIAGE_PROMPT, "talkers"),
-    "hunt_beacons": (THREAT_HUNT_PROMPT, "beacons"),
-    "hunt_dns": (THREAT_HUNT_PROMPT, "dns"),
-    "hunt_tls": (THREAT_HUNT_PROMPT, "tls"),
-    "hunt_lateral": (THREAT_HUNT_PROMPT, "lateral"),
-    "hunt_exfil": (REPORTING_PROMPT, "exfil"),
-    "report": (REPORTING_PROMPT, None),              # Uses pcap_metadata_summary
+# ---------------------------------------------------------------------------
+# OT / ICS Prompt templates
+# ---------------------------------------------------------------------------
+
+OT_TRIAGE_PROMPT = """{system_identity}
+{alert_condition}
+{investigation_context}CURRENT TASK:
+You are an OT Security Analyst conducting initial triage on a network capture from an
+industrial control system (ICS) / SCADA environment.
+
+SUMMARY DATA:
+{pcap_summary_data}
+
+ANALYSIS TASKS:
+1. OT PROTOCOL BASELINE: Review ICS protocol transactions (Modbus, DNP3, S7, CIP, OPC-UA,
+   BACnet, IEC-104). Identify unexpected function codes, write operations from unusual sources,
+   diagnostic/restart commands, and exception responses.
+2. ZONE VIOLATION CHECK: Identify any traffic crossing Purdue Model boundaries — IT subnet
+   IPs communicating with control network devices, external IPs reaching ICS ports, or
+   unexpected internal-to-internal OT lateral movement.
+3. CREDENTIAL EXPOSURE: Review cleartext credential detections. Assess severity based on
+   which protocols and which network segments are affected. Flag any credentials that could
+   enable IT-to-OT pivot.
+4. DEVICE INVENTORY ANOMALY: Check for rogue devices — IPs that appear as OT protocol
+   sources/destinations but seem unusual (e.g., workstation IPs sending Modbus writes).
+5. PRIORITIZATION: Rank the top 3 findings by severity using OT-specific criteria:
+   - CRITICAL: Direct process impact risk (unauthorized writes to PLCs, safety system commands)
+   - HIGH: Zone violations, credential exposure, unauthorized access to ICS protocols
+   - MEDIUM: Reconnaissance activity, unusual polling patterns
+   - LOW: Minor anomalies, informational
+6. SAFETY ASSESSMENT: Could any observed activity lead to physical process manipulation?
+
+End with:
+⚡ TL;DR
+- One-line safety/risk verdict
+- Top 1-3 bullet points: most critical OT-specific findings
+"""
+
+OT_THREAT_HUNT_PROMPT = """{system_identity}
+{alert_condition}
+{investigation_context}CURRENT TASK:
+You are an OT Threat Hunter analyzing parsed PCAP data for ICS-targeted intrusions,
+state-sponsored ICS attacks (TRITON/TRISIS, Industroyer, PIPEDREAM/INCONTROLLER patterns),
+or insider threats targeting operational technology.
+
+SUMMARY DATA:
+{pcap_summary_data}
+
+ANALYSIS TASKS:
+1. MITRE ATT&CK FOR ICS MAPPING: Map observed behavior to MITRE ATT&CK for ICS Tactics and
+   Techniques (use ICS-specific technique IDs like T0803, T0855, T0836, etc.).
+   Key tactics to evaluate:
+   - Initial Access (T0819, T0886) — IT-to-OT pivot evidence
+   - Execution (T0807, T0823) — Command execution on controllers
+   - Inhibit Response Function (T0803, T0804, T0816) — Safety system manipulation
+   - Impair Process Control (T0836, T0855) — Setpoint changes, unauthorized writes
+   - Collection (T0801, T0802) — Process data gathering/reconnaissance
+2. ATTACK PATTERN MATCHING: Compare observed traffic patterns against known ICS attack
+   playbooks:
+   - TRITON/TRISIS: Safety Instrumented System (SIS) communication anomalies
+   - Industroyer: IEC-104 unauthorized commands to breaker controls
+   - PIPEDREAM/INCONTROLLER: Multi-protocol reconnaissance + targeted writes
+   - Stuxnet-style: Legitimate-looking writes with subtly modified values
+3. HYPOTHESIS GENERATION: Formulate three (3) hypotheses about attacker objectives
+   specific to OT (e.g., "Hypothesis 1: Process Disruption via Unauthorized Modbus
+   Register Writes", "Hypothesis 2: Safety System Bypass via S7 PLC Stop Command").
+4. EVIDENCE GAPS: What additional data sources would confirm/deny each hypothesis?
+   (Engineering workstation logs, historian data, change management records, physical
+   process readings)
+
+End with:
+⚡ TL;DR
+- One-line safety/risk verdict
+- Top 1-3 bullet points: most critical OT hypotheses and next checks
+"""
+
+OT_REPORTING_PROMPT = """{system_identity}
+{alert_condition}
+{investigation_context}CURRENT TASK:
+You are a Senior OT Incident Responder preparing documentation for the OT Security Team
+and Plant Operations.
+
+SUMMARY DATA:
+{pcap_summary_data}
+
+ANALYSIS TASKS:
+1. EXECUTIVE SUMMARY: Concise summary for both cybersecurity leadership AND plant operations
+   management. Include potential SAFETY IMPACT assessment.
+2. OT-SPECIFIC IoCs: Extract all potential indicators as:
+   [Type] | [Value] | [OT Context/Risk]
+   Include: unauthorized ICS protocol sources, suspicious function codes, write targets,
+   credential exposure, zone violations.
+3. PROCESS SAFETY ASSESSMENT:
+   - Were any writes detected to safety-critical registers or PLCs?
+   - Were any PLC stop/start/restart commands observed?
+   - Were any diagnostic/firmware commands detected?
+   - Could observed activity affect Safety Instrumented Systems (SIS)?
+4. IMMEDIATE ACTIONS (prioritized for OT):
+   - Process safety actions (verify physical process state)
+   - Network containment (isolate without disrupting running processes)
+   - Forensic preservation (controller backups, historian snapshots)
+5. IEC 62443 COMPLIANCE: Which security levels (SL) and zones are affected?
+6. LIMITATION CAVEATS: What cannot be determined from parsed PCAP alone.
+
+Format as a professional OT incident report suitable for both CISO and Plant Manager.
+
+End with:
+⚡ TL;DR
+- One-line safety verdict
+- Top 1-3 bullet points: most urgent safety/security actions
+"""
+
+# Mode → (prompt_template, underlying_hunt_type, system_identity_override)
+MODE_CONFIG: dict[str, tuple[str, str | None, str | None]] = {
+    "triage_summary": (TRIAGE_PROMPT, None, None),
+    "hunt_talkers": (TRIAGE_PROMPT, "talkers", None),
+    "hunt_beacons": (THREAT_HUNT_PROMPT, "beacons", None),
+    "hunt_dns": (THREAT_HUNT_PROMPT, "dns", None),
+    "hunt_tls": (THREAT_HUNT_PROMPT, "tls", None),
+    "hunt_lateral": (THREAT_HUNT_PROMPT, "lateral", None),
+    "hunt_exfil": (REPORTING_PROMPT, "exfil", None),
+    "report": (REPORTING_PROMPT, None, None),
+    # OT / ICS modes
+    "ot_triage": (OT_TRIAGE_PROMPT, None, PCAP_OT_SYSTEM_IDENTITY),
+    "ot_threat_hunt": (OT_THREAT_HUNT_PROMPT, None, PCAP_OT_SYSTEM_IDENTITY),
+    "ot_report": (OT_REPORTING_PROMPT, None, PCAP_OT_SYSTEM_IDENTITY),
 }
 
 
@@ -196,23 +351,28 @@ class PcapAiAnalyzer:
 
         mode = payload["mode"]
         condition_orange = payload.get("condition_orange", False)
+        is_ot_mode = mode.startswith("ot_")
 
         # Also check context.config for condition_orange (set by CLI --orange flag)
         if not condition_orange and hasattr(context, "config"):
             condition_orange = context.config.get("condition_orange", False)
 
         try:
-            # Step 1: Get static output
-            static_output = self._get_static_output(session, mode, payload)
+            # Step 1: Get static output (OT modes get OT-enriched summary)
+            if is_ot_mode:
+                static_output = self._get_ot_static_output(session)
+            else:
+                static_output = self._get_static_output(session, mode, payload)
 
             # Step 2: Load investigation context from any markdown/text artifact
             investigation_context = self._load_investigation_context(context)
 
             # Step 3: Build prompt
-            prompt_template, _ = MODE_CONFIG[mode]
+            prompt_template, _, system_identity_override = MODE_CONFIG[mode]
+            system_identity = system_identity_override or PCAP_SYSTEM_IDENTITY
             alert_condition = self._get_alert_condition(condition_orange)
             prompt = prompt_template.format(
-                system_identity=PCAP_SYSTEM_IDENTITY,
+                system_identity=system_identity,
                 alert_condition=alert_condition,
                 investigation_context=investigation_context,
                 pcap_summary_data=static_output,
@@ -238,7 +398,7 @@ class PcapAiAnalyzer:
             # Step 4: Query LLM
             response = context.llm_query.query_text(
                 prompt=prompt,
-                system_context=PCAP_SYSTEM_IDENTITY,
+                system_context=system_identity,
                 max_tokens=16384,
             )
 
@@ -270,10 +430,11 @@ class PcapAiAnalyzer:
                 )
 
             ai_text = response.text or ""
+            mode_label = f"OT/ICS ANALYSIS" if is_ot_mode else "AI ANALYSIS"
             combined = (
                 static_output
                 + "\n\n" + "=" * 60 + "\n"
-                + "🔍 AI ANALYSIS"
+                + f"🔍 {mode_label}"
                 + (" 🚨 CONDITION ORANGE" if condition_orange else "")
                 + "\n" + "=" * 60 + "\n"
                 + ai_text
@@ -398,7 +559,7 @@ class PcapAiAnalyzer:
     @staticmethod
     def _get_static_output(session: Any, mode: str, payload: dict) -> str:
         """Run the underlying static analysis tool and get its text output."""
-        _, hunt_type = MODE_CONFIG[mode]
+        _, hunt_type, _ = MODE_CONFIG[mode]
 
         # Build PCAP context header — always included
         header = PcapAiAnalyzer._build_pcap_header(session)
@@ -423,6 +584,178 @@ class PcapAiAnalyzer:
             hunt_text = f"Hunt '{hunt_type}' failed: {result.message}"
 
         return header + "\n\n" + hunt_text
+
+    @staticmethod
+    def _get_ot_static_output(session: Any) -> str:
+        """Build OT/ICS-focused static summary for OT analysis modes."""
+        from plugins.network_forensics.pcap_metadata_summary.tool import (
+            is_internal, _format_bytes, _OT_PORT_PROTOCOL,
+            _MODBUS_FUNC_NAMES,
+        )
+        from plugins.network_forensics.pcap_threat_hunter.tool import PcapThreatHunter
+        from collections import Counter, defaultdict
+
+        lines = []
+
+        # --- Standard PCAP header ---
+        header = PcapAiAnalyzer._build_pcap_header(session)
+        lines.append(header)
+
+        # --- OT Protocol Summary ---
+        ot = session.ot_transactions
+        if ot:
+            lines.append(f"\n{'=' * 60}")
+            lines.append("OT / ICS PROTOCOL ACTIVITY")
+            lines.append(f"{'=' * 60}")
+
+            ot_protos = Counter(t["protocol"] for t in ot)
+            lines.append(f"\nTotal OT transactions: {len(ot):,}")
+            lines.append("\nProtocol breakdown:")
+            for proto, cnt in ot_protos.most_common():
+                lines.append(f"  {proto:<18} {cnt:>6,} transactions")
+
+            # Unique OT endpoints
+            ot_sources = set(t["src"] for t in ot)
+            ot_dests = set(t["dst"] for t in ot)
+            ot_endpoints = ot_sources | ot_dests
+            int_ot = [ip for ip in ot_endpoints if is_internal(ip)]
+            ext_ot = [ip for ip in ot_endpoints if not is_internal(ip)]
+            lines.append(f"\nOT endpoints: {len(ot_endpoints)} total "
+                         f"({len(int_ot)} internal, {len(ext_ot)} external)")
+            if ext_ot:
+                lines.append(f"  ⚠️  EXTERNAL IPs on OT protocols: {', '.join(sorted(ext_ot)[:10])}")
+
+            # Write operations
+            writes = [t for t in ot if t.get("is_write")]
+            if writes:
+                lines.append(f"\n🔶 WRITE OPERATIONS: {len(writes):,}")
+                lines.append("-" * 60)
+                write_by_src = defaultdict(list)
+                for w in writes:
+                    write_by_src[w["src"]].append(w)
+                for src, ws in sorted(write_by_src.items(), key=lambda x: len(x[1]), reverse=True)[:15]:
+                    dsts = sorted(set(w["dst"] for w in ws))
+                    protos = sorted(set(w["protocol"] for w in ws))
+                    func_names = sorted(set(w.get("function_name", "?") for w in ws))
+                    lines.append(
+                        f"  {src} → {', '.join(dsts[:5])} | "
+                        f"{', '.join(protos)} | {len(ws)} writes | "
+                        f"Functions: {', '.join(func_names[:5])}"
+                    )
+
+            # Control commands (PLC stop/start/restart, direct operate)
+            controls = [t for t in ot if t.get("is_control")]
+            if controls:
+                lines.append(f"\n🔴 CONTROL COMMANDS: {len(controls):,}")
+                lines.append("-" * 60)
+                for c in controls[:20]:
+                    func = c.get("function_name") or c.get("function", "?")
+                    lines.append(
+                        f"  {c['src']} → {c['dst']}:{c['port']} ({c['protocol']}) "
+                        f"— {func}"
+                    )
+
+            # Exception responses
+            exceptions = [t for t in ot if t.get("is_exception")]
+            if exceptions:
+                lines.append(f"\n⚠️  EXCEPTION RESPONSES: {len(exceptions):,}")
+                lines.append("-" * 60)
+                exc_by_func = Counter(
+                    (t.get("function_name", "?"), t.get("exception_code", "?"))
+                    for t in exceptions
+                )
+                for (func, exc_code), cnt in exc_by_func.most_common(10):
+                    lines.append(f"  {func} exception code={exc_code} — {cnt} occurrence(s)")
+
+            # Diagnostic/firmware commands
+            diags = [t for t in ot if t.get("is_diagnostic")]
+            if diags:
+                lines.append(f"\n⚠️  DIAGNOSTIC COMMANDS: {len(diags):,}")
+                lines.append("-" * 60)
+                for d in diags[:10]:
+                    func = d.get("function_name", "?")
+                    lines.append(
+                        f"  {d['src']} → {d['dst']}:{d['port']} ({d['protocol']}) — {func}"
+                    )
+
+            # Per-protocol function code distribution (Modbus detail)
+            modbus_txns = [t for t in ot if t["protocol"] == "Modbus" and "function_code" in t]
+            if modbus_txns:
+                lines.append(f"\nModbus Function Code Distribution ({len(modbus_txns):,} parsed):")
+                func_dist = Counter(
+                    (t["function_code"], t.get("function_name", "?"))
+                    for t in modbus_txns
+                )
+                for (fc, fname), cnt in func_dist.most_common():
+                    marker = " ⚠️ WRITE" if fc in {5, 6, 15, 16, 22, 23} else ""
+                    marker = " 🔴 DIAG" if fc in {8, 43} else marker
+                    lines.append(f"  FC {fc:>3} ({fname:<28}) {cnt:>6,}{marker}")
+
+            # Modbus unit IDs seen
+            unit_ids = sorted(set(t.get("unit_id", -1) for t in modbus_txns if "unit_id" in t))
+            if unit_ids:
+                lines.append(f"\nModbus Unit IDs: {', '.join(str(u) for u in unit_ids[:30])}")
+
+        else:
+            lines.append(f"\n{'=' * 60}")
+            lines.append("OT / ICS PROTOCOL ACTIVITY")
+            lines.append(f"{'=' * 60}")
+            lines.append("No OT/ICS protocol transactions detected in this capture.")
+            lines.append("(Checked ports: " + ", ".join(
+                f"{p}/{n}" for p, n in sorted(_OT_PORT_PROTOCOL.items())
+            ) + ")")
+
+        # --- Cleartext Credentials ---
+        creds = session.cleartext_creds
+        if creds:
+            lines.append(f"\n{'=' * 60}")
+            lines.append(f"⚠️  CLEARTEXT CREDENTIALS DETECTED: {len(creds)} instance(s)")
+            lines.append(f"{'=' * 60}")
+            cred_by_proto = defaultdict(list)
+            for c in creds:
+                cred_by_proto[c["protocol"]].append(c)
+            for proto, detections in sorted(cred_by_proto.items(), key=lambda x: len(x[1]), reverse=True):
+                src_dst_pairs = sorted(set((d["src"], d["dst"]) for d in detections))
+                desc = detections[0].get("description", "")
+                lines.append(
+                    f"  {proto:<22} {len(detections):>4} detection(s)  — {desc}"
+                )
+                for src, dst in src_dst_pairs[:5]:
+                    lines.append(f"    {src} → {dst}")
+                if len(src_dst_pairs) > 5:
+                    lines.append(f"    ... +{len(src_dst_pairs) - 5} more pairs")
+
+        # --- Standard IT hunts (beacons, lateral, exfil) ---
+        hunter = PcapThreatHunter()
+
+        beacons_result = hunter.execute({"hunt": "beacons"}, None)
+        if beacons_result.ok and beacons_result.result:
+            beacon_text = beacons_result.result.get("summary_text", "")
+            if beacon_text and "No C2 beaconing" not in beacon_text:
+                lines.append(f"\n{'=' * 60}")
+                lines.append("C2 Beaconing Detection")
+                lines.append(f"{'=' * 60}")
+                lines.append(beacon_text)
+
+        lateral_result = hunter.execute({"hunt": "lateral"}, None)
+        if lateral_result.ok and lateral_result.result:
+            lateral_text = lateral_result.result.get("summary_text", "")
+            if lateral_text and "No lateral movement" not in lateral_text:
+                lines.append(f"\n{'=' * 60}")
+                lines.append("Lateral Movement & ICS Cross-Zone")
+                lines.append(f"{'=' * 60}")
+                lines.append(lateral_text)
+
+        ports_result = hunter.execute({"hunt": "ports"}, None)
+        if ports_result.ok and ports_result.result:
+            port_text = ports_result.result.get("summary_text", "")
+            if port_text:
+                lines.append(f"\n{'=' * 60}")
+                lines.append("Port Analysis")
+                lines.append(f"{'=' * 60}")
+                lines.append(port_text)
+
+        return "\n".join(lines)
 
     @staticmethod
     def _build_pcap_header(session: Any) -> str:
@@ -460,6 +793,11 @@ class PcapAiAnalyzer:
         lines.append(f"\nDNS: {len(session.dns_queries)} queries | "
                      f"HTTP: {len(session.http_requests)} requests | "
                      f"TLS: {len(session.tls_handshakes)} handshakes")
+
+        if session.ot_transactions:
+            lines.append(f"OT/ICS: {len(session.ot_transactions):,} transactions")
+        if session.cleartext_creds:
+            lines.append(f"⚠️  Cleartext credentials: {len(session.cleartext_creds)} detection(s)")
 
         return "\n".join(lines)
 
