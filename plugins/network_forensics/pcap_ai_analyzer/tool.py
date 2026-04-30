@@ -305,7 +305,7 @@ MODE_CONFIG: dict[str, tuple[str, str | None, str | None]] = {
 
 
 # ---------------------------------------------------------------------------
-# PDF export helper (fpdf2)
+# PDF export helper (fpdf2) — professional report renderer
 # ---------------------------------------------------------------------------
 
 # Unicode → ASCII replacements for PDF rendering with built-in fonts
@@ -326,14 +326,29 @@ _PDF_UNICODE_MAP = {
     "\u00b7": ".",    # middle dot
     "\u2212": "-",    # minus sign
     "\u00a0": " ",    # non-breaking space
+    "\u2705": "[OK]",    # check mark
+    "\u274c": "[X]",     # cross mark
+    "\u25cf": "*",       # black circle
+    "\u25cb": "o",       # white circle
+    "\u25ba": ">",       # right pointer
+    "\u00ab": "<<",      # left guillemet
+    "\u00bb": ">>",      # right guillemet
 }
+
+# Sections that contain dense repetitive data — truncate after N visible lines
+_DATA_HEAVY_SECTIONS = {
+    "INTERNAL LATERAL MOVEMENT",
+    "ICS PROTOCOL CROSS-ZONE TRAFFIC",
+    "PORT SCAN PATTERNS",
+    "UNKNOWN HIGH PORTS",
+}
+_DATA_SECTION_MAX_LINES = 20  # Show at most this many data lines per section
 
 
 def _pdf_safe(text: str) -> str:
     """Convert Unicode text to ASCII-safe string for PDF built-in fonts."""
     for uc, repl in _PDF_UNICODE_MAP.items():
         text = text.replace(uc, repl)
-    # Strip remaining non-ASCII (emoji, etc.)
     return text.encode("ascii", "ignore").decode("ascii")
 
 
@@ -344,105 +359,414 @@ def _export_pdf(
     mode: str = "",
     condition_orange: bool = False,
 ) -> Path | None:
-    """Render report text to a PDF file using fpdf2. Returns path or None on failure."""
+    """Render a professional, executive-readable PDF report using fpdf2."""
     try:
         from fpdf import FPDF
     except ImportError:
-        print("  ⚠️  fpdf2 not installed — PDF export skipped. Install with: pip install fpdf2")
+        print("  ⚠️  fpdf2 not installed -- PDF export skipped. Install with: pip install fpdf2")
         return None
 
+    # --- Colour palette ---
+    CLR_GREY_FOOTER = (100, 100, 100)
+    CLR_NAVY = (22, 42, 72)          # section header background
+    CLR_DARK_SLATE = (47, 62, 80)    # sub-header background
+    CLR_WHITE = (255, 255, 255)
+    CLR_BLACK = (0, 0, 0)
+    CLR_RED = (180, 30, 30)          # CRITICAL text
+    CLR_ORANGE = (200, 100, 20)      # HIGH / warning text
+    CLR_GREY = (100, 100, 100)       # secondary text
+    CLR_LIGHT_GREY = (230, 230, 230) # zebra row background
+    CLR_ACCENT_LINE = (22, 42, 72)   # thin accent lines
+
     try:
-        pdf = FPDF()
-        pdf.set_auto_page_break(auto=True, margin=20)
+        # Subclass for automatic page footer
+        class _ReportPDF(FPDF):
+            def footer(self):
+                self.set_y(-15)
+                self.set_font("Helvetica", "I", 7)
+                self.set_text_color(*CLR_GREY_FOOTER)
+                self.cell(0, 4, f"Event Mill  |  Page {self.page_no()} of {{nb}}",
+                          align="C")
+
+        pdf = _ReportPDF()
+        pdf.alias_nb_pages()
+        pdf.set_auto_page_break(auto=True, margin=22)
+
+        eff_w = pdf.w - pdf.l_margin - pdf.r_margin  # effective width
+
+        # ===================================================================
+        # COVER PAGE
+        # ===================================================================
+        pdf.add_page()
+        # Navy banner at top
+        pdf.set_fill_color(*CLR_NAVY)
+        pdf.rect(0, 0, 210, 55, "F")
+
+        # Title
+        pdf.set_y(12)
+        pdf.set_text_color(*CLR_WHITE)
+        pdf.set_font("Helvetica", "B", 22)
+        if mode.startswith("ot_"):
+            pdf.cell(0, 10, "OT / ICS  PCAP Analysis Report", align="C",
+                     new_x="LMARGIN", new_y="NEXT")
+        else:
+            pdf.cell(0, 10, "PCAP AI Analysis Report", align="C",
+                     new_x="LMARGIN", new_y="NEXT")
+
+        pdf.set_font("Helvetica", "", 11)
+        pdf.cell(0, 7, "Event Mill  |  Network Forensics Division", align="C",
+                 new_x="LMARGIN", new_y="NEXT")
+
+        # Condition Orange banner (if active)
+        if condition_orange:
+            pdf.set_y(55)
+            pdf.set_fill_color(220, 80, 20)
+            pdf.rect(0, 55, 210, 10, "F")
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.set_text_color(*CLR_WHITE)
+            pdf.cell(0, 10, "!! CONDITION ORANGE -- HEIGHTENED ALERT POSTURE !!", align="C",
+                     new_x="LMARGIN", new_y="NEXT")
+
+        # Meta info box
+        pdf.set_y(75)
+        pdf.set_text_color(*CLR_BLACK)
+        pdf.set_font("Helvetica", "", 10)
+        ts_str = datetime.now().strftime("%Y-%m-%d  %H:%M:%S UTC")
+        mode_display = mode.replace("_", " ").upper()
+
+        # Extract PCAP filename and key stats from the content header
+        pcap_name = ""
+        pcap_stats_lines: list[str] = []
+        for raw_line in content.split("\n")[:30]:
+            ln = raw_line.strip()
+            if ln.startswith("PCAP ANALYSIS:"):
+                pcap_name = ln.split(":", 1)[1].strip()
+            elif ln.startswith(("Size:", "Time:", "IPs:", "DNS:")):
+                pcap_stats_lines.append(ln)
+            elif ln.startswith(("TCP", "UDP", "ICMP", "OTHER")):
+                pcap_stats_lines.append("  " + ln)
+            elif ln.startswith("Protocols:"):
+                pcap_stats_lines.append(ln)
+            elif ln.startswith("OT/ICS:") or "Cleartext credentials:" in ln:
+                pcap_stats_lines.append(ln)
+
+        meta_items = [
+            ("Analysis Mode:", mode_display),
+            ("Generated:", ts_str),
+        ]
+        if pcap_name:
+            meta_items.insert(0, ("PCAP File:", pcap_name))
+
+        for label, val in meta_items:
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.cell(40, 6, label)
+            pdf.set_font("Helvetica", "", 10)
+            pdf.cell(0, 6, _pdf_safe(val), new_x="LMARGIN", new_y="NEXT")
+
+        # Key stats summary
+        if pcap_stats_lines:
+            pdf.ln(3)
+            pdf.set_draw_color(*CLR_ACCENT_LINE)
+            pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
+            pdf.ln(3)
+            pdf.set_font("Helvetica", "B", 10)
+            pdf.cell(0, 6, "Capture Summary", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_font("Helvetica", "", 9)
+            for stat_line in pcap_stats_lines:
+                pdf.cell(0, 5, _pdf_safe(stat_line), new_x="LMARGIN", new_y="NEXT")
+
+        # Classification footer on cover
+        pdf.set_y(260)
+        pdf.set_draw_color(*CLR_ACCENT_LINE)
+        pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
+        pdf.ln(2)
+        pdf.set_font("Helvetica", "I", 8)
+        pdf.set_text_color(*CLR_GREY)
+        pdf.cell(0, 4, "Confidential -- For authorized security personnel only",
+                 align="C", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(0, 4, "Full data export available in companion .md file",
+                 align="C", new_x="LMARGIN", new_y="NEXT")
+
+        # ===================================================================
+        # BODY PAGES — parse content into structured sections
+        # ===================================================================
+
+        # Helper: draw a coloured section header bar
+        def _section_header(title_text: str, bg: tuple = CLR_NAVY) -> None:
+            pdf.ln(4)
+            pdf.set_fill_color(*bg)
+            pdf.set_text_color(*CLR_WHITE)
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.cell(eff_w, 8, "  " + _pdf_safe(title_text),
+                     fill=True, new_x="LMARGIN", new_y="NEXT")
+            pdf.set_text_color(*CLR_BLACK)
+            pdf.ln(2)
+
+        # Helper: draw a sub-section header
+        def _sub_header(title_text: str) -> None:
+            pdf.ln(2)
+            pdf.set_fill_color(*CLR_DARK_SLATE)
+            pdf.set_text_color(*CLR_WHITE)
+            pdf.set_font("Helvetica", "B", 9)
+            pdf.cell(eff_w, 6, "  " + _pdf_safe(title_text),
+                     fill=True, new_x="LMARGIN", new_y="NEXT")
+            pdf.set_text_color(*CLR_BLACK)
+            pdf.ln(1)
+
+        # Helper: body text line
+        def _body_line(text: str, bold: bool = False, color: tuple = CLR_BLACK,
+                       font_size: float = 9, indent: float = 0) -> None:
+            pdf.set_text_color(*color)
+            style = "B" if bold else ""
+            pdf.set_font("Helvetica", style, font_size)
+            if indent:
+                pdf.set_x(pdf.l_margin + indent)
+                w = eff_w - indent
+            else:
+                w = eff_w
+            pdf.multi_cell(w, 4.5, _pdf_safe(text))
+
+        # Helper: monospace data line (small)
+        def _data_line(text: str, bold: bool = False) -> None:
+            style = "B" if bold else ""
+            pdf.set_text_color(*CLR_BLACK)
+            pdf.set_font("Courier", style, 7)
+            pdf.multi_cell(eff_w, 3.5, _pdf_safe(text))
+
+        # --- Parse content into sections (split on ===== dividers) ---
+        raw_sections: list[tuple[str, list[str]]] = []
+        current_title = ""
+        current_lines: list[str] = []
+
+        for raw_line in content.split("\n"):
+            stripped = raw_line.strip()
+            # Detect section headers: a line of ====, then the title, then ====
+            if stripped.startswith("=" * 10):
+                # If we have pending lines, save them
+                if current_title or current_lines:
+                    raw_sections.append((current_title, current_lines))
+                    current_lines = []
+                # Next non-empty, non-==== line is the title
+                current_title = "__DIVIDER__"
+                continue
+            if current_title == "__DIVIDER__":
+                current_title = stripped
+                continue
+            current_lines.append(raw_line)
+        # Save final section
+        if current_title or current_lines:
+            raw_sections.append((current_title, current_lines))
+
+        # --- Render each section ---
         pdf.add_page()
 
-        # --- Title ---
-        pdf.set_font("Helvetica", "B", 16)
-        title = "Event Mill - PCAP AI Analysis Report"
-        if mode.startswith("ot_"):
-            title = "Event Mill - OT/ICS PCAP Analysis Report"
-        pdf.cell(0, 10, title, new_x="LMARGIN", new_y="NEXT", align="C")
-
-        # Subtitle with mode and timestamp
-        pdf.set_font("Helvetica", "I", 10)
-        subtitle = f"Mode: {mode}"
-        if condition_orange:
-            subtitle += "  |  CONDITION ORANGE"
-        ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
-        subtitle += f"  |  Generated: {ts_str}"
-        pdf.cell(0, 6, subtitle, new_x="LMARGIN", new_y="NEXT", align="C")
-        pdf.ln(6)
-
-        # --- Body ---
-        pdf.set_font("Courier", "", 8)
-        effective_width = pdf.w - pdf.l_margin - pdf.r_margin
-
-        for line in content.split("\n"):
-            clean = _pdf_safe(line)
-
-            # Section headers (lines of === or ---)
-            if line.startswith("====") or line.startswith("----"):
-                pdf.set_font("Courier", "", 8)
-                pdf.cell(0, 4, clean[:120], new_x="LMARGIN", new_y="NEXT")
+        for sec_title, sec_lines in raw_sections:
+            if not sec_title or sec_title == "__DIVIDER__":
+                # Pre-header content — already shown on cover page, skip
                 continue
 
-            # Markdown headings (## or ###)
-            if line.startswith("### "):
-                pdf.set_font("Helvetica", "B", 10)
-                pdf.multi_cell(effective_width, 5, _pdf_safe(line[4:]))
-                pdf.set_font("Courier", "", 8)
-                continue
-            if line.startswith("## "):
-                pdf.set_font("Helvetica", "B", 12)
-                pdf.multi_cell(effective_width, 6, _pdf_safe(line[3:]))
-                pdf.set_font("Courier", "", 8)
-                continue
-
-            # Section emoji headers
-            if any(line.startswith(e) for e in ("🔍 ", "⚡ ")):
-                pdf.set_font("Helvetica", "B", 12)
-                if clean.strip():
-                    pdf.cell(0, 8, clean.strip(), new_x="LMARGIN", new_y="NEXT")
-                pdf.set_font("Courier", "", 8)
+            # Skip the "PCAP ANALYSIS: filename" section (cover page duplicate)
+            if sec_title.startswith("PCAP ANALYSIS:"):
+                # But render any lines that aren't already on the cover
+                non_cover = [
+                    ln for ln in sec_lines if ln.strip()
+                    and not ln.strip().startswith(("Size:", "Time:", "IPs:", "OT/ICS:", "Cleartext"))
+                    and not ln.strip().startswith("Protocols:")
+                    and not ln.strip().startswith(("TCP", "UDP", "ICMP", "OTHER", "DNS:"))
+                ]
+                if non_cover:
+                    _section_header("Capture Details")
+                    for ln in non_cover:
+                        _body_line(ln.strip(), font_size=9)
                 continue
 
-            # Bold-ish markers for severity lines
-            if any(marker in line for marker in ("CRITICAL", "🔴", "🟡", "⚠️", "**CRITICAL**", "**HIGH**")):
-                pdf.set_font("Courier", "B", 8)
-                pdf.multi_cell(effective_width, 4, clean)
-                pdf.set_font("Courier", "", 8)
-                continue
+            # Determine if this is a data-heavy section to truncate
+            is_data_heavy = any(tag in sec_title for tag in _DATA_HEAVY_SECTIONS)
+            # Identify the AI analysis section (most important)
+            is_ai_section = ("AI ANALYSIS" in sec_title.upper()
+                             or "OT/ICS ANALYSIS" in sec_title.upper())
 
-            # Markdown bold (**text**) — render whole line in bold if it starts with **
-            if clean.strip().startswith("**"):
-                pdf.set_font("Courier", "B", 8)
-                # Strip ** markers for display
-                display = clean.replace("**", "")
-                pdf.multi_cell(effective_width, 4, display)
-                pdf.set_font("Courier", "", 8)
-                continue
-
-            # Markdown list items (* or -)
-            if clean.strip().startswith("* ") or clean.strip().startswith("- "):
-                indent = len(clean) - len(clean.lstrip())
-                pdf.set_font("Courier", "", 8)
-                pdf.multi_cell(effective_width, 4, clean)
-                continue
-
-            # Regular line
-            if clean.strip():
-                pdf.multi_cell(effective_width, 4, clean)
+            # Section header colour
+            if is_ai_section:
+                _section_header(sec_title, bg=(15, 82, 35))  # dark green for AI analysis
+            elif "CREDENTIAL" in sec_title.upper():
+                _section_header(sec_title, bg=(140, 30, 30))  # dark red for credentials
+            elif "OT" in sec_title.upper() or "ICS" in sec_title.upper():
+                _section_header(sec_title, bg=(130, 70, 10))  # amber for OT
             else:
-                pdf.ln(3)
+                _section_header(sec_title)
+
+            # Track data lines for truncation (at section and sub-section level)
+            data_line_count = 0
+            truncated = False
+            in_data_heavy_subsection = is_data_heavy
+
+            for ln in sec_lines:
+                stripped = ln.strip()
+                if not stripped:
+                    pdf.ln(2)
+                    continue
+
+                # Sub-section dividers (----)
+                if stripped.startswith("-" * 10):
+                    pdf.set_draw_color(*CLR_LIGHT_GREY)
+                    pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + eff_w, pdf.get_y())
+                    pdf.ln(1)
+                    continue
+
+                # Detect sub-headers (emoji prefixed or all-caps short lines)
+                if stripped.startswith(("WRITE OPERATIONS", "CONTROL COMMANDS",
+                                       "EXCEPTION RESPONSES", "DIAGNOSTIC COMMANDS",
+                                       "STANDARD SERVICES", "ICS/SCADA PROTOCOLS",
+                                       "SUSPICIOUS PORTS", "UNKNOWN HIGH PORTS",
+                                       "PORT SCAN PATTERNS", "INTERNAL LATERAL",
+                                       "ICS PROTOCOL CROSS-ZONE",
+                                       "EXTERNAL IPs")):
+                    _sub_header(stripped)
+                    data_line_count = 0
+                    truncated = False
+                    # Check if this sub-section is data-heavy
+                    in_data_heavy_subsection = any(
+                        tag in stripped for tag in _DATA_HEAVY_SECTIONS
+                    )
+                    continue
+
+                # Data-heavy truncation
+                if in_data_heavy_subsection and not is_ai_section:
+                    # Count lines that look like data (start with IP or indent)
+                    if (stripped.startswith("10.") or stripped.startswith("161.")
+                            or stripped.startswith("->") or stripped.startswith("...")):
+                        data_line_count += 1
+                        if data_line_count > _DATA_SECTION_MAX_LINES and not truncated:
+                            pdf.ln(2)
+                            pdf.set_font("Helvetica", "I", 8)
+                            pdf.set_text_color(*CLR_GREY)
+                            remaining = sum(
+                                1 for x in sec_lines
+                                if x.strip().startswith(("10.", "161.", "->"))
+                            ) - _DATA_SECTION_MAX_LINES
+                            pdf.cell(eff_w, 4,
+                                     f"    ... +{remaining} more entries "
+                                     "(see companion .md file for complete listing)",
+                                     new_x="LMARGIN", new_y="NEXT")
+                            pdf.set_text_color(*CLR_BLACK)
+                            truncated = True
+                            continue
+                        if truncated:
+                            continue
+
+                # --- Render AI analysis content (the most important part) ---
+                if is_ai_section:
+                    # Numbered findings (e.g. "1. OT PROTOCOL BASELINE REVIEW:")
+                    if (len(stripped) > 2 and stripped[0].isdigit()
+                            and stripped[1] in ".)" and stripped[2] == " "):
+                        pdf.ln(3)
+                        _body_line(stripped, bold=True, font_size=10,
+                                   color=CLR_NAVY)
+                        continue
+
+                    # Severity markers
+                    if "CRITICAL" in stripped.upper():
+                        color = CLR_RED
+                    elif "HIGH" in stripped.upper():
+                        color = CLR_ORANGE
+                    else:
+                        color = CLR_BLACK
+
+                    # Bold markdown lines (**text**)
+                    display = stripped.replace("**", "")
+                    if stripped.startswith("**") or stripped.startswith("*   **"):
+                        _body_line(display, bold=True, color=color, font_size=9,
+                                   indent=4 if stripped.startswith("*") else 0)
+                        continue
+
+                    # Bullet points
+                    if stripped.startswith("* ") or stripped.startswith("- "):
+                        _body_line(display, color=color, font_size=9, indent=6)
+                        continue
+
+                    # MITRE / IEC references
+                    if stripped.startswith("*   "):
+                        _body_line(display, font_size=8.5, indent=10, color=CLR_GREY)
+                        continue
+
+                    # TL;DR section
+                    if stripped.upper().startswith("TL;DR"):
+                        pdf.ln(3)
+                        _sub_header("TL;DR -- Executive Summary")
+                        continue
+
+                    _body_line(display, color=color, font_size=9)
+                    continue
+
+                # --- Standard data section rendering ---
+                # Protocol summary lines (e.g. "Modbus  1,997 transactions")
+                if any(stripped.startswith(p) for p in (
+                    "Modbus", "EtherNet", "DNP3", "OPC", "BACnet", "S7",
+                    "Total OT", "OT endpoints", "Protocol breakdown"
+                )):
+                    _body_line(stripped, bold=True, font_size=9)
+                    continue
+
+                # Credential detail lines
+                if "detection(s)" in stripped:
+                    parts = stripped.split("detection(s)")
+                    _body_line(stripped, bold=True, font_size=9,
+                               color=CLR_ORANGE if int(''.join(c for c in parts[0] if c.isdigit()) or "0") > 50 else CLR_BLACK)
+                    continue
+
+                # FC distribution lines (Modbus)
+                if stripped.startswith("FC "):
+                    is_write = "WRITE" in stripped.upper()
+                    is_diag = "DIAG" in stripped.upper()
+                    _data_line(
+                        stripped,
+                        bold=is_write or is_diag,
+                    )
+                    continue
+
+                # Port analysis lines (port number + service)
+                if stripped and stripped[0].isdigit() and ("flows=" in stripped or "hosts on port" in stripped):
+                    _data_line(stripped)
+                    continue
+
+                # Indented data (arrow lines, IP listings)
+                if stripped.startswith("->") or stripped.startswith("..."):
+                    _data_line("    " + stripped)
+                    continue
+
+                # IP flow lines (10.x.x.x -> ...)
+                if stripped.startswith("10.") or stripped.startswith("161."):
+                    _data_line(stripped)
+                    continue
+
+                # SCAN? lines
+                if "SCAN?" in stripped:
+                    _body_line(stripped, bold=True, font_size=8.5, color=CLR_ORANGE)
+                    continue
+
+                # Cobalt-Strike / suspicious
+                if "Cobalt" in stripped or "SUSPICIOUS" in stripped.upper():
+                    _body_line(stripped, bold=True, color=CLR_RED, font_size=9)
+                    continue
+
+                # Default
+                clean = stripped.replace("**", "")
+                if "CRITICAL" in stripped.upper():
+                    _body_line(clean, color=CLR_RED, font_size=9)
+                elif any(kw in stripped.upper() for kw in ("WARNING", "HIGH")):
+                    _body_line(clean, color=CLR_ORANGE, font_size=9)
+                else:
+                    _body_line(clean, font_size=9)
 
         pdf_path = output_dir / filename
         pdf.output(str(pdf_path))
-        print(f"  📑 PDF report saved: {pdf_path}")
+        print(f"  PDF report saved: {pdf_path}")
         return pdf_path
 
     except Exception as e:
         logger.warning("PDF export failed: %s", e)
-        print(f"  ⚠️  PDF export failed: {e}")
+        print(f"  PDF export failed: {e}")
         return None
 
 
