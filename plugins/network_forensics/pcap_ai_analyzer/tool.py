@@ -352,12 +352,279 @@ def _pdf_safe(text: str) -> str:
     return text.encode("ascii", "ignore").decode("ascii")
 
 
+# ---------------------------------------------------------------------------
+# Purdue Model Zone Traffic Diagram (matplotlib + networkx)
+# ---------------------------------------------------------------------------
+
+# OT ports → Purdue level "SCADA" or "CONTROL/FIELD"
+_SCADA_PORTS = {502, 102, 44818, 20000, 4840, 47808, 2404, 789, 1911, 9600, 18245}
+# IT service ports → "Corporate"
+_CORP_PORTS = {53, 88, 135, 139, 389, 445, 636, 3389, 5985, 5986}
+# DMZ ports → "DMZ"
+_DMZ_PORTS = {80, 443, 8080, 8443, 25, 587, 993, 995}
+
+# Purdue zone definitions and visual layout
+_PURDUE_ZONES = [
+    ("External",      "#1a5276",  0.95),   # dark blue
+    ("Corporate",     "#e67e22",  0.76),   # orange
+    ("DMZ",           "#27ae60",  0.57),   # green
+    ("SCADA",         "#8e44ad",  0.38),   # purple
+    ("CONTROL/FIELD", "#2980b9",  0.19),   # blue
+]
+
+_ZONE_BG_COLORS = {
+    "External":      "#d6eaf8",
+    "Corporate":     "#fdebd0",
+    "DMZ":           "#d5f5e3",
+    "SCADA":         "#f4ecf7",
+    "CONTROL/FIELD": "#d4efdf",
+}
+
+
+def _classify_ip_zone(ip: str, session: Any) -> str:
+    """Classify an IP into a Purdue zone based on traffic patterns."""
+    from plugins.network_forensics.pcap_metadata_summary.tool import is_internal
+
+    if not is_internal(ip):
+        return "External"
+
+    # Check what ports this IP communicates on (as src or dst)
+    ip_ports: set[int] = set()
+    for (src, dst, dport, proto), stats in session.conversations.items():
+        if src == ip or dst == ip:
+            ip_ports.add(dport)
+
+    # OT ports → SCADA or CONTROL/FIELD
+    ot_ports_used = ip_ports & _SCADA_PORTS
+    if ot_ports_used:
+        # If IP also uses IT ports, it's a SCADA gateway
+        it_ports_used = ip_ports & (_CORP_PORTS | _DMZ_PORTS)
+        if it_ports_used:
+            return "SCADA"
+        return "CONTROL/FIELD"
+
+    # DMZ ports only → DMZ
+    dmz_only = ip_ports & _DMZ_PORTS
+    if dmz_only and not (ip_ports & _CORP_PORTS):
+        return "DMZ"
+
+    # Default internal → Corporate
+    return "Corporate"
+
+
+def _render_purdue_zone_graph(session: Any) -> bytes | None:
+    """Render a Purdue model zone traffic diagram as PNG bytes.
+
+    Returns PNG image bytes or None if matplotlib is not available.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # headless backend
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        from io import BytesIO
+    except ImportError:
+        return None
+
+    from plugins.network_forensics.pcap_metadata_summary.tool import is_internal
+
+    # --- Classify all IPs into zones ---
+    all_ips: set[str] = set()
+    for (src, dst, dport, proto), stats in session.conversations.items():
+        all_ips.add(src)
+        all_ips.add(dst)
+
+    ip_zones: dict[str, str] = {}
+    zone_ips: dict[str, list[str]] = {z[0]: [] for z in _PURDUE_ZONES}
+    for ip in all_ips:
+        zone = _classify_ip_zone(ip, session)
+        ip_zones[ip] = zone
+        zone_ips[zone].append(ip)
+
+    # --- Aggregate traffic between zones ---
+    zone_flows: dict[tuple[str, str], int] = {}
+    for (src, dst, dport, proto), stats in session.conversations.items():
+        src_zone = ip_zones.get(src, "External")
+        dst_zone = ip_zones.get(dst, "External")
+        key = (src_zone, dst_zone)
+        zone_flows[key] = zone_flows.get(key, 0) + stats["bytes_out"]
+
+    if not zone_flows:
+        return None
+
+    max_bytes = max(zone_flows.values()) if zone_flows else 1
+
+    # --- Draw the diagram ---
+    fig, ax = plt.subplots(figsize=(10, 7))
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("auto")
+    ax.axis("off")
+    fig.patch.set_facecolor("white")
+
+    zone_y: dict[str, float] = {}
+    zone_rects: dict[str, tuple[float, float, float, float]] = {}
+    zone_height = 0.145
+    zone_margin = 0.05
+
+    # Draw zone boxes
+    for zone_name, border_color, y_center in _PURDUE_ZONES:
+        y_bottom = y_center - zone_height / 2
+        bg_color = _ZONE_BG_COLORS[zone_name]
+
+        rect = mpatches.FancyBboxPatch(
+            (zone_margin, y_bottom), 1 - 2 * zone_margin, zone_height,
+            boxstyle="round,pad=0.01",
+            linewidth=2.5, edgecolor=border_color,
+            facecolor=bg_color, alpha=0.6,
+        )
+        ax.add_patch(rect)
+
+        # Zone label
+        ax.text(zone_margin + 0.02, y_center + zone_height / 2 - 0.025,
+                zone_name, fontsize=11, fontweight="bold",
+                color=border_color, va="top")
+
+        zone_y[zone_name] = y_center
+        zone_rects[zone_name] = (zone_margin, y_bottom,
+                                 1 - 2 * zone_margin, zone_height)
+
+    # Place IP nodes within their zones
+    node_positions: dict[str, tuple[float, float]] = {}
+    for zone_name, _, y_center in _PURDUE_ZONES:
+        ips = sorted(zone_ips[zone_name])
+        if not ips:
+            continue
+        n = len(ips)
+        # Distribute IPs horizontally within the zone
+        max_show = min(n, 8)  # show at most 8 nodes per zone
+        for i, ip in enumerate(ips[:max_show]):
+            x = 0.15 + (i + 0.5) * (0.7 / max_show)
+            y = y_center
+            node_positions[ip] = (x, y)
+
+            # Draw node dot
+            ax.plot(x, y, "o", color="#2c3e50", markersize=6, zorder=5)
+            # IP label (shortened)
+            short_ip = ip.split(".")[-1]  # last octet
+            ax.text(x, y - 0.02, short_ip, fontsize=5.5,
+                    ha="center", va="top", color="#2c3e50")
+
+        # If more IPs than shown
+        if n > max_show:
+            ax.text(0.9, y_center, f"+{n - max_show}",
+                    fontsize=8, ha="center", va="center",
+                    color="#7f8c8d", style="italic")
+
+    # Draw traffic flow edges between zones
+    drawn_flows: set[tuple[str, str]] = set()
+    for (src_zone, dst_zone), total_bytes in sorted(
+        zone_flows.items(), key=lambda x: x[1], reverse=True
+    ):
+        if src_zone == dst_zone:
+            continue  # skip intra-zone
+
+        # Normalize to unique pair
+        pair = tuple(sorted([src_zone, dst_zone]))
+        if pair in drawn_flows:
+            continue
+        drawn_flows.add(pair)
+
+        # Combine both directions
+        reverse_bytes = zone_flows.get((dst_zone, src_zone), 0)
+        combined = total_bytes + reverse_bytes
+
+        # Line thickness proportional to traffic
+        width = max(0.5, (combined / max_bytes) * 8)
+        alpha = max(0.25, min(0.85, combined / max_bytes))
+
+        # Find center X positions for each zone's nodes
+        src_x = 0.5
+        dst_x = 0.5
+        src_ips_in_zone = zone_ips.get(src_zone, [])
+        dst_ips_in_zone = zone_ips.get(dst_zone, [])
+        if src_ips_in_zone:
+            positions = [node_positions[ip] for ip in src_ips_in_zone
+                         if ip in node_positions]
+            if positions:
+                src_x = sum(p[0] for p in positions) / len(positions)
+        if dst_ips_in_zone:
+            positions = [node_positions[ip] for ip in dst_ips_in_zone
+                         if ip in node_positions]
+            if positions:
+                dst_x = sum(p[0] for p in positions) / len(positions)
+
+        src_y = zone_y[src_zone]
+        dst_y = zone_y[dst_zone]
+
+        # Determine if this is a cross-zone OT flow
+        is_ot_flow = (src_zone in ("SCADA", "CONTROL/FIELD")
+                      or dst_zone in ("SCADA", "CONTROL/FIELD"))
+        color = "#e74c3c" if is_ot_flow else "#3498db"
+
+        ax.annotate(
+            "", xy=(dst_x, dst_y), xytext=(src_x, src_y),
+            arrowprops=dict(
+                arrowstyle="-|>",
+                color=color, alpha=alpha,
+                linewidth=width, mutation_scale=12,
+                connectionstyle="arc3,rad=0.1",
+            ),
+            zorder=3,
+        )
+
+        # Byte count label on the edge midpoint
+        mid_x = (src_x + dst_x) / 2 + 0.05
+        mid_y = (src_y + dst_y) / 2
+        from plugins.network_forensics.pcap_metadata_summary.tool import _format_bytes
+        label = _format_bytes(combined)
+        ax.text(mid_x, mid_y, label, fontsize=6.5,
+                ha="center", va="center",
+                bbox=dict(boxstyle="round,pad=0.15", facecolor="white",
+                          edgecolor="#bdc3c7", alpha=0.85),
+                zorder=4)
+
+    # Legend
+    legend_elements = [
+        mpatches.Patch(facecolor="#3498db", alpha=0.6, label="IT Traffic"),
+        mpatches.Patch(facecolor="#e74c3c", alpha=0.6, label="OT/ICS Traffic"),
+    ]
+    # Zone IP counts
+    for zone_name, _, _ in _PURDUE_ZONES:
+        n = len(zone_ips[zone_name])
+        if n > 0:
+            legend_elements.append(
+                mpatches.Patch(
+                    facecolor=_ZONE_BG_COLORS[zone_name],
+                    edgecolor="#7f8c8d",
+                    label=f"{zone_name}: {n} IPs",
+                )
+            )
+
+    ax.legend(handles=legend_elements, loc="lower right",
+              fontsize=7, framealpha=0.9, ncol=2)
+
+    ax.set_title("Purdue Model - Network Zone Traffic Flow",
+                 fontsize=13, fontweight="bold", pad=12)
+
+    plt.tight_layout()
+
+    # Render to PNG bytes in memory
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight",
+                facecolor="white", edgecolor="none")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
 def _export_pdf(
     content: str,
     output_dir: Path,
     filename: str,
     mode: str = "",
     condition_orange: bool = False,
+    session: Any | None = None,
 ) -> Path | None:
     """Render a professional, executive-readable PDF report using fpdf2."""
     try:
@@ -486,6 +753,50 @@ def _export_pdf(
                  align="C", new_x="LMARGIN", new_y="NEXT")
         pdf.cell(0, 4, "Full data export available in companion .md file",
                  align="C", new_x="LMARGIN", new_y="NEXT")
+
+        # ===================================================================
+        # PURDUE ZONE TRAFFIC DIAGRAM (OT reports only)
+        # ===================================================================
+        if mode.startswith("ot_") and session is not None:
+            graph_png = _render_purdue_zone_graph(session)
+            if graph_png:
+                import tempfile
+                pdf.add_page()
+
+                # Section header
+                pdf.set_fill_color(*CLR_NAVY)
+                pdf.set_text_color(*CLR_WHITE)
+                pdf.set_font("Helvetica", "B", 11)
+                pdf.cell(eff_w, 8, "  Network Zone Traffic Flow (Purdue Model)",
+                         fill=True, new_x="LMARGIN", new_y="NEXT")
+                pdf.set_text_color(*CLR_BLACK)
+                pdf.ln(4)
+
+                # Write PNG to temp file and embed
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    tmp.write(graph_png)
+                    tmp_path = tmp.name
+                try:
+                    # Scale image to fit page width
+                    img_w = eff_w
+                    pdf.image(tmp_path, x=pdf.l_margin, w=img_w)
+                finally:
+                    import os
+                    os.unlink(tmp_path)
+
+                pdf.ln(3)
+                pdf.set_font("Helvetica", "I", 7.5)
+                pdf.set_text_color(*CLR_GREY)
+                pdf.cell(0, 4,
+                         "Zone classification: OT ports -> SCADA/Control, "
+                         "IT service ports -> Corporate, "
+                         "Web/mail ports -> DMZ, Non-RFC1918 -> External",
+                         new_x="LMARGIN", new_y="NEXT")
+                pdf.cell(0, 4,
+                         "Edge thickness proportional to traffic volume. "
+                         "Red = OT/ICS traffic, Blue = IT traffic.",
+                         new_x="LMARGIN", new_y="NEXT")
+                pdf.set_text_color(*CLR_BLACK)
 
         # ===================================================================
         # BODY PAGES — parse content into structured sections
@@ -1471,6 +1782,7 @@ class PcapAiAnalyzer:
                     f"pcap_ai_analyzer_{mode}_{ts}.pdf",
                     mode=mode,
                     condition_orange=condition_orange,
+                    session=session,
                 )
 
             # Register the markdown file as an artifact
