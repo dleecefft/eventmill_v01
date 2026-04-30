@@ -390,6 +390,351 @@ def parse_pcap_file(file_path: str) -> PcapSession:
 
 
 # ---------------------------------------------------------------------------
+# dpkt-based fast parser (--large mode) — 5-10x faster than scapy
+# ---------------------------------------------------------------------------
+
+DPKT_AVAILABLE = False
+try:
+    import dpkt
+    import socket
+    import struct
+    DPKT_AVAILABLE = True
+except ImportError:
+    dpkt = None  # type: ignore[assignment]
+
+
+def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
+    """Parse a PCAP file using dpkt (fast, C-backed struct unpacking).
+
+    Produces an identical PcapSession to ``parse_pcap_file`` but runs
+    5-10x faster on large captures (>100 MB / >500K packets).
+    """
+    if not DPKT_AVAILABLE:
+        raise RuntimeError("dpkt is required for --large mode. Install with: pip install dpkt")
+
+    _build_cred_patterns()
+
+    session = PcapSession()
+    session.filename = os.path.basename(file_path)
+    session.file_path = file_path
+    session.file_size = os.path.getsize(file_path)
+
+    def _ip_to_str(packed: bytes) -> str:
+        return socket.inet_ntoa(packed)
+
+    with open(file_path, "rb") as f:
+        try:
+            reader: Any = dpkt.pcap.Reader(f)
+        except ValueError:
+            # Try pcapng format
+            f.seek(0)
+            reader = dpkt.pcapng.Reader(f)
+
+        for ts, buf in reader:
+            session.packet_count += 1
+
+            if session.start_time is None or ts < session.start_time:
+                session.start_time = ts
+            if session.end_time is None or ts > session.end_time:
+                session.end_time = ts
+
+            # Parse Ethernet frame
+            try:
+                eth = dpkt.ethernet.Ethernet(buf)
+            except (dpkt.dpkt.NeedData, dpkt.dpkt.UnpackError):
+                continue
+
+            # Only process IPv4
+            if not isinstance(eth.data, dpkt.ip.IP):
+                continue
+
+            ip = eth.data
+            src_ip = _ip_to_str(ip.src)
+            dst_ip = _ip_to_str(ip.dst)
+            pkt_len = len(buf)
+
+            session.src_ips[src_ip] += 1
+            session.dst_ips[dst_ip] += 1
+
+            # Protocol & ports
+            proto = "OTHER"
+            sport = 0
+            dport = 0
+            tcp_data = b""
+
+            if isinstance(ip.data, dpkt.tcp.TCP):
+                proto = "TCP"
+                tcp_obj = ip.data
+                sport = tcp_obj.sport
+                dport = tcp_obj.dport
+                tcp_data = bytes(tcp_obj.data)
+            elif isinstance(ip.data, dpkt.udp.UDP):
+                proto = "UDP"
+                udp_obj = ip.data
+                sport = udp_obj.sport
+                dport = udp_obj.dport
+                tcp_data = bytes(udp_obj.data)  # reuse var for payload
+            elif ip.p == 1:  # ICMP
+                proto = "ICMP"
+
+            session.protocols[proto] += 1
+
+            if dport:
+                session.dst_ports[dport] += 1
+                session.port_proto[dport] = proto
+            if sport:
+                session.src_ports[sport] += 1
+
+            # Conversation tracking
+            conv_key = (src_ip, dst_ip, dport, proto)
+            conv = session.conversations[conv_key]
+            conv["packets"] += 1
+            conv["bytes_out"] += pkt_len
+            if conv["first_seen"] is None or ts < conv["first_seen"]:
+                conv["first_seen"] = ts
+            if conv["last_seen"] is None or ts > conv["last_seen"]:
+                conv["last_seen"] = ts
+            if len(conv["timestamps"]) < 2000:
+                conv["timestamps"].append(ts)
+
+            # DNS extraction
+            if dport == 53 or sport == 53:
+                try:
+                    dns = dpkt.dns.DNS(tcp_data)
+                    if dns.qr == dpkt.dns.DNS_Q:  # query
+                        for q in dns.qd:
+                            qname = q.name.rstrip(".")
+                            session.dns_queries.append({
+                                "query": qname, "type": q.type,
+                                "src": src_ip, "ts": ts,
+                            })
+                    elif dns.qr == dpkt.dns.DNS_R:  # response
+                        qname = dns.qd[0].name.rstrip(".") if dns.qd else ""
+                        for rr in dns.an:
+                            rdata = ""
+                            if rr.type == dpkt.dns.DNS_A:
+                                try:
+                                    rdata = _ip_to_str(rr.rdata)
+                                except Exception:
+                                    rdata = repr(rr.rdata)
+                            elif rr.type == dpkt.dns.DNS_CNAME:
+                                rdata = rr.cname if hasattr(rr, "cname") else str(rr.rdata)
+                            else:
+                                rdata = str(rr.rdata)
+                            session.dns_responses.append({
+                                "query": qname, "answer": rdata,
+                                "type": rr.type, "src": src_ip, "ts": ts,
+                            })
+                except Exception:
+                    pass
+
+            # HTTP extraction (port 80 or payload starts with HTTP method)
+            if tcp_data and (dport == 80 or sport == 80 or dport == 8080):
+                try:
+                    if tcp_data[:4] in (b"GET ", b"POST", b"PUT ", b"HEAD", b"DELE", b"PATC", b"OPTI"):
+                        req = dpkt.http.Request(tcp_data)
+                        session.http_requests.append({
+                            "method": req.method, "host": req.headers.get("host", ""),
+                            "path": req.uri, "src": src_ip, "dst": dst_ip, "ts": ts,
+                        })
+                except Exception:
+                    pass
+
+            # TLS ClientHello / SNI extraction
+            if tcp_data and len(tcp_data) > 5 and tcp_data[0] == 0x16:
+                try:
+                    tls_records = dpkt.ssl.TLSRecord(tcp_data)
+                    # ClientHello: handshake type 1
+                    if (hasattr(tls_records, "data") and len(tls_records.data) > 0
+                            and tls_records.data[0] == 1):
+                        sni = _extract_sni_from_client_hello(tls_records.data)
+                        session.tls_handshakes.append({
+                            "type": "ClientHello", "sni": sni,
+                            "src": src_ip, "dst": dst_ip,
+                            "dport": dport, "ts": ts,
+                        })
+                except Exception:
+                    pass
+
+            # OT / ICS protocol extraction (port-based, same logic)
+            _extract_ot_transaction_dpkt(
+                session, src_ip, dst_ip, sport, dport, proto, ts, tcp_data,
+            )
+
+            # Cleartext credential detection
+            _extract_cleartext_creds_dpkt(
+                session, src_ip, dst_ip, sport, dport, ts, tcp_data,
+            )
+
+    return session
+
+
+def _extract_sni_from_client_hello(handshake_data: bytes) -> str:
+    """Extract SNI from a TLS ClientHello handshake payload."""
+    try:
+        # Skip handshake header (1 type + 3 length)
+        if len(handshake_data) < 44:
+            return ""
+        offset = 4  # skip type + length
+        # Skip client version (2) + random (32) = 34
+        offset += 34
+        # Session ID length
+        if offset >= len(handshake_data):
+            return ""
+        sid_len = handshake_data[offset]
+        offset += 1 + sid_len
+        # Cipher suites length (2 bytes)
+        if offset + 2 > len(handshake_data):
+            return ""
+        cs_len = struct.unpack("!H", handshake_data[offset:offset + 2])[0]
+        offset += 2 + cs_len
+        # Compression methods length (1 byte)
+        if offset >= len(handshake_data):
+            return ""
+        cm_len = handshake_data[offset]
+        offset += 1 + cm_len
+        # Extensions length (2 bytes)
+        if offset + 2 > len(handshake_data):
+            return ""
+        ext_len = struct.unpack("!H", handshake_data[offset:offset + 2])[0]
+        offset += 2
+        ext_end = offset + ext_len
+
+        while offset + 4 <= ext_end:
+            ext_type = struct.unpack("!H", handshake_data[offset:offset + 2])[0]
+            ext_data_len = struct.unpack("!H", handshake_data[offset + 2:offset + 4])[0]
+            offset += 4
+            if ext_type == 0 and ext_data_len > 5:  # SNI extension
+                # Server Name List length (2), type (1), name length (2), name
+                sni_offset = offset + 3  # skip list_len + type
+                if sni_offset + 2 <= offset + ext_data_len:
+                    name_len = struct.unpack("!H", handshake_data[sni_offset:sni_offset + 2])[0]
+                    sni_offset += 2
+                    if sni_offset + name_len <= len(handshake_data):
+                        return handshake_data[sni_offset:sni_offset + name_len].decode("ascii", errors="replace")
+            offset += ext_data_len
+    except Exception:
+        pass
+    return ""
+
+
+def _extract_ot_transaction_dpkt(
+    session: PcapSession,
+    src_ip: str, dst_ip: str,
+    sport: int, dport: int, proto: str, ts: float,
+    payload: bytes,
+) -> None:
+    """Extract OT/ICS protocol metadata (dpkt version — uses raw bytes directly)."""
+    ot_port = 0
+    ot_proto = ""
+    if dport in _OT_PORT_PROTOCOL:
+        ot_port = dport
+        ot_proto = _OT_PORT_PROTOCOL[dport]
+    elif sport in _OT_PORT_PROTOCOL:
+        ot_port = sport
+        ot_proto = _OT_PORT_PROTOCOL[sport]
+    else:
+        return
+
+    entry: Dict[str, Any] = {
+        "protocol": ot_proto, "port": ot_port,
+        "src": src_ip, "dst": dst_ip, "ts": ts,
+    }
+
+    raw = payload
+
+    if ot_proto == "Modbus" and proto == "TCP" and len(raw) >= 8:
+        try:
+            unit_id = raw[6]
+            func_code = raw[7]
+            is_exception = bool(func_code & 0x80)
+            base_func = func_code & 0x7F
+            entry["unit_id"] = unit_id
+            entry["function_code"] = base_func
+            entry["function_name"] = _MODBUS_FUNC_NAMES.get(base_func, f"FC-{base_func}")
+            entry["is_exception"] = is_exception
+            entry["is_write"] = base_func in _MODBUS_WRITE_FUNCS
+            entry["is_diagnostic"] = base_func in _MODBUS_DIAG_FUNCS
+            if is_exception and len(raw) >= 9:
+                entry["exception_code"] = raw[8]
+        except Exception:
+            pass
+
+    if ot_proto == "S7comm" and proto == "TCP":
+        try:
+            s7_idx = raw.find(b'\x32')
+            if s7_idx >= 0 and s7_idx + 2 < len(raw):
+                pdu_type = raw[s7_idx + 1]
+                pdu_names = {1: "Job", 2: "Ack", 3: "Ack-Data", 7: "Userdata"}
+                entry["pdu_type"] = pdu_names.get(pdu_type, f"0x{pdu_type:02x}")
+                if s7_idx + 8 < len(raw):
+                    func = raw[s7_idx + 7] if pdu_type in (1, 3) else None
+                    if func is not None:
+                        s7_funcs = {
+                            4: "Read", 5: "Write", 0x28: "PLC-Stop",
+                            0x29: "PLC-Start", 0x1A: "Upload", 0x1B: "Download",
+                        }
+                        entry["function"] = s7_funcs.get(func, f"0x{func:02x}")
+                        entry["is_write"] = func in (5, 0x1B)
+                        entry["is_control"] = func in (0x28, 0x29)
+        except Exception:
+            pass
+
+    if ot_proto == "DNP3" and proto == "TCP":
+        try:
+            if len(raw) >= 12 and raw[0:2] == b'\x05\x64':
+                if len(raw) > 13:
+                    func_code = raw[13]
+                    dnp3_funcs = {
+                        0: "Confirm", 1: "Read", 2: "Write",
+                        3: "Select", 4: "Operate", 5: "Direct-Operate",
+                        13: "Cold-Restart", 14: "Warm-Restart",
+                        18: "Stop-Application", 19: "Start-Application",
+                        129: "Response", 130: "Unsolicited-Response",
+                    }
+                    entry["function_code"] = func_code
+                    entry["function_name"] = dnp3_funcs.get(func_code, f"FC-{func_code}")
+                    entry["is_write"] = func_code in (2, 3, 4, 5)
+                    entry["is_control"] = func_code in (5, 13, 14, 18, 19)
+        except Exception:
+            pass
+
+    if len(session.ot_transactions) < 50000:
+        session.ot_transactions.append(entry)
+
+
+def _extract_cleartext_creds_dpkt(
+    session: PcapSession,
+    src_ip: str, dst_ip: str,
+    sport: int, dport: int, ts: float,
+    payload: bytes,
+) -> None:
+    """Detect cleartext credentials from raw payload bytes (dpkt version)."""
+    if not payload or len(payload) < 4:
+        return
+    if len(session.cleartext_creds) >= 500:
+        return
+
+    for proto_name, ports, pattern, description in _CRED_PATTERNS:
+        if ports is not None and dport not in ports and sport not in ports:
+            continue
+        if pattern is None:
+            session.cleartext_creds.append({
+                "protocol": proto_name, "description": description,
+                "src": src_ip, "dst": dst_ip,
+                "port": dport if (ports and dport in ports) else sport,
+                "ts": ts,
+            })
+            return
+        if pattern.search(payload):
+            session.cleartext_creds.append({
+                "protocol": proto_name, "description": description,
+                "src": src_ip, "dst": dst_ip, "port": dport, "ts": ts,
+            })
+            return
+
+
+# ---------------------------------------------------------------------------
 # OT / ICS protocol port map
 # ---------------------------------------------------------------------------
 

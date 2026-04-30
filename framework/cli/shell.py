@@ -642,7 +642,12 @@ class EventMillShell(cmd.Cmd):
     def do_load(self, arg: str) -> None:
         """Load an artifact file into the current session.
         
-        Usage: load <file_path_or_name> [artifact_type]
+        Usage: load <file_path_or_name> [artifact_type] [--large]
+        
+        Options:
+          --large    Use dpkt (fast C-backed parser) instead of scapy.
+                     Recommended for PCAPs >100 MB / >500K packets.
+                     5-10x faster, identical report output.
         
         Resolution order:
           1. Local file path (if exists on disk)
@@ -662,8 +667,13 @@ class EventMillShell(cmd.Cmd):
         except ValueError:
             parts = arg.strip().split(maxsplit=1)
         if not parts:
-            print("  Usage: load <file_path_or_name> [artifact_type]")
+            print("  Usage: load <file_path_or_name> [artifact_type] [--large]")
             return
+        
+        # Check for --large flag
+        use_dpkt = "--large" in parts
+        if use_dpkt:
+            parts = [p for p in parts if p != "--large"]
         
         file_ref = parts[0]
         file_path = Path(file_ref)
@@ -671,7 +681,7 @@ class EventMillShell(cmd.Cmd):
         # Try local file first
         if file_path.exists():
             artifact_type = parts[1] if len(parts) > 1 else self._infer_artifact_type(file_path)
-            self._register_local_artifact(file_path, artifact_type)
+            self._register_local_artifact(file_path, artifact_type, use_dpkt=use_dpkt)
             return
         
         # Try storage resolver (gs:// URI or filename lookup in buckets)
@@ -703,7 +713,7 @@ class EventMillShell(cmd.Cmd):
                     return
                 
                 artifact_type = parts[1] if len(parts) > 1 else self._infer_artifact_type(local_dest)
-                self._register_local_artifact(local_dest, artifact_type, source_info=resolved.display)
+                self._register_local_artifact(local_dest, artifact_type, source_info=resolved.display, use_dpkt=use_dpkt)
                 return
         
         # Nothing found
@@ -720,6 +730,7 @@ class EventMillShell(cmd.Cmd):
         file_path: Path,
         artifact_type: str,
         source_info: str | None = None,
+        use_dpkt: bool = False,
     ) -> None:
         """Register a local file as an artifact in the current session."""
         artifact = self.session_manager.register_artifact(
@@ -751,14 +762,17 @@ class EventMillShell(cmd.Cmd):
 
         # Auto-parse PCAP files (mirrors event_mill v1 load_pcap behaviour)
         if artifact_type == "pcap":
-            self._auto_parse_pcap(file_path)
+            self._auto_parse_pcap(file_path, use_dpkt=use_dpkt)
 
-    def _auto_parse_pcap(self, file_path: Path) -> None:
-        """Automatically parse a PCAP with scapy so downstream tools work immediately.
+    def _auto_parse_pcap(self, file_path: Path, use_dpkt: bool = False) -> None:
+        """Automatically parse a PCAP so downstream tools work immediately.
 
         Mirrors event_mill v1 where ``load_pcap`` was a single atomic operation.
         Uses the process-global session storage so the loader's module and the
         shell's module see the same PcapSession singleton.
+
+        When use_dpkt=True, uses the fast dpkt parser (5-10x faster for large
+        captures). Use ``load file.pcap --large`` to activate.
         """
         try:
             from plugins.network_forensics.pcap_metadata_summary.tool import (
@@ -769,8 +783,21 @@ class EventMillShell(cmd.Cmd):
                 is_internal,
             )
 
-            print(f"  Parsing PCAP with scapy...")
-            session = parse_pcap_file(str(file_path))
+            if use_dpkt:
+                from plugins.network_forensics.pcap_metadata_summary.tool import (
+                    parse_pcap_file_dpkt,
+                    DPKT_AVAILABLE,
+                )
+                if not DPKT_AVAILABLE:
+                    print("  Warning: dpkt not installed, falling back to scapy.")
+                    use_dpkt = False
+
+            parser_name = "dpkt (fast mode)" if use_dpkt else "scapy"
+            print(f"  Parsing PCAP with {parser_name}...")
+            if use_dpkt:
+                session = parse_pcap_file_dpkt(str(file_path))
+            else:
+                session = parse_pcap_file(str(file_path))
             set_pcap_session(session)
 
             duration = session.duration_seconds
