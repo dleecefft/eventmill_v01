@@ -494,6 +494,7 @@ def _export_pdf(
         # Helper: draw a coloured section header bar
         def _section_header(title_text: str, bg: tuple = CLR_NAVY) -> None:
             pdf.ln(4)
+            pdf.set_x(pdf.l_margin)
             pdf.set_fill_color(*bg)
             pdf.set_text_color(*CLR_WHITE)
             pdf.set_font("Helvetica", "B", 11)
@@ -505,6 +506,7 @@ def _export_pdf(
         # Helper: draw a sub-section header
         def _sub_header(title_text: str) -> None:
             pdf.ln(2)
+            pdf.set_x(pdf.l_margin)
             pdf.set_fill_color(*CLR_DARK_SLATE)
             pdf.set_text_color(*CLR_WHITE)
             pdf.set_font("Helvetica", "B", 9)
@@ -513,25 +515,34 @@ def _export_pdf(
             pdf.set_text_color(*CLR_BLACK)
             pdf.ln(1)
 
-        # Helper: body text line
+        # Helper: clean markdown artifacts from text for PDF display
+        def _clean_md(text: str) -> str:
+            """Strip **, backticks, leading *-bullets for PDF body text."""
+            t = text.replace("**", "").replace("`", "")
+            # Strip leading bullet markers ("*   ", "* ", "- ")
+            s = t.lstrip()
+            if s.startswith("*   "):
+                t = s[4:]
+            elif s.startswith("* "):
+                t = s[2:]
+            elif s.startswith("- "):
+                t = s[2:]
+            return t.strip()
+
+        # Helper: body text line — ALWAYS resets X to prevent overflow
         def _body_line(text: str, bold: bool = False, color: tuple = CLR_BLACK,
                        font_size: float = 9, indent: float = 0) -> None:
             pdf.set_text_color(*color)
-            style = "B" if bold else ""
-            pdf.set_font("Helvetica", style, font_size)
-            if indent:
-                pdf.set_x(pdf.l_margin + indent)
-                w = eff_w - indent
-            else:
-                w = eff_w
-            pdf.multi_cell(w, 4.5, _pdf_safe(text))
+            pdf.set_font("Helvetica", "B" if bold else "", font_size)
+            pdf.set_x(pdf.l_margin + indent)   # always reset X
+            pdf.multi_cell(0, 4.5, _pdf_safe(text))  # 0 = auto-fill to right margin
 
-        # Helper: monospace data line (small)
+        # Helper: monospace data line (small) — ALWAYS resets X
         def _data_line(text: str, bold: bool = False) -> None:
-            style = "B" if bold else ""
             pdf.set_text_color(*CLR_BLACK)
-            pdf.set_font("Courier", style, 7)
-            pdf.multi_cell(eff_w, 3.5, _pdf_safe(text))
+            pdf.set_font("Courier", "B" if bold else "", 7)
+            pdf.set_x(pdf.l_margin)             # always reset X
+            pdf.multi_cell(0, 3.5, _pdf_safe(text))  # 0 = auto-fill
 
         # --- Parse content into sections (split on ===== dividers) ---
         raw_sections: list[tuple[str, list[str]]] = []
@@ -661,6 +672,7 @@ def _export_pdf(
                     if (len(stripped) > 2 and stripped[0].isdigit()
                             and stripped[1] in ".)" and stripped[2] == " "):
                         pdf.ln(3)
+                        display = _clean_md(stripped)
                         _body_line(stripped, bold=True, font_size=10,
                                    color=CLR_NAVY)
                         continue
@@ -673,19 +685,20 @@ def _export_pdf(
                     else:
                         color = CLR_BLACK
 
+                    display = _clean_md(stripped)
+
                     # Bold markdown lines (**text**)
-                    display = stripped.replace("**", "")
                     if stripped.startswith("**") or stripped.startswith("*   **"):
                         _body_line(display, bold=True, color=color, font_size=9,
                                    indent=4 if stripped.startswith("*") else 0)
                         continue
 
-                    # Bullet points
+                    # Bullet points (* item or - item)
                     if stripped.startswith("* ") or stripped.startswith("- "):
                         _body_line(display, color=color, font_size=9, indent=6)
                         continue
 
-                    # MITRE / IEC references
+                    # MITRE / IEC references (deeper indent)
                     if stripped.startswith("*   "):
                         _body_line(display, font_size=8.5, indent=10, color=CLR_GREY)
                         continue
@@ -751,7 +764,7 @@ def _export_pdf(
                     continue
 
                 # Default
-                clean = stripped.replace("**", "")
+                clean = _clean_md(stripped)
                 if "CRITICAL" in stripped.upper():
                     _body_line(clean, color=CLR_RED, font_size=9)
                 elif any(kw in stripped.upper() for kw in ("WARNING", "HIGH")):
