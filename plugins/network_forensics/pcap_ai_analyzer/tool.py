@@ -304,6 +304,92 @@ MODE_CONFIG: dict[str, tuple[str, str | None, str | None]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# PDF export helper (fpdf2)
+# ---------------------------------------------------------------------------
+
+def _export_pdf(
+    content: str,
+    output_dir: Path,
+    filename: str,
+    mode: str = "",
+    condition_orange: bool = False,
+) -> Path | None:
+    """Render report text to a PDF file using fpdf2. Returns path or None on failure."""
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        print("  ⚠️  fpdf2 not installed — PDF export skipped. Install with: pip install fpdf2")
+        return None
+
+    try:
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=20)
+        pdf.add_page()
+
+        # --- Title ---
+        pdf.set_font("Helvetica", "B", 16)
+        title = "Event Mill — PCAP AI Analysis Report"
+        if mode.startswith("ot_"):
+            title = "Event Mill — OT/ICS PCAP Analysis Report"
+        pdf.cell(0, 10, title, new_x="LMARGIN", new_y="NEXT", align="C")
+
+        # Subtitle with mode and timestamp
+        pdf.set_font("Helvetica", "I", 10)
+        subtitle = f"Mode: {mode}"
+        if condition_orange:
+            subtitle += "  |  CONDITION ORANGE"
+        ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
+        subtitle += f"  |  Generated: {ts_str}"
+        pdf.cell(0, 6, subtitle, new_x="LMARGIN", new_y="NEXT", align="C")
+        pdf.ln(6)
+
+        # --- Body ---
+        pdf.set_font("Courier", "", 8)
+        effective_width = pdf.w - pdf.l_margin - pdf.r_margin
+
+        for line in content.split("\n"):
+            # Section headers (lines starting with '=' or containing emoji headers)
+            if line.startswith("====") or line.startswith("----"):
+                pdf.set_font("Courier", "", 8)
+                pdf.cell(0, 4, line[:120], new_x="LMARGIN", new_y="NEXT")
+                continue
+
+            if line.startswith("🔍 ") or line.startswith("⚡ "):
+                pdf.set_font("Helvetica", "B", 12)
+                # Strip emoji for PDF (fpdf2 built-in fonts don't support them)
+                clean = line.encode("ascii", "ignore").decode("ascii").strip()
+                if clean:
+                    pdf.cell(0, 8, clean, new_x="LMARGIN", new_y="NEXT")
+                pdf.set_font("Courier", "", 8)
+                continue
+
+            # Bold-ish markers for severity lines
+            if any(marker in line for marker in ("CRITICAL", "🔴", "🟡", "⚠️")):
+                pdf.set_font("Courier", "B", 8)
+                clean = line.encode("ascii", "ignore").decode("ascii")
+                pdf.multi_cell(effective_width, 4, clean)
+                pdf.set_font("Courier", "", 8)
+                continue
+
+            # Regular line — strip non-ASCII (emoji) for built-in font compat
+            clean = line.encode("ascii", "ignore").decode("ascii")
+            if clean.strip():
+                pdf.multi_cell(effective_width, 4, clean)
+            else:
+                pdf.ln(3)
+
+        pdf_path = output_dir / filename
+        pdf.output(str(pdf_path))
+        print(f"  📑 PDF report saved: {pdf_path}")
+        return pdf_path
+
+    except Exception as e:
+        logger.warning("PDF export failed: %s", e)
+        print(f"  ⚠️  PDF export failed: {e}")
+        return None
+
+
 class PcapAiAnalyzer:
     """AI-enhanced PCAP analysis with Condition Orange support."""
 
@@ -450,6 +536,17 @@ class PcapAiAnalyzer:
             md_path.write_text(combined, encoding="utf-8")
             print(f"  📄 Full report saved: {md_path}")
 
+            # Optional PDF export
+            export_type = payload.get("export_type", "").lower()
+            pdf_path = None
+            if export_type == "pdf":
+                pdf_path = _export_pdf(
+                    combined, output_dir,
+                    f"pcap_ai_analyzer_{mode}_{ts}.pdf",
+                    mode=mode,
+                    condition_orange=condition_orange,
+                )
+
             # Register the markdown file as an artifact
             if hasattr(context, "register_artifact"):
                 context.register_artifact(
@@ -458,6 +555,13 @@ class PcapAiAnalyzer:
                     source_tool="pcap_ai_analyzer",
                     metadata={"mode": mode, "condition_orange": condition_orange},
                 )
+                if pdf_path:
+                    context.register_artifact(
+                        artifact_type="text",
+                        file_path=str(pdf_path),
+                        source_tool="pcap_ai_analyzer",
+                        metadata={"mode": mode, "condition_orange": condition_orange, "format": "pdf"},
+                    )
 
             return ToolResult(
                 ok=True,

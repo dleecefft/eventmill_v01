@@ -64,6 +64,7 @@ plugins-log-analysis = [
 plugins-network-forensics = [
     "scapy>=2.5.0",
     "dpkt>=1.9.8",
+    "fpdf2>=2.8.0",
 ]
 plugins-threat-modeling = [
     "pypdf>=4.0.0",

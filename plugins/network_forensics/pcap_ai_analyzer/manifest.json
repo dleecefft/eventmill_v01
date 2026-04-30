@@ -23,7 +23,8 @@
     "network_forensics:ot_threat_hunt",
     "network_forensics:ot_safety_assessment",
     "network_forensics:mitre_attack_ics",
-    "network_forensics:cleartext_credential_analysis"
+    "network_forensics:cleartext_credential_analysis",
+    "network_forensics:pdf_export"
   ],
   "input_schema": "schemas/input.schema.json",
   "output_schema": "schemas/output.schema.json",
