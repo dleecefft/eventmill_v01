@@ -388,27 +388,40 @@ def _classify_ip_zone(ip: str, session: Any) -> str:
     if not is_internal(ip):
         return "External"
 
-    # Check what ports this IP communicates on (as src or dst)
-    ip_ports: set[int] = set()
+    # Gather ports this IP connects TO (client) vs SERVES (server)
+    dst_ports: set[int] = set()   # ports this IP connects to as client
+    srv_ports: set[int] = set()   # ports this IP serves as server
+    has_external_peer = False
+
     for (src, dst, dport, proto), stats in session.conversations.items():
-        if src == ip or dst == ip:
-            ip_ports.add(dport)
+        if src == ip:
+            dst_ports.add(dport)
+            if not is_internal(dst):
+                has_external_peer = True
+        if dst == ip:
+            srv_ports.add(dport)
+            if not is_internal(src):
+                has_external_peer = True
 
-    # OT ports → SCADA or CONTROL/FIELD
-    ot_ports_used = ip_ports & _SCADA_PORTS
-    if ot_ports_used:
-        # If IP also uses IT ports, it's a SCADA gateway
-        it_ports_used = ip_ports & (_CORP_PORTS | _DMZ_PORTS)
-        if it_ports_used:
-            return "SCADA"
-        return "CONTROL/FIELD"
+    serves_ot = bool(srv_ports & _SCADA_PORTS)
+    connects_ot = bool(dst_ports & _SCADA_PORTS)
 
-    # DMZ ports only → DMZ
-    dmz_only = ip_ports & _DMZ_PORTS
-    if dmz_only and not (ip_ports & _CORP_PORTS):
-        return "DMZ"
+    # OT classification
+    if serves_ot and connects_ot:
+        return "SCADA"          # bidirectional OT = HMI / gateway
+    if serves_ot:
+        return "CONTROL/FIELD"  # pure OT server / field device
+    if connects_ot:
+        # Initiates OT connections — OT workstation or IT user accessing OT
+        non_ot = (dst_ports | srv_ports) - _SCADA_PORTS
+        if non_ot & (_CORP_PORTS | _DMZ_PORTS):
+            return "Corporate"  # IT user who also accesses OT
+        return "SCADA"          # OT workstation / HMI
 
-    # Default internal → Corporate
+    # IT classification
+    if srv_ports & _DMZ_PORTS:
+        return "DMZ"            # serves web/mail ports
+
     return "Corporate"
 
 
@@ -428,26 +441,53 @@ def _render_purdue_zone_graph(session: Any) -> bytes | None:
 
     from plugins.network_forensics.pcap_metadata_summary.tool import is_internal
 
-    # --- Classify all IPs into zones ---
+    # --- Classify all IPs into zones, then group by /24 network ---
     all_ips: set[str] = set()
     for (src, dst, dport, proto), stats in session.conversations.items():
         all_ips.add(src)
         all_ips.add(dst)
 
     ip_zones: dict[str, str] = {}
-    zone_ips: dict[str, list[str]] = {z[0]: [] for z in _PURDUE_ZONES}
     for ip in all_ips:
-        zone = _classify_ip_zone(ip, session)
-        ip_zones[ip] = zone
-        zone_ips[zone].append(ip)
+        ip_zones[ip] = _classify_ip_zone(ip, session)
 
-    # --- Aggregate traffic between zones ---
-    zone_flows: dict[tuple[str, str], int] = {}
+    # Group IPs into /24 networks and assign zone by majority vote
+    from collections import Counter as _Counter
+    network_ips: dict[str, list[str]] = {}  # "10.0.3" -> ["10.0.3.47", ...]
+    for ip in all_ips:
+        octets = ip.split(".")
+        if len(octets) == 4:
+            net = ".".join(octets[:3])
+            network_ips.setdefault(net, []).append(ip)
+
+    # Zone assignment per /24 — majority of IPs in that subnet
+    net_zones: dict[str, str] = {}
+    zone_nets: dict[str, list[str]] = {z[0]: [] for z in _PURDUE_ZONES}
+    for net, ips in network_ips.items():
+        zone_votes = _Counter(ip_zones[ip] for ip in ips)
+        zone = zone_votes.most_common(1)[0][0]
+        net_zones[net] = zone
+        zone_nets[zone].append(net)
+
+    # --- Aggregate traffic between /24 networks ---
+    net_pair_bytes: dict[tuple[str, str], int] = {}
     for (src, dst, dport, proto), stats in session.conversations.items():
-        src_zone = ip_zones.get(src, "External")
-        dst_zone = ip_zones.get(dst, "External")
-        key = (src_zone, dst_zone)
-        zone_flows[key] = zone_flows.get(key, 0) + stats["bytes_out"]
+        src_net = ".".join(src.split(".")[:3])
+        dst_net = ".".join(dst.split(".")[:3])
+        if src_net == dst_net:
+            continue  # skip intra-subnet
+        pair = (min(src_net, dst_net), max(src_net, dst_net))
+        net_pair_bytes[pair] = net_pair_bytes.get(pair, 0) + stats["bytes_out"]
+
+    # Zone-to-zone aggregate for byte labels
+    zone_flows: dict[tuple[str, str], int] = {}
+    for (net_a, net_b), total_bytes in net_pair_bytes.items():
+        z_a = net_zones.get(net_a, "External")
+        z_b = net_zones.get(net_b, "External")
+        if z_a == z_b:
+            continue
+        key = (z_a, z_b)
+        zone_flows[key] = zone_flows.get(key, 0) + total_bytes
 
     if not zone_flows:
         return None
@@ -489,115 +529,111 @@ def _render_purdue_zone_graph(session: Any) -> bytes | None:
         zone_rects[zone_name] = (zone_margin, y_bottom,
                                  1 - 2 * zone_margin, zone_height)
 
-    # Place IP nodes within their zones
+    # Place /24 network nodes within their zones
     node_positions: dict[str, tuple[float, float]] = {}
     for zone_name, _, y_center in _PURDUE_ZONES:
-        ips = sorted(zone_ips[zone_name])
-        if not ips:
+        nets = sorted(zone_nets[zone_name])
+        if not nets:
             continue
-        n = len(ips)
-        # Distribute IPs horizontally within the zone
-        max_show = min(n, 8)  # show at most 8 nodes per zone
-        for i, ip in enumerate(ips[:max_show]):
+        n = len(nets)
+        max_show = min(n, 8)
+        for i, net in enumerate(nets[:max_show]):
             x = 0.15 + (i + 0.5) * (0.7 / max_show)
             y = y_center
-            node_positions[ip] = (x, y)
+            node_positions[net] = (x, y)
 
             # Draw node dot
             ax.plot(x, y, "o", color="#2c3e50", markersize=6, zorder=5)
-            # IP label (shortened)
-            short_ip = ip.split(".")[-1]  # last octet
-            ax.text(x, y - 0.02, short_ip, fontsize=5.5,
+            # Network label: "10.0.3.x"
+            label = net + ".x"
+            ax.text(x, y - 0.022, label, fontsize=5.5,
                     ha="center", va="top", color="#2c3e50")
 
-        # If more IPs than shown
         if n > max_show:
             ax.text(0.9, y_center, f"+{n - max_show}",
                     fontsize=8, ha="center", va="center",
                     color="#7f8c8d", style="italic")
 
-    # Draw traffic flow edges between zones
-    drawn_flows: set[tuple[str, str]] = set()
-    for (src_zone, dst_zone), total_bytes in sorted(
-        zone_flows.items(), key=lambda x: x[1], reverse=True
-    ):
-        if src_zone == dst_zone:
-            continue  # skip intra-zone
-
-        # Normalize to unique pair
-        pair = tuple(sorted([src_zone, dst_zone]))
-        if pair in drawn_flows:
+    # --- Draw /24-to-/24 traffic flow edges (cross-zone only) ---
+    cross_zone_flows: list[tuple[str, str, int]] = []
+    for (net_a, net_b), total_bytes in net_pair_bytes.items():
+        zone_a = net_zones.get(net_a, "External")
+        zone_b = net_zones.get(net_b, "External")
+        if zone_a == zone_b:
             continue
-        drawn_flows.add(pair)
+        cross_zone_flows.append((net_a, net_b, total_bytes))
 
-        # Combine both directions
-        reverse_bytes = zone_flows.get((dst_zone, src_zone), 0)
-        combined = total_bytes + reverse_bytes
+    if cross_zone_flows:
+        max_flow = max(f[2] for f in cross_zone_flows)
+    else:
+        max_flow = 1
 
-        # Line thickness proportional to traffic
-        width = max(0.5, (combined / max_bytes) * 8)
-        alpha = max(0.25, min(0.85, combined / max_bytes))
+    for net_a, net_b, total_bytes in sorted(cross_zone_flows, key=lambda x: x[2]):
+        zone_a = net_zones.get(net_a, "External")
+        zone_b = net_zones.get(net_b, "External")
 
-        # Find center X positions for each zone's nodes
-        src_x = 0.5
-        dst_x = 0.5
-        src_ips_in_zone = zone_ips.get(src_zone, [])
-        dst_ips_in_zone = zone_ips.get(dst_zone, [])
-        if src_ips_in_zone:
-            positions = [node_positions[ip] for ip in src_ips_in_zone
-                         if ip in node_positions]
-            if positions:
-                src_x = sum(p[0] for p in positions) / len(positions)
-        if dst_ips_in_zone:
-            positions = [node_positions[ip] for ip in dst_ips_in_zone
-                         if ip in node_positions]
-            if positions:
-                dst_x = sum(p[0] for p in positions) / len(positions)
+        ax_pos = node_positions.get(net_a, (0.5, zone_y.get(zone_a, 0.5)))
+        bx_pos = node_positions.get(net_b, (0.5, zone_y.get(zone_b, 0.5)))
 
-        src_y = zone_y[src_zone]
-        dst_y = zone_y[dst_zone]
+        ratio = total_bytes / max_flow if max_flow > 0 else 0
+        width = max(1.0, ratio * 14)
+        alpha = max(0.3, min(0.9, 0.3 + ratio * 0.6))
 
-        # Determine if this is a cross-zone OT flow
-        is_ot_flow = (src_zone in ("SCADA", "CONTROL/FIELD")
-                      or dst_zone in ("SCADA", "CONTROL/FIELD"))
+        is_ot_flow = (zone_a in ("SCADA", "CONTROL/FIELD")
+                      or zone_b in ("SCADA", "CONTROL/FIELD"))
         color = "#e74c3c" if is_ot_flow else "#3498db"
 
+        rad = 0.08 + (hash((net_a, net_b)) % 10) * 0.015
         ax.annotate(
-            "", xy=(dst_x, dst_y), xytext=(src_x, src_y),
+            "", xy=bx_pos, xytext=ax_pos,
             arrowprops=dict(
                 arrowstyle="-|>",
                 color=color, alpha=alpha,
-                linewidth=width, mutation_scale=12,
-                connectionstyle="arc3,rad=0.1",
+                linewidth=width, mutation_scale=10 + width,
+                connectionstyle=f"arc3,rad={rad:.3f}",
             ),
             zorder=3,
         )
 
-        # Byte count label on the edge midpoint
-        mid_x = (src_x + dst_x) / 2 + 0.05
-        mid_y = (src_y + dst_y) / 2
-        from plugins.network_forensics.pcap_metadata_summary.tool import _format_bytes
+    # Byte count labels for top zone-to-zone flows (aggregate)
+    from plugins.network_forensics.pcap_metadata_summary.tool import _format_bytes
+    drawn_labels: set[tuple[str, str]] = set()
+    for (src_zone, dst_zone), total_bytes in sorted(
+        zone_flows.items(), key=lambda x: x[1], reverse=True
+    ):
+        if src_zone == dst_zone:
+            continue
+        pair = tuple(sorted([src_zone, dst_zone]))
+        if pair in drawn_labels:
+            continue
+        drawn_labels.add(pair)
+
+        reverse_bytes = zone_flows.get((dst_zone, src_zone), 0)
+        combined = total_bytes + reverse_bytes
+
+        mid_x = 0.5 + 0.08 * (len(drawn_labels) % 3 - 1)
+        mid_y = (zone_y[src_zone] + zone_y[dst_zone]) / 2
         label = _format_bytes(combined)
-        ax.text(mid_x, mid_y, label, fontsize=6.5,
+        ax.text(mid_x, mid_y, label, fontsize=7, fontweight="bold",
                 ha="center", va="center",
-                bbox=dict(boxstyle="round,pad=0.15", facecolor="white",
-                          edgecolor="#bdc3c7", alpha=0.85),
-                zorder=4)
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="white",
+                          edgecolor="#2c3e50", alpha=0.9, linewidth=0.8),
+                zorder=6)
 
     # Legend
     legend_elements = [
         mpatches.Patch(facecolor="#3498db", alpha=0.6, label="IT Traffic"),
         mpatches.Patch(facecolor="#e74c3c", alpha=0.6, label="OT/ICS Traffic"),
     ]
-    # Zone IP counts
+    # Zone /24 network counts
     for zone_name, _, _ in _PURDUE_ZONES:
-        n = len(zone_ips[zone_name])
+        n = len(zone_nets[zone_name])
         if n > 0:
             legend_elements.append(
                 mpatches.Patch(
                     facecolor=_ZONE_BG_COLORS[zone_name],
                     edgecolor="#7f8c8d",
-                    label=f"{zone_name}: {n} IPs",
+                    label=f"{zone_name}: {n} /24s",
                 )
             )
 
