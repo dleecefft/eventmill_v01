@@ -544,6 +544,177 @@ def _export_pdf(
             pdf.set_x(pdf.l_margin)             # always reset X
             pdf.multi_cell(0, 3.5, _pdf_safe(text))  # 0 = auto-fill
 
+        # Helper: render a table with header + rows (zebra-striped)
+        def _table(headers: list[str], rows: list[list[str]],
+                   col_widths: list[float] | None = None,
+                   font_size: float = 7.5) -> None:
+            """Draw a simple table. col_widths should sum to ~eff_w."""
+            if not rows:
+                return
+            n_cols = len(headers)
+            if col_widths is None:
+                col_widths = [eff_w / n_cols] * n_cols
+
+            # Header row
+            pdf.set_x(pdf.l_margin)
+            pdf.set_font("Helvetica", "B", font_size)
+            pdf.set_fill_color(*CLR_DARK_SLATE)
+            pdf.set_text_color(*CLR_WHITE)
+            for i, hdr in enumerate(headers):
+                pdf.cell(col_widths[i], 5, _pdf_safe(hdr), border=0, fill=True)
+            pdf.ln()
+
+            # Data rows
+            pdf.set_font("Courier", "", font_size)
+            for row_idx, row in enumerate(rows):
+                # Zebra striping
+                if row_idx % 2 == 0:
+                    pdf.set_fill_color(*CLR_LIGHT_GREY)
+                    fill = True
+                else:
+                    fill = False
+                pdf.set_x(pdf.l_margin)
+                pdf.set_text_color(*CLR_BLACK)
+                for i, cell_text in enumerate(row):
+                    pdf.cell(col_widths[i], 4, _pdf_safe(cell_text[:50]),
+                             border=0, fill=fill)
+                pdf.ln()
+            pdf.ln(1)
+
+        # Helper: parse credential lines into table rows
+        def _render_credential_table(lines: list[str]) -> None:
+            """Parse credential section lines into a structured table."""
+            cred_rows: list[list[str]] = []
+            current_proto = ""
+            current_count = ""
+            current_desc = ""
+            ip_pairs: list[str] = []
+
+            def _flush() -> None:
+                if current_proto:
+                    pairs_str = "; ".join(ip_pairs[:4])
+                    if len(ip_pairs) > 4:
+                        pairs_str += f" (+{len(ip_pairs)-4})"
+                    cred_rows.append([current_proto, current_count,
+                                      current_desc, pairs_str])
+
+            for ln in lines:
+                s = ln.strip()
+                if not s:
+                    continue
+                if "detection(s)" in s:
+                    _flush()
+                    ip_pairs = []
+                    # Parse "LDAP-SimpleBind   308 detection(s)  -- LDAP simple bind"
+                    parts = s.split()
+                    current_proto = parts[0] if parts else ""
+                    # Find the count (digits before "detection(s)")
+                    current_count = ""
+                    for p in parts[1:]:
+                        if p == "detection(s)":
+                            break
+                        current_count = p
+                    # Description after "--"
+                    if "--" in s:
+                        current_desc = s.split("--", 1)[1].strip()
+                    else:
+                        current_desc = ""
+                elif "->" in s and not s.startswith("..."):
+                    ip_pairs.append(s.replace("->", ">"))
+                elif s.startswith("..."):
+                    pass  # skip overflow markers
+
+            _flush()
+
+            if cred_rows:
+                _table(
+                    ["Protocol", "Count", "Type", "Source > Destination"],
+                    cred_rows,
+                    col_widths=[35, 15, 45, eff_w - 95],
+                )
+
+        # Helper: parse lateral movement lines into table rows
+        def _render_lateral_table(lines: list[str], max_rows: int = 20) -> None:
+            """Parse lateral movement lines into a structured table."""
+            lat_rows: list[list[str]] = []
+            total_sources = 0
+
+            for ln in lines:
+                s = ln.strip()
+                if not s:
+                    continue
+                # Source line: "10.70.4.176 -> 10 targets (RDP)  SCAN?"
+                if (s.startswith("10.") and "->" in s and "targets" in s):
+                    total_sources += 1
+                    if len(lat_rows) >= max_rows:
+                        continue
+                    parts = s.split("->", 1)
+                    src = parts[0].strip()
+                    rest = parts[1].strip() if len(parts) > 1 else ""
+                    # Parse "10 targets (RDP)  SCAN?"
+                    tgt_count = ""
+                    proto = ""
+                    flag = ""
+                    tokens = rest.split()
+                    if tokens:
+                        tgt_count = tokens[0]
+                    for t in tokens:
+                        if t.startswith("(") and t.endswith(")"):
+                            proto = t[1:-1]
+                        elif "(" in t:
+                            proto = t.split("(")[1].rstrip(")")
+                        if t == "SCAN?":
+                            flag = "SCAN?"
+                    lat_rows.append([src, tgt_count, proto, flag])
+
+            if lat_rows:
+                _table(
+                    ["Source IP", "Targets", "Protocol", "Flag"],
+                    lat_rows,
+                    col_widths=[45, 20, 30, 20],
+                )
+                if total_sources > max_rows:
+                    pdf.set_font("Helvetica", "I", 7.5)
+                    pdf.set_text_color(*CLR_GREY)
+                    pdf.set_x(pdf.l_margin)
+                    pdf.cell(0, 4,
+                             f"  Showing top {max_rows} of {total_sources} sources "
+                             "(see .md for complete listing)",
+                             new_x="LMARGIN", new_y="NEXT")
+                    pdf.set_text_color(*CLR_BLACK)
+
+        # Helper: parse port scan lines into table rows
+        def _render_scan_table(lines: list[str]) -> None:
+            """Parse port scan pattern lines into a table."""
+            scan_rows: list[list[str]] = []
+            for ln in lines:
+                s = ln.strip()
+                if not s or not s[0].isdigit():
+                    # Source line: "10.70.144.155 -> 108 hosts on port 5450 (5450)"
+                    if s.startswith("10.") and "hosts on port" in s:
+                        parts = s.split("->", 1)
+                        src = parts[0].strip()
+                        rest = parts[1].strip() if len(parts) > 1 else ""
+                        # "108 hosts on port 5450 (5450)"
+                        tokens = rest.split()
+                        count = tokens[0] if tokens else ""
+                        port = ""
+                        svc = ""
+                        if "port" in rest:
+                            after_port = rest.split("port", 1)[1].strip()
+                            port_tokens = after_port.split()
+                            port = port_tokens[0] if port_tokens else ""
+                            if len(port_tokens) > 1:
+                                svc = port_tokens[1].strip("()")
+                        scan_rows.append([src, count, port, svc])
+
+            if scan_rows:
+                _table(
+                    ["Scanner IP", "Hosts", "Port", "Service"],
+                    scan_rows,
+                    col_widths=[45, 18, 18, eff_w - 81],
+                )
+
         # --- Parse content into sections (split on ===== dividers) ---
         raw_sections: list[tuple[str, list[str]]] = []
         current_title = ""
@@ -553,7 +724,11 @@ def _export_pdf(
             stripped = raw_line.strip()
             # Detect section headers: a line of ====, then the title, then ====
             if stripped.startswith("=" * 10):
-                # If we have pending lines, save them
+                # If we already captured a title but no content lines yet,
+                # this is the closing ==== of a ====TITLE==== pair – skip it.
+                if current_title and current_title != "__DIVIDER__" and not current_lines:
+                    continue
+                # Otherwise save any pending section
                 if current_title or current_lines:
                     raw_sections.append((current_title, current_lines))
                     current_lines = []
@@ -606,6 +781,135 @@ def _export_pdf(
                 _section_header(sec_title, bg=(130, 70, 10))  # amber for OT
             else:
                 _section_header(sec_title)
+
+            # --- Check for table-friendly sections and render as tables ---
+            is_credential_section = "CREDENTIAL" in sec_title.upper()
+            is_lateral_section = "LATERAL" in sec_title.upper() or "CROSS-ZONE" in sec_title.upper()
+
+            if is_credential_section:
+                _render_credential_table(sec_lines)
+                continue
+
+            if is_lateral_section:
+                # Split into sub-sections by sub-header keywords
+                subsections: list[tuple[str, list[str]]] = []
+                cur_sub = ""
+                cur_lines: list[str] = []
+                for ln in sec_lines:
+                    s = ln.strip()
+                    if s.startswith(("INTERNAL LATERAL", "ICS PROTOCOL CROSS-ZONE",
+                                     "PORT SCAN PATTERNS")):
+                        if cur_sub or cur_lines:
+                            subsections.append((cur_sub, cur_lines))
+                        cur_sub = s
+                        cur_lines = []
+                        continue
+                    cur_lines.append(ln)
+                if cur_sub or cur_lines:
+                    subsections.append((cur_sub, cur_lines))
+
+                for sub_title, sub_lines in subsections:
+                    if sub_title:
+                        _sub_header(sub_title)
+                    if "LATERAL" in sub_title.upper():
+                        _render_lateral_table(sub_lines, max_rows=20)
+                    elif "CROSS-ZONE" in sub_title.upper():
+                        # Cross-zone: render as table too
+                        xz_rows: list[list[str]] = []
+                        for ln in sub_lines:
+                            s = ln.strip()
+                            if not s or s.startswith("-"):
+                                continue
+                            if "(INT)" in s and "(EXT)" in s:
+                                # "10.70.1.75 (INT) -> 161.141.96.182 (EXT):44818 (EtherNet/IP) -- 2 pkts"
+                                parts = s.split("->", 1)
+                                src = parts[0].replace("(INT)", "").strip()
+                                rest = parts[1].strip() if len(parts) > 1 else ""
+                                # Parse dest, port, proto, pkts
+                                dst_part = rest.split("--")[0].strip() if "--" in rest else rest
+                                pkts = rest.split("--")[1].strip() if "--" in rest else ""
+                                # "161.141.96.182 (EXT):44818 (EtherNet/IP)"
+                                dst_ip = dst_part.split("(EXT)")[0].strip()
+                                port_proto = dst_part.split("(EXT)")[1].strip(": ") if "(EXT)" in dst_part else ""
+                                xz_rows.append([src, dst_ip, port_proto, pkts])
+                        if xz_rows:
+                            show = xz_rows[:20]
+                            _table(
+                                ["Internal IP", "External IP", "Port / Protocol", "Volume"],
+                                show,
+                                col_widths=[38, 38, 55, eff_w - 131],
+                            )
+                            if len(xz_rows) > 20:
+                                pdf.set_font("Helvetica", "I", 7.5)
+                                pdf.set_text_color(*CLR_GREY)
+                                pdf.set_x(pdf.l_margin)
+                                pdf.cell(0, 4,
+                                         f"  Showing 20 of {len(xz_rows)} cross-zone flows "
+                                         "(see .md for complete listing)",
+                                         new_x="LMARGIN", new_y="NEXT")
+                                pdf.set_text_color(*CLR_BLACK)
+                    elif "SCAN" in sub_title.upper():
+                        _render_scan_table(sub_lines)
+                    else:
+                        # Fallback: render as data lines
+                        for ln in sub_lines:
+                            s = ln.strip()
+                            if s:
+                                _data_line(s)
+                continue
+
+            # --- Port Analysis section → render as tables ---
+            is_port_section = "PORT ANALYSIS" in sec_title.upper()
+            if is_port_section:
+                # Split into sub-sections
+                port_subs: list[tuple[str, list[str]]] = []
+                cur_sub_title = ""
+                cur_sub_lines: list[str] = []
+                for ln in sec_lines:
+                    s = ln.strip()
+                    if s.startswith(("STANDARD SERVICES", "ICS/SCADA PROTOCOLS",
+                                     "SUSPICIOUS PORTS", "UNKNOWN HIGH PORTS")):
+                        if cur_sub_title or cur_sub_lines:
+                            port_subs.append((cur_sub_title, cur_sub_lines))
+                        cur_sub_title = s
+                        cur_sub_lines = []
+                        continue
+                    cur_sub_lines.append(ln)
+                if cur_sub_title or cur_sub_lines:
+                    port_subs.append((cur_sub_title, cur_sub_lines))
+
+                for psub_title, psub_lines in port_subs:
+                    if psub_title:
+                        _sub_header(psub_title)
+                    port_rows: list[list[str]] = []
+                    for ln in psub_lines:
+                        s = ln.strip()
+                        if not s or s.startswith("-"):
+                            continue
+                        # "443    HTTPS   flows=160  sources=112  1.5 MB"
+                        # or "502    Modbus  flows=422  sources=9"
+                        tokens = s.split()
+                        if tokens and tokens[0].isdigit():
+                            port = tokens[0]
+                            svc = tokens[1] if len(tokens) > 1 else ""
+                            flows = ""
+                            sources = ""
+                            vol = ""
+                            for t in tokens[2:]:
+                                if t.startswith("flows="):
+                                    flows = t.split("=")[1]
+                                elif t.startswith("sources="):
+                                    sources = t.split("=")[1]
+                                else:
+                                    vol = (vol + " " + t).strip()
+                            port_rows.append([port, svc, flows, sources, vol])
+                    if port_rows:
+                        _table(
+                            ["Port", "Service", "Flows", "Sources", "Volume"],
+                            port_rows,
+                            col_widths=[18, 35, 22, 22, eff_w - 97],
+                        )
+                continue
 
             # Track data lines for truncation (at section and sub-section level)
             data_line_count = 0
