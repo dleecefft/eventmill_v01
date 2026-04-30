@@ -715,6 +715,9 @@ def _export_pdf(
                     col_widths=[45, 18, 18, eff_w - 81],
                 )
 
+        # --- Normalize Unicode before parsing so table parsers see ASCII ---
+        content = _pdf_safe(content)
+
         # --- Parse content into sections (split on ===== dividers) ---
         raw_sections: list[tuple[str, list[str]]] = []
         current_title = ""
