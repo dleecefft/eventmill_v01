@@ -545,8 +545,9 @@ def _build_cred_patterns() -> None:
     _CRED_PATTERNS = [
         ("FTP", {21}, _re.compile(rb'^(USER |PASS )', _re.IGNORECASE), "FTP login command"),
         ("Telnet", {23}, _re.compile(rb'(login:|password:|username:)', _re.IGNORECASE), "Telnet login prompt"),
-        ("HTTP-BasicAuth", {80, 8080, 8443, 8000}, _re.compile(rb'Authorization:\s*Basic\s+', _re.IGNORECASE), "HTTP Basic Auth header"),
-        ("HTTP-FormPost", {80, 8080, 8443, 8000}, _re.compile(rb'(password=|passwd=|pwd=|user=|username=|login=)', _re.IGNORECASE), "HTTP form credential field"),
+        # HTTP Basic Auth / Form — match on ANY port (services run on 15672, 9200, 8161, etc.)
+        ("HTTP-BasicAuth", None, _re.compile(rb'Authorization:\s*Basic\s+', _re.IGNORECASE), "HTTP Basic Auth header"),
+        ("HTTP-FormPost", None, _re.compile(rb'(password=|passwd=|pwd=|user=|username=|login=)', _re.IGNORECASE), "HTTP form credential field"),
         ("SMTP", {25, 587}, _re.compile(rb'^(AUTH LOGIN|AUTH PLAIN)', _re.IGNORECASE), "SMTP authentication"),
         ("SNMPv1/v2c", {161, 162}, None, "SNMP community string (unauthenticated)"),
         ("LDAP-SimpleBind", {389}, _re.compile(rb'\x80.{0,4}(\x04)', _re.DOTALL), "LDAP simple bind"),
@@ -587,16 +588,17 @@ def _extract_cleartext_creds(
         sport = pkt[UDP].sport
 
     for proto_name, ports, pattern, description in _CRED_PATTERNS:
-        if dport not in ports and sport not in ports:
+        # ports=None means match any port (pattern-only detection like HTTP Basic Auth)
+        if ports is not None and dport not in ports and sport not in ports:
             continue
-        # For SNMP and VNC, any traffic on the port is flagged
+        # For SNMP and VNC, any traffic on the port is flagged (no pattern needed)
         if pattern is None:
             session.cleartext_creds.append({
                 "protocol": proto_name,
                 "description": description,
                 "src": src_ip,
                 "dst": dst_ip,
-                "port": dport if dport in ports else sport,
+                "port": dport if (ports and dport in ports) else sport,
                 "ts": ts,
             })
             return
@@ -606,7 +608,7 @@ def _extract_cleartext_creds(
                 "description": description,
                 "src": src_ip,
                 "dst": dst_ip,
-                "port": dport if dport in ports else sport,
+                "port": dport,
                 "ts": ts,
             })
             return
