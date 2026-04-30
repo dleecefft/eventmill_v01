@@ -308,6 +308,35 @@ MODE_CONFIG: dict[str, tuple[str, str | None, str | None]] = {
 # PDF export helper (fpdf2)
 # ---------------------------------------------------------------------------
 
+# Unicode → ASCII replacements for PDF rendering with built-in fonts
+_PDF_UNICODE_MAP = {
+    "\u2014": "--",   # em dash
+    "\u2013": "-",    # en dash
+    "\u2018": "'",    # left single quote
+    "\u2019": "'",    # right single quote
+    "\u201c": '"',    # left double quote
+    "\u201d": '"',    # right double quote
+    "\u2022": "*",    # bullet
+    "\u2026": "...",  # ellipsis
+    "\u2192": "->",   # right arrow
+    "\u2190": "<-",   # left arrow
+    "\u2502": "|",    # box drawing vertical
+    "\u2500": "-",    # box drawing horizontal
+    "\u00d7": "x",    # multiplication sign
+    "\u00b7": ".",    # middle dot
+    "\u2212": "-",    # minus sign
+    "\u00a0": " ",    # non-breaking space
+}
+
+
+def _pdf_safe(text: str) -> str:
+    """Convert Unicode text to ASCII-safe string for PDF built-in fonts."""
+    for uc, repl in _PDF_UNICODE_MAP.items():
+        text = text.replace(uc, repl)
+    # Strip remaining non-ASCII (emoji, etc.)
+    return text.encode("ascii", "ignore").decode("ascii")
+
+
 def _export_pdf(
     content: str,
     output_dir: Path,
@@ -329,9 +358,9 @@ def _export_pdf(
 
         # --- Title ---
         pdf.set_font("Helvetica", "B", 16)
-        title = "Event Mill — PCAP AI Analysis Report"
+        title = "Event Mill - PCAP AI Analysis Report"
         if mode.startswith("ot_"):
-            title = "Event Mill — OT/ICS PCAP Analysis Report"
+            title = "Event Mill - OT/ICS PCAP Analysis Report"
         pdf.cell(0, 10, title, new_x="LMARGIN", new_y="NEXT", align="C")
 
         # Subtitle with mode and timestamp
@@ -349,31 +378,58 @@ def _export_pdf(
         effective_width = pdf.w - pdf.l_margin - pdf.r_margin
 
         for line in content.split("\n"):
-            # Section headers (lines starting with '=' or containing emoji headers)
+            clean = _pdf_safe(line)
+
+            # Section headers (lines of === or ---)
             if line.startswith("====") or line.startswith("----"):
                 pdf.set_font("Courier", "", 8)
-                pdf.cell(0, 4, line[:120], new_x="LMARGIN", new_y="NEXT")
+                pdf.cell(0, 4, clean[:120], new_x="LMARGIN", new_y="NEXT")
                 continue
 
-            if line.startswith("🔍 ") or line.startswith("⚡ "):
+            # Markdown headings (## or ###)
+            if line.startswith("### "):
+                pdf.set_font("Helvetica", "B", 10)
+                pdf.multi_cell(effective_width, 5, _pdf_safe(line[4:]))
+                pdf.set_font("Courier", "", 8)
+                continue
+            if line.startswith("## "):
                 pdf.set_font("Helvetica", "B", 12)
-                # Strip emoji for PDF (fpdf2 built-in fonts don't support them)
-                clean = line.encode("ascii", "ignore").decode("ascii").strip()
-                if clean:
-                    pdf.cell(0, 8, clean, new_x="LMARGIN", new_y="NEXT")
+                pdf.multi_cell(effective_width, 6, _pdf_safe(line[3:]))
+                pdf.set_font("Courier", "", 8)
+                continue
+
+            # Section emoji headers
+            if any(line.startswith(e) for e in ("🔍 ", "⚡ ")):
+                pdf.set_font("Helvetica", "B", 12)
+                if clean.strip():
+                    pdf.cell(0, 8, clean.strip(), new_x="LMARGIN", new_y="NEXT")
                 pdf.set_font("Courier", "", 8)
                 continue
 
             # Bold-ish markers for severity lines
-            if any(marker in line for marker in ("CRITICAL", "🔴", "🟡", "⚠️")):
+            if any(marker in line for marker in ("CRITICAL", "🔴", "🟡", "⚠️", "**CRITICAL**", "**HIGH**")):
                 pdf.set_font("Courier", "B", 8)
-                clean = line.encode("ascii", "ignore").decode("ascii")
                 pdf.multi_cell(effective_width, 4, clean)
                 pdf.set_font("Courier", "", 8)
                 continue
 
-            # Regular line — strip non-ASCII (emoji) for built-in font compat
-            clean = line.encode("ascii", "ignore").decode("ascii")
+            # Markdown bold (**text**) — render whole line in bold if it starts with **
+            if clean.strip().startswith("**"):
+                pdf.set_font("Courier", "B", 8)
+                # Strip ** markers for display
+                display = clean.replace("**", "")
+                pdf.multi_cell(effective_width, 4, display)
+                pdf.set_font("Courier", "", 8)
+                continue
+
+            # Markdown list items (* or -)
+            if clean.strip().startswith("* ") or clean.strip().startswith("- "):
+                indent = len(clean) - len(clean.lstrip())
+                pdf.set_font("Courier", "", 8)
+                pdf.multi_cell(effective_width, 4, clean)
+                continue
+
+            # Regular line
             if clean.strip():
                 pdf.multi_cell(effective_width, 4, clean)
             else:
