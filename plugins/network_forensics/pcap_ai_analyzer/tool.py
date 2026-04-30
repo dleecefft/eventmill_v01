@@ -788,6 +788,205 @@ def _export_pdf(
             # --- Check for table-friendly sections and render as tables ---
             is_credential_section = "CREDENTIAL" in sec_title.upper()
             is_lateral_section = "LATERAL" in sec_title.upper() or "CROSS-ZONE" in sec_title.upper()
+            is_ot_activity = ("OT / ICS PROTOCOL ACTIVITY" in sec_title.upper()
+                              or "OT/ICS PROTOCOL ACTIVITY" in sec_title.upper())
+
+            # --- OT / ICS Protocol Activity → structured tables ---
+            if is_ot_activity:
+                # Categorise lines into sub-parts
+                proto_rows: list[list[str]] = []
+                write_rows: list[list[str]] = []
+                write_title = ""
+                control_rows: list[list[str]] = []
+                control_title = ""
+                exception_rows: list[list[str]] = []
+                exception_title = ""
+                diag_rows: list[list[str]] = []
+                diag_title = ""
+                fc_rows: list[list[str]] = []
+                fc_title = ""
+                unit_id_line = ""
+                summary_lines: list[str] = []
+                current_block = ""
+
+                for ln in sec_lines:
+                    s = ln.strip()
+                    if not s or s.startswith("-" * 5):
+                        continue
+
+                    # Detect sub-block transitions
+                    s_up = s.upper()
+                    if "PROTOCOL BREAKDOWN" in s_up:
+                        current_block = "proto"
+                        continue
+                    if "WRITE OPERATIONS" in s_up:
+                        current_block = "write"
+                        write_title = s
+                        continue
+                    if "CONTROL COMMANDS" in s_up:
+                        current_block = "control"
+                        control_title = s
+                        continue
+                    if "EXCEPTION RESPONSES" in s_up:
+                        current_block = "exception"
+                        exception_title = s
+                        continue
+                    if "DIAGNOSTIC COMMANDS" in s_up:
+                        current_block = "diag"
+                        diag_title = s
+                        continue
+                    if "FUNCTION CODE DISTRIBUTION" in s_up:
+                        current_block = "fc"
+                        fc_title = s
+                        continue
+                    if "UNIT IDS" in s_up:
+                        current_block = ""
+                        unit_id_line = s
+                        continue
+
+                    # Route lines to appropriate list
+                    if current_block == "proto":
+                        # "  Modbus              7,189 transactions"
+                        tokens = s.split()
+                        if len(tokens) >= 2 and tokens[-1] == "transactions":
+                            proto_rows.append([tokens[0], tokens[1]])
+                        else:
+                            summary_lines.append(s)
+                    elif current_block == "write":
+                        # "172.24.162.205 -> ... | Modbus | 328 writes | Functions: ..."
+                        if "->" in s and "|" in s:
+                            parts = [p.strip() for p in s.split("|")]
+                            route = parts[0] if parts else ""
+                            proto = parts[1] if len(parts) > 1 else ""
+                            writes = parts[2].replace("writes", "").strip() if len(parts) > 2 else ""
+                            funcs = parts[3].replace("Functions:", "").strip() if len(parts) > 3 else ""
+                            write_rows.append([route, proto, writes, funcs])
+                        else:
+                            summary_lines.append(s)
+                    elif current_block == "control":
+                        # "src -> dst:port (proto) -- func"
+                        if "->" in s:
+                            parts = s.split("->", 1)
+                            src = parts[0].strip()
+                            rest = parts[1].strip() if len(parts) > 1 else ""
+                            if "--" in rest:
+                                target, cmd = rest.split("--", 1)
+                                control_rows.append([src, target.strip(), cmd.strip()])
+                            else:
+                                control_rows.append([src, rest, ""])
+                        else:
+                            summary_lines.append(s)
+                    elif current_block == "exception":
+                        # "Read Holding Registers exception code=2 -- 8 occurrence(s)"
+                        if "exception" in s.lower() and "--" in s:
+                            before_dash, after_dash = s.split("--", 1)
+                            # func_name exception code=X
+                            parts = before_dash.strip().rsplit("code=", 1)
+                            func_part = parts[0].replace("exception", "").strip()
+                            exc_code = parts[1].strip() if len(parts) > 1 else ""
+                            count_part = after_dash.strip().split()[0] if after_dash.strip() else ""
+                            exception_rows.append([func_part, exc_code, count_part])
+                        elif "exception" in s.lower():
+                            exception_rows.append([s, "", ""])
+                        else:
+                            summary_lines.append(s)
+                    elif current_block == "diag":
+                        if "->" in s:
+                            parts = s.split("->", 1)
+                            src = parts[0].strip()
+                            rest = parts[1].strip() if len(parts) > 1 else ""
+                            if "--" in rest:
+                                target, cmd = rest.split("--", 1)
+                                diag_rows.append([src, target.strip(), cmd.strip()])
+                            else:
+                                diag_rows.append([src, rest, ""])
+                        else:
+                            summary_lines.append(s)
+                    elif current_block == "fc":
+                        # "FC   3 (Read Holding Registers      )  1,328"
+                        # or "FC  15 (Write Multiple Coils       )    496  WRITE"
+                        if s.startswith("FC"):
+                            tokens = s.split()
+                            fc_num = tokens[1] if len(tokens) > 1 else ""
+                            # Extract function name between parens
+                            fname = ""
+                            if "(" in s and ")" in s:
+                                fname = s.split("(", 1)[1].split(")", 1)[0].strip()
+                            # Count is after the closing paren
+                            after_paren = s.split(")", 1)[1].strip() if ")" in s else ""
+                            at = after_paren.split()
+                            count = at[0] if at else ""
+                            flag = at[1] if len(at) > 1 else ""
+                            fc_rows.append([fc_num, fname, count, flag])
+                        else:
+                            summary_lines.append(s)
+                    else:
+                        # Pre-block summary lines (Total OT, OT endpoints, etc.)
+                        summary_lines.append(s)
+
+                # Render summary lines at top
+                for sl in summary_lines:
+                    _body_line(sl, font_size=9)
+
+                # Protocol breakdown table
+                if proto_rows:
+                    _sub_header("Protocol Breakdown")
+                    _table(
+                        ["Protocol", "Transactions"],
+                        proto_rows,
+                        col_widths=[55, eff_w - 55],
+                    )
+
+                # Write operations table
+                if write_rows:
+                    _sub_header(write_title or "Write Operations")
+                    _table(
+                        ["Route (Src -> Dst)", "Protocol", "Writes", "Functions"],
+                        write_rows,
+                        col_widths=[eff_w * 0.38, 30, 20, eff_w * 0.62 - 50],
+                    )
+
+                # Control commands table
+                if control_rows:
+                    _sub_header(control_title or "Control Commands")
+                    _table(
+                        ["Source", "Target", "Command"],
+                        control_rows,
+                        col_widths=[45, 55, eff_w - 100],
+                    )
+
+                # Exception responses table
+                if exception_rows:
+                    _sub_header(exception_title or "Exception Responses")
+                    _table(
+                        ["Function", "Exc. Code", "Count"],
+                        exception_rows,
+                        col_widths=[eff_w - 60, 30, 30],
+                    )
+
+                # Diagnostic commands table
+                if diag_rows:
+                    _sub_header(diag_title or "Diagnostic Commands")
+                    _table(
+                        ["Source", "Target", "Command"],
+                        diag_rows,
+                        col_widths=[45, 55, eff_w - 100],
+                    )
+
+                # Modbus FC distribution table
+                if fc_rows:
+                    _sub_header(fc_title or "Function Code Distribution")
+                    _table(
+                        ["FC", "Function Name", "Count", "Flag"],
+                        fc_rows,
+                        col_widths=[15, eff_w - 75, 30, 30],
+                    )
+
+                # Unit IDs at the bottom
+                if unit_id_line:
+                    _body_line(unit_id_line, bold=True, font_size=8.5)
+
+                continue
 
             if is_credential_section:
                 _render_credential_table(sec_lines)
