@@ -636,22 +636,19 @@ def _export_pdf(
         # Helper: parse lateral movement lines into table rows
         def _render_lateral_table(lines: list[str], max_rows: int = 20) -> None:
             """Parse lateral movement lines into a structured table."""
-            lat_rows: list[list[str]] = []
-            total_sources = 0
+            # Two-pass: first collect sources with their detail targets
+            entries: list[dict] = []
+            current_entry: dict | None = None
 
             for ln in lines:
                 s = ln.strip()
                 if not s:
                     continue
-                # Source line: "10.70.4.176 -> 10 targets (RDP)  SCAN?"
-                if (s.startswith("10.") and "->" in s and "targets" in s):
-                    total_sources += 1
-                    if len(lat_rows) >= max_rows:
-                        continue
+                # Source line: "172.24.62.114 -> 3 targets (SMB)"
+                if (s[0].isdigit() and "->" in s and "targets" in s):
                     parts = s.split("->", 1)
                     src = parts[0].strip()
                     rest = parts[1].strip() if len(parts) > 1 else ""
-                    # Parse "10 targets (RDP)  SCAN?"
                     tgt_count = ""
                     proto = ""
                     flag = ""
@@ -665,13 +662,36 @@ def _export_pdf(
                             proto = t.split("(")[1].rstrip(")")
                         if t == "SCAN?":
                             flag = "SCAN?"
-                    lat_rows.append([src, tgt_count, proto, flag])
+                    current_entry = {
+                        "src": src, "count": tgt_count,
+                        "proto": proto, "flag": flag, "targets": [],
+                    }
+                    entries.append(current_entry)
+                # Detail line: "-> 10.123.0.46:445 (SMB) 6 pkts 372.0 B"
+                elif s.startswith("->") and current_entry is not None:
+                    detail = s[2:].strip()
+                    # Extract just the destination IP:port
+                    dst_tokens = detail.split()
+                    if dst_tokens:
+                        current_entry["targets"].append(dst_tokens[0])
+
+            # Build table rows (top max_rows sources)
+            total_sources = len(entries)
+            lat_rows: list[list[str]] = []
+            for e in entries[:max_rows]:
+                tgts = "; ".join(e["targets"][:3])
+                if len(e["targets"]) > 3:
+                    tgts += f" (+{len(e['targets'])-3})"
+                lat_rows.append([
+                    e["src"], e["count"], e["proto"],
+                    e["flag"], tgts,
+                ])
 
             if lat_rows:
                 _table(
-                    ["Source IP", "Targets", "Protocol", "Flag"],
+                    ["Source IP", "Targets", "Protocol", "Flag", "Top Destinations"],
                     lat_rows,
-                    col_widths=[45, 20, 30, 20],
+                    col_widths=[38, 18, 25, 18, eff_w - 99],
                 )
                 if total_sources > max_rows:
                     pdf.set_font("Helvetica", "I", 7.5)
@@ -689,24 +709,25 @@ def _export_pdf(
             scan_rows: list[list[str]] = []
             for ln in lines:
                 s = ln.strip()
-                if not s or not s[0].isdigit():
-                    # Source line: "10.70.144.155 -> 108 hosts on port 5450 (5450)"
-                    if s.startswith("10.") and "hosts on port" in s:
-                        parts = s.split("->", 1)
-                        src = parts[0].strip()
-                        rest = parts[1].strip() if len(parts) > 1 else ""
-                        # "108 hosts on port 5450 (5450)"
-                        tokens = rest.split()
-                        count = tokens[0] if tokens else ""
-                        port = ""
-                        svc = ""
-                        if "port" in rest:
-                            after_port = rest.split("port", 1)[1].strip()
-                            port_tokens = after_port.split()
-                            port = port_tokens[0] if port_tokens else ""
-                            if len(port_tokens) > 1:
-                                svc = port_tokens[1].strip("()")
-                        scan_rows.append([src, count, port, svc])
+                if not s:
+                    continue
+                # Source line: "10.70.144.155 -> 108 hosts on port 5450 (5450)"
+                if s[0].isdigit() and "hosts on port" in s:
+                    parts = s.split("->", 1)
+                    src = parts[0].strip()
+                    rest = parts[1].strip() if len(parts) > 1 else ""
+                    # "108 hosts on port 5450 (5450)"
+                    tokens = rest.split()
+                    count = tokens[0] if tokens else ""
+                    port = ""
+                    svc = ""
+                    if "port" in rest:
+                        after_port = rest.split("port", 1)[1].strip()
+                        port_tokens = after_port.split()
+                        port = port_tokens[0] if port_tokens else ""
+                        if len(port_tokens) > 1:
+                            svc = port_tokens[1].strip("()")
+                    scan_rows.append([src, count, port, svc])
 
             if scan_rows:
                 _table(
@@ -1088,16 +1109,22 @@ def _export_pdf(
                         s = ln.strip()
                         if not s or s.startswith("-"):
                             continue
-                        # "443    HTTPS   flows=160  sources=112  1.5 MB"
-                        # or "502    Modbus  flows=422  sources=9"
+                        # Standard: "443  HTTPS  flows=160  sources=112  1.5 MB"
+                        # Unknown:  "1947  flows=17  sources=11  144.0 KB"
                         tokens = s.split()
                         if tokens and tokens[0].isdigit():
                             port = tokens[0]
-                            svc = tokens[1] if len(tokens) > 1 else ""
+                            # If second token starts with flows=, no service name
+                            if len(tokens) > 1 and tokens[1].startswith("flows="):
+                                svc = ""
+                                rest_tokens = tokens[1:]
+                            else:
+                                svc = tokens[1] if len(tokens) > 1 else ""
+                                rest_tokens = tokens[2:]
                             flows = ""
                             sources = ""
                             vol = ""
-                            for t in tokens[2:]:
+                            for t in rest_tokens:
                                 if t.startswith("flows="):
                                     flows = t.split("=")[1]
                                 elif t.startswith("sources="):
