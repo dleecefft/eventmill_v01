@@ -346,6 +346,44 @@ ARP HEALTH ANALYSIS:
 - High request/reply ratio (>5:1) suggests many dead or unreachable hosts, a subnet
   misconfiguration, or an active ARP scan.
 - ARP >5% of total traffic is abnormal for production networks.
+
+CONTROL PLANE & TOPOLOGY ANALYSIS:
+- STP (Spanning Tree Protocol):
+  - BPDUs are normal L2 control frames; their RATE matters, not mere presence.
+  - TCN (Topology Change Notification) BPDUs signal that the L2 topology changed —
+    a port went up/down, a device joined/left. Occasional TCNs are normal; sustained
+    floods (>10/min) indicate port flapping, cable issues, or misconfiguration.
+  - TC flag set in Config BPDUs triggers MAC table aging acceleration across bridges.
+    Many TC flags = many topology changes = network instability.
+  - Multiple root bridges seen means root bridge election occurred during the capture.
+    This is a CRITICAL event that causes seconds-long traffic blackout.
+  - BPDU rate >5/s on a single bridge is elevated; standard STP sends every 2s.
+- HSRP (Hot Standby Router Protocol):
+  - HSRP state transitions (Standby→Active or Active→Standby) represent gateway
+    failover events. Each transition causes brief traffic disruption for hosts
+    using that HSRP virtual IP as their default gateway.
+  - Rapid state oscillation (multiple transitions in seconds) indicates a flapping
+    peer, WAN link instability, or HSRP timer misconfiguration.
+  - Multiple groups are normal in multi-VLAN environments.
+- VRRP (Virtual Router Redundancy Protocol):
+  - Similar to HSRP but standards-based. Priority changes trigger master election.
+  - Priority 255 means the VRRP router owns the virtual IP (it's the IP owner).
+  - Priority drops from 255 indicate the IP owner is relinquishing mastership.
+- OSPF (Open Shortest Path First):
+  - Hello packets maintain neighbor adjacencies. A gap exceeding the Dead Interval
+    (default 40s) means the neighbor was declared dead — adjacency reset.
+  - LS Update bursts (>10/5s) indicate link flapping or route recalculation (SPF).
+    This causes network-wide reconvergence and potential micro-loops.
+  - DB Description and LS Request packets appear during initial adjacency formation
+    or adjacency reset — many of these suggest neighbors are re-syncing.
+  - Multiple areas and many router IDs help map the OSPF topology.
+- EIGRP (Enhanced Interior Gateway Routing Protocol):
+  - Queries indicate a route went ACTIVE (lost). High query counts suggest routes
+    are frequently being recalculated.
+  - Stuck-In-Active (SIA): if queries exceed 3 minutes without replies, EIGRP
+    resets the neighbor adjacency. Look for high Query counts with low Reply counts.
+  - Update packets carry route changes; elevated Update/Hello ratio indicates
+    active topology changes rather than steady-state operation.
 """
 
 # ---------------------------------------------------------------------------
@@ -393,7 +431,13 @@ ANALYSIS TASKS:
    - IP address conflicts (same IP, multiple MACs) — identify affected IPs
    - Gratuitous ARP anomalies — distinguish VRRP/HSRP failover from spoofing
    - Unanswered ARP requests — dead hosts or wrong-subnet devices
-6. QUICK WINS: Recommend 2-3 immediate fixes a network engineer can implement.
+6. CONTROL PLANE CHECK: Review STP, HSRP/VRRP, OSPF, and EIGRP sections:
+   - STP: Are there TCN storms or root bridge changes? Flag root instability as CRITICAL.
+   - HSRP/VRRP: Any state transitions or priority changes? Each = a gateway failover.
+   - OSPF: Any neighbor hello gaps exceeding dead interval? Any LSUpdate bursts?
+   - EIGRP: Any queries (routes going ACTIVE)? High query count = convergence event.
+   Summarize control plane health as STABLE / CONVERGING / UNSTABLE.
+7. QUICK WINS: Recommend 2-3 immediate fixes a network engineer can implement.
 
 Keep response concise and action-oriented for NOC staff.
 
@@ -459,7 +503,22 @@ ANALYSIS TASKS:
    - Top bandwidth consumers (flows, hosts, protocols).
    - Long-lived connections that may indicate stuck sessions.
    - Protocol distribution anomalies (unexpected protocol ratios).
-6. ROOT CAUSE HYPOTHESES: For each major issue found, propose the most likely
+6. CONTROL PLANE DEEP DIVE: If STP/HSRP/VRRP/OSPF/EIGRP data is present:
+   - STP: Correlate TCN count with ARP storms — both together confirm L2 loop.
+     If root bridge changed, estimate reconvergence time from BPDU timestamps.
+     Check if multiple bridges are contending for root (priority war).
+   - HSRP/VRRP: Map state transitions to a timeline. Rapid oscillation (>3
+     transitions/minute) indicates peer reachability issues (WAN flap, interface
+     flap, or timer misconfiguration). Check if all group members are visible.
+   - OSPF: Build neighbor adjacency map from Hello data. Identify dead neighbors
+     (hello gaps >40s). Correlate LSUpdate bursts with topology events.
+     Check for area mismatches if DB Description exchanges are failing.
+   - EIGRP: Calculate Query/Reply ratio. If queries >> replies, suspect SIA
+     condition. Map AS numbers to identify multi-AS boundary issues.
+   - Cross-protocol correlation: STP TCN + HSRP failover + OSPF neighbor reset
+     occurring together indicates a physical link failure cascading through all
+     layers. Build a timeline of control plane events.
+7. ROOT CAUSE HYPOTHESES: For each major issue found, propose the most likely
    root cause and what additional data (SNMP, syslog, interface counters) would
    confirm it.
 
@@ -489,16 +548,30 @@ ANALYSIS TASKS:
    - Zero-window event frequency
    - ARP storm rate (pkt/s) and ARP-to-traffic ratio
    - IP address conflict count
+   - STP TCN count, root bridge stability (stable/changed)
+   - HSRP/VRRP failover count
+   - OSPF dead neighbor events, LSUpdate burst count
+   - EIGRP query count, SIA risk level
    Present each KPI with: current value, typical healthy range, and status
    (GREEN/YELLOW/RED).
-3. PROBLEM AREAS: For each identified issue (including routing loops if detected):
+3. PROBLEM AREAS: For each identified issue (including routing loops and control
+   plane events if detected):
    - Affected hosts/subnets (for loops: the router IPs involved and destinations affected)
    - Impact description (for loops: bandwidth waste, unreachable destinations, application
      timeouts caused by packets being dropped after TTL expiry)
    - Recommended remediation (for loops: specific routing protocol checks, route table
      verification commands, convergence timer adjustments)
-   - Priority (P1-P4) — active routing loops are typically P1/P2
-4. CAPACITY PLANNING NOTES:
+   - For control plane issues: STP root bridge elections cause network-wide traffic
+     blackout (30-50s with legacy STP). HSRP/VRRP failovers cause 1-10s disruption
+     per VLAN. OSPF reconvergence causes micro-loops until SPF completes.
+   - Priority (P1-P4) — active routing loops and root bridge changes are P1/P2
+4. CONTROL PLANE HEALTH SUMMARY:
+   - STP: Root bridge stability, TCN rate, bridge count
+   - HSRP/VRRP: Failover events, group health, VIP availability
+   - OSPF: Adjacency health, convergence events, area topology
+   - EIGRP: Route stability, query volume, SIA risk
+   - Control plane stability grade: STABLE / CONVERGING / UNSTABLE
+5. CAPACITY PLANNING NOTES:
    - Top bandwidth consumers
    - Growth trends if visible from conversation patterns
    - Links or paths that appear near capacity
@@ -2671,6 +2744,209 @@ class PcapAiAnalyzer:
             lines.append("\n  No ARP traffic captured.")
             lines.append("  (Capture may be from a routed interface or span port "
                          "that strips L2 headers)")
+
+        # --- Control Plane & Topology ---
+        has_control_plane = (
+            session.stp_bpdu_count + session.stp_tcn_count > 0
+            or session.hsrp_hello_count > 0
+            or session.vrrp_advert_count > 0
+            or session.ospf_total_count > 0
+            or session.eigrp_total_count > 0
+        )
+
+        lines.append(f"\n{'=' * 60}")
+        lines.append("CONTROL PLANE & TOPOLOGY")
+        lines.append(f"{'=' * 60}")
+
+        if not has_control_plane:
+            lines.append("\n  No control plane protocol traffic detected.")
+            lines.append("  (STP, HSRP, VRRP, OSPF, EIGRP — none captured)")
+        else:
+            # --- STP ---
+            total_stp = session.stp_bpdu_count + session.stp_tcn_count
+            if total_stp > 0:
+                lines.append(f"\n  SPANNING TREE PROTOCOL (STP)")
+                lines.append(f"  {'─' * 40}")
+                lines.append(f"  Config BPDUs: {session.stp_bpdu_count:,}")
+                lines.append(f"  TCN BPDUs (Topology Change Notifications): "
+                             f"{session.stp_tcn_count:,}")
+                lines.append(f"  BPDUs with TC flag set: {session.stp_tc_flag_count:,}")
+
+                # Root bridge stability
+                root_bridges = list(session.stp_root_bridges.keys())
+                if len(root_bridges) == 1:
+                    lines.append(f"  Root Bridge: {root_bridges[0]} (stable)")
+                elif len(root_bridges) > 1:
+                    lines.append(f"  🔴 ROOT BRIDGE CHANGES DETECTED: "
+                                 f"{len(root_bridges)} different root bridges seen!")
+                    for rb in root_bridges:
+                        count = len(session.stp_root_bridges[rb])
+                        lines.append(f"    {rb}: {count:,} BPDUs")
+                    lines.append(f"    ⚠️  Root bridge instability indicates "
+                                 f"STP reconvergence or attack")
+
+                # TCN rate analysis
+                if session.stp_tcn_count > 10:
+                    lines.append(f"  ⚠️  HIGH TCN COUNT: {session.stp_tcn_count} topology "
+                                 f"change notifications — indicates L2 flapping")
+
+                # STP rate
+                if len(session._stp_timestamps) >= 2:
+                    stp_duration = max(session._stp_timestamps) - min(session._stp_timestamps)
+                    if stp_duration > 0:
+                        stp_rate = total_stp / stp_duration
+                        lines.append(f"  STP rate: {stp_rate:.1f} BPDU/s")
+                        if stp_rate > 5:
+                            lines.append(f"  ⚠️  Elevated BPDU rate — possible STP storm")
+
+                # Number of bridges participating
+                if session.stp_bridges:
+                    lines.append(f"  Bridges seen: {len(session.stp_bridges)}")
+                    for bridge, count in session.stp_bridges.most_common(10):
+                        lines.append(f"    {bridge}: {count:,} BPDUs")
+
+            # --- HSRP ---
+            if session.hsrp_hello_count > 0:
+                lines.append(f"\n  HSRP (Hot Standby Router Protocol)")
+                lines.append(f"  {'─' * 40}")
+                lines.append(f"  HSRP Hellos: {session.hsrp_hello_count:,}")
+
+                # Group summary
+                if session.hsrp_events:
+                    groups = set(e["group"] for e in session.hsrp_events)
+                    lines.append(f"  Groups: {', '.join(str(g) for g in sorted(groups))}")
+                    for grp in sorted(groups):
+                        grp_events = [e for e in session.hsrp_events if e["group"] == grp]
+                        sources = set(e["src"] for e in grp_events)
+                        states = set(e["state_name"] for e in grp_events)
+                        vips = set(e["virtual_ip"] for e in grp_events if e["virtual_ip"])
+                        lines.append(f"    Group {grp}: routers={', '.join(sorted(sources))}"
+                                     f"  states={', '.join(sorted(states))}"
+                                     f"  VIP={', '.join(sorted(vips))}")
+
+                # State transitions
+                if session.hsrp_state_changes:
+                    lines.append(f"\n  🔴 HSRP STATE TRANSITIONS: "
+                                 f"{len(session.hsrp_state_changes)}")
+                    for sc in session.hsrp_state_changes[:15]:
+                        lines.append(f"    Group {sc['group']} {sc['src']}: "
+                                     f"{sc['from_state']} → {sc['to_state']}")
+                    if len(session.hsrp_state_changes) > 15:
+                        lines.append(f"    ... +{len(session.hsrp_state_changes) - 15} more")
+                    lines.append(f"    ⚠️  State transitions indicate failover events — "
+                                 f"correlate with network drops")
+
+            # --- VRRP ---
+            if session.vrrp_advert_count > 0:
+                lines.append(f"\n  VRRP (Virtual Router Redundancy Protocol)")
+                lines.append(f"  {'─' * 40}")
+                lines.append(f"  VRRP Advertisements: {session.vrrp_advert_count:,}")
+
+                if session.vrrp_events:
+                    vrids = set(e["vrid"] for e in session.vrrp_events)
+                    lines.append(f"  VRIDs: {', '.join(str(v) for v in sorted(vrids))}")
+                    for vrid in sorted(vrids):
+                        vrid_events = [e for e in session.vrrp_events if e["vrid"] == vrid]
+                        sources = set(e["src"] for e in vrid_events)
+                        priorities = set(e["priority"] for e in vrid_events)
+                        lines.append(f"    VRID {vrid}: routers={', '.join(sorted(sources))}"
+                                     f"  priorities={', '.join(str(p) for p in sorted(priorities))}")
+
+                if session.vrrp_priority_changes:
+                    lines.append(f"\n  ⚠️  VRRP PRIORITY CHANGES: "
+                                 f"{len(session.vrrp_priority_changes)}")
+                    for pc in session.vrrp_priority_changes[:10]:
+                        lines.append(f"    VRID {pc['vrid']} {pc['src']}: "
+                                     f"priority {pc['from_priority']} → {pc['to_priority']}")
+                    lines.append(f"    Priority changes trigger master election — "
+                                 f"may cause brief traffic disruption")
+
+            # --- OSPF ---
+            if session.ospf_total_count > 0:
+                lines.append(f"\n  OSPF (Open Shortest Path First)")
+                lines.append(f"  {'─' * 40}")
+                lines.append(f"  Total OSPF packets: {session.ospf_total_count:,}")
+                lines.append(f"    Hello: {session.ospf_hello_count:,}")
+                lines.append(f"    DB Description: {session.ospf_dbd_count:,}")
+                lines.append(f"    LS Request: {session.ospf_lsrequest_count:,}")
+                lines.append(f"    LS Update: {session.ospf_lsupdate_count:,}")
+                lines.append(f"    LS Ack: {session.ospf_lsack_count:,}")
+
+                if session.ospf_areas:
+                    lines.append(f"  Areas: {', '.join(sorted(session.ospf_areas))}")
+                if session.ospf_router_ids:
+                    lines.append(f"  Router IDs: {', '.join(sorted(session.ospf_router_ids))}"
+                                 f" ({len(session.ospf_router_ids)} routers)")
+
+                # Neighbor hello gap analysis (detect dead neighbors)
+                if session.ospf_neighbor_hellos:
+                    dead_suspects = []
+                    for pair, timestamps in session.ospf_neighbor_hellos.items():
+                        if len(timestamps) < 2:
+                            continue
+                        sorted_ts = sorted(timestamps)
+                        gaps = [sorted_ts[i+1] - sorted_ts[i]
+                                for i in range(len(sorted_ts) - 1)]
+                        max_gap = max(gaps) if gaps else 0
+                        # OSPF default dead interval is 40s (4x hello of 10s)
+                        if max_gap > 40:
+                            dead_suspects.append((pair, max_gap, len(timestamps)))
+
+                    if dead_suspects:
+                        lines.append(f"\n  🔴 OSPF NEIGHBOR GAPS (possible adjacency resets):")
+                        dead_suspects.sort(key=lambda x: x[1], reverse=True)
+                        for (ip_a, ip_b), gap, hello_count in dead_suspects[:10]:
+                            lines.append(
+                                f"    {ip_a} ↔ {ip_b}: max gap={gap:.1f}s "
+                                f"({hello_count} hellos) — "
+                                f"{'DEAD NEIGHBOR' if gap > 120 else 'near dead interval'}")
+
+                # LSUpdate burst detection (link flapping)
+                if len(session._ospf_lsupdate_timestamps) >= 5:
+                    sorted_lsu = sorted(session._ospf_lsupdate_timestamps)
+                    # Check for bursts: >10 LSUpdates in any 5-second window
+                    burst_windows = []
+                    for i in range(len(sorted_lsu) - 10):
+                        window = sorted_lsu[i+10] - sorted_lsu[i]
+                        if window <= 5.0:
+                            burst_windows.append((sorted_lsu[i], 10 / window if window > 0 else 999))
+
+                    if burst_windows:
+                        lines.append(f"\n  ⚠️  OSPF LSUpdate BURSTS DETECTED:")
+                        lines.append(f"    {len(burst_windows)} burst window(s) "
+                                     f"(>10 LSUpdates in 5s)")
+                        max_rate = max(bw[1] for bw in burst_windows)
+                        lines.append(f"    Peak rate: {max_rate:.1f} LSUpdate/s")
+                        lines.append(f"    Indicates link flapping or route recalculation")
+
+            # --- EIGRP ---
+            if session.eigrp_total_count > 0:
+                lines.append(f"\n  EIGRP (Enhanced Interior Gateway Routing Protocol)")
+                lines.append(f"  {'─' * 40}")
+                lines.append(f"  Total EIGRP packets: {session.eigrp_total_count:,}")
+                lines.append(f"    Hello: {session.eigrp_hello_count:,}")
+                lines.append(f"    Update: {session.eigrp_update_count:,}")
+                lines.append(f"    Query: {session.eigrp_query_count:,}")
+                lines.append(f"    Reply: {session.eigrp_reply_count:,}")
+
+                if session.eigrp_as_numbers:
+                    lines.append(f"  AS Numbers: "
+                                 f"{', '.join(str(a) for a in sorted(session.eigrp_as_numbers))}")
+
+                # EIGRP queries indicate route recalculation (active state)
+                if session.eigrp_query_count > 0:
+                    lines.append(f"\n  ⚠️  EIGRP QUERIES: {session.eigrp_query_count:,}")
+                    lines.append(f"    Queries indicate routes going ACTIVE — "
+                                 f"neighbors are recalculating paths")
+                    if session.eigrp_query_count > 20:
+                        lines.append(f"    🔴 HIGH query volume — possible convergence "
+                                     f"event or Stuck-In-Active (SIA) condition")
+
+                # High update count relative to hellos indicates instability
+                if (session.eigrp_hello_count > 0
+                        and session.eigrp_update_count > session.eigrp_hello_count * 0.1):
+                    lines.append(f"    ⚠️  Update/Hello ratio is elevated — "
+                                 f"topology changes in progress")
 
         # --- IP Fragmentation ---
         lines.append(f"\n{'=' * 60}")

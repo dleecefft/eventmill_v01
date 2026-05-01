@@ -175,6 +175,52 @@ class PcapSession:
         # Timestamps for rate analysis (capped)
         self._arp_timestamps: List[float] = []
 
+        # --- Control Plane / Topology tracking ---
+        # STP (Spanning Tree Protocol)
+        self.stp_bpdu_count: int = 0
+        self.stp_tcn_count: int = 0  # Topology Change Notifications
+        self.stp_tc_flag_count: int = 0  # BPDUs with Topology Change flag set
+        # root_bridge_id -> list of timestamps (detect root bridge changes)
+        self.stp_root_bridges: Dict[str, List[float]] = defaultdict(list)
+        self.stp_bridges: Dict[str, int] = Counter()  # bridge_id -> BPDU count
+        self._stp_timestamps: List[float] = []
+
+        # HSRP (Hot Standby Router Protocol)
+        self.hsrp_hello_count: int = 0
+        # group_id -> list of {state, src, priority, virtual_ip, ts}
+        self.hsrp_events: List[Dict] = []
+        # (group_id, src_ip) -> last_state seen — for transition detection
+        self._hsrp_last_state: Dict[Tuple, int] = {}
+        self.hsrp_state_changes: List[Dict] = []  # detected transitions
+
+        # VRRP (Virtual Router Redundancy Protocol)
+        self.vrrp_advert_count: int = 0
+        self.vrrp_events: List[Dict] = []
+        self._vrrp_last_priority: Dict[Tuple, int] = {}
+        self.vrrp_priority_changes: List[Dict] = []
+
+        # OSPF (Open Shortest Path First)
+        self.ospf_hello_count: int = 0
+        self.ospf_lsupdate_count: int = 0
+        self.ospf_lsack_count: int = 0
+        self.ospf_dbd_count: int = 0  # Database Description
+        self.ospf_lsrequest_count: int = 0
+        self.ospf_total_count: int = 0
+        # neighbor_pair -> list of hello timestamps (detect dead neighbor gaps)
+        self.ospf_neighbor_hellos: Dict[Tuple[str, str], List[float]] = defaultdict(list)
+        # Track LSUpdate bursts (link flapping indicator)
+        self._ospf_lsupdate_timestamps: List[float] = []
+        self.ospf_areas: set = set()  # area IDs seen
+        self.ospf_router_ids: set = set()  # router IDs seen
+
+        # EIGRP (Enhanced Interior Gateway Routing Protocol)
+        self.eigrp_hello_count: int = 0
+        self.eigrp_update_count: int = 0
+        self.eigrp_query_count: int = 0
+        self.eigrp_reply_count: int = 0
+        self.eigrp_total_count: int = 0
+        self.eigrp_as_numbers: set = set()  # AS numbers seen
+
     @property
     def unique_ips(self) -> set:
         """All unique IPs seen (src + dst)."""
@@ -295,6 +341,54 @@ try:
 except Exception as e:
     logger.warning("scapy not available: %s — PCAP parsing disabled", e)
 
+# Optional control-plane protocol imports (scapy.contrib)
+_SCAPY_STP = False
+_SCAPY_HSRP = False
+_SCAPY_VRRP = False
+_SCAPY_OSPF = False
+_SCAPY_EIGRP = False
+
+if SCAPY_AVAILABLE:
+    try:
+        from scapy.contrib.stp import STP as _STP_Layer
+        _SCAPY_STP = True
+    except Exception:
+        _STP_Layer = None  # type: ignore[assignment,misc]
+    try:
+        from scapy.contrib.hsrp import HSRP as _HSRP_Layer
+        _SCAPY_HSRP = True
+    except Exception:
+        _HSRP_Layer = None  # type: ignore[assignment,misc]
+    try:
+        from scapy.layers.vrrp import VRRP as _VRRP_Layer
+        _SCAPY_VRRP = True
+    except Exception:
+        try:
+            from scapy.contrib.vrrp import VRRP as _VRRP_Layer  # type: ignore[no-redef]
+            _SCAPY_VRRP = True
+        except Exception:
+            _VRRP_Layer = None  # type: ignore[assignment,misc]
+    try:
+        from scapy.contrib.ospf import OSPF_Hdr as _OSPF_Layer
+        _SCAPY_OSPF = True
+    except Exception:
+        _OSPF_Layer = None  # type: ignore[assignment,misc]
+    try:
+        from scapy.contrib.eigrp import EIGRP as _EIGRP_Layer
+        _SCAPY_EIGRP = True
+    except Exception:
+        _EIGRP_Layer = None  # type: ignore[assignment,misc]
+
+# HSRP state code names
+_HSRP_STATES = {0: "Initial", 1: "Learn", 2: "Listen", 4: "Speak", 8: "Standby", 16: "Active"}
+
+# OSPF message type codes
+_OSPF_TYPES = {1: "Hello", 2: "DBD", 3: "LSRequest", 4: "LSUpdate", 5: "LSAck"}
+
+# EIGRP opcode names
+_EIGRP_OPCODES = {1: "Update", 3: "Query", 4: "Reply", 5: "Hello", 6: "IPX-SAP",
+                  10: "SIA-Query", 11: "SIA-Reply"}
+
 
 # ---------------------------------------------------------------------------
 # Core parser (streaming, packet-by-packet) — identical to event_mill v1
@@ -348,6 +442,30 @@ def parse_pcap_file(file_path: str) -> PcapSession:
                 # Track ARP timestamps for rate analysis
                 if len(session._arp_timestamps) < 10000:
                     session._arp_timestamps.append(ts)
+
+            # --- STP extraction (Layer 2, before IP filter) ---
+            if _SCAPY_STP and pkt.haslayer(_STP_Layer):
+                try:
+                    stp = pkt[_STP_Layer]
+                    bpdu_type = getattr(stp, 'bpdutype', 0)
+                    if bpdu_type == 0x80:
+                        # TCN BPDU (Topology Change Notification)
+                        session.stp_tcn_count += 1
+                    else:
+                        session.stp_bpdu_count += 1
+                        # Track root bridge ID changes
+                        root_id = f"{getattr(stp, 'rootmac', 'unknown')}"
+                        bridge_id = f"{getattr(stp, 'bridgemac', 'unknown')}"
+                        session.stp_root_bridges[root_id].append(ts)
+                        session.stp_bridges[bridge_id] += 1
+                        # Check Topology Change flag
+                        flags = getattr(stp, 'bpduflags', 0)
+                        if flags & 0x01:  # TC flag
+                            session.stp_tc_flag_count += 1
+                    if len(session._stp_timestamps) < 10000:
+                        session._stp_timestamps.append(ts)
+                except Exception:
+                    pass
 
             if not pkt.haslayer(IP):
                 continue
@@ -547,6 +665,119 @@ def parse_pcap_file(file_path: str) -> PcapSession:
             # ---------------------------------------------------------------
             _extract_cleartext_creds(pkt, session, src_ip, dst_ip, dport, ts)
 
+            # ---------------------------------------------------------------
+            # Control plane protocol extraction
+            # ---------------------------------------------------------------
+            # HSRP (UDP port 1985)
+            if _SCAPY_HSRP and dport == 1985 and pkt.haslayer(_HSRP_Layer):
+                try:
+                    hsrp = pkt[_HSRP_Layer]
+                    state = getattr(hsrp, 'state', 0)
+                    group = getattr(hsrp, 'group', 0)
+                    priority = getattr(hsrp, 'priority', 0)
+                    vip = getattr(hsrp, 'virtualIP', '')
+                    session.hsrp_hello_count += 1
+                    session.hsrp_events.append({
+                        "group": group, "state": state,
+                        "state_name": _HSRP_STATES.get(state, f"Unknown({state})"),
+                        "src": src_ip, "priority": priority,
+                        "virtual_ip": str(vip), "ts": ts,
+                    })
+                    # Detect state transitions
+                    key = (group, src_ip)
+                    prev = session._hsrp_last_state.get(key)
+                    if prev is not None and prev != state:
+                        session.hsrp_state_changes.append({
+                            "group": group, "src": src_ip,
+                            "from_state": _HSRP_STATES.get(prev, str(prev)),
+                            "to_state": _HSRP_STATES.get(state, str(state)),
+                            "ts": ts,
+                        })
+                    session._hsrp_last_state[key] = state
+                except Exception:
+                    pass
+            # HSRP fallback: raw UDP port 1985 when scapy contrib not available
+            elif not _SCAPY_HSRP and dport == 1985 and proto == "UDP":
+                session.hsrp_hello_count += 1
+
+            # VRRP (IP protocol 112)
+            if _SCAPY_VRRP and pkt.haslayer(_VRRP_Layer):
+                try:
+                    vrrp = pkt[_VRRP_Layer]
+                    vrid = getattr(vrrp, 'vrid', 0)
+                    priority = getattr(vrrp, 'priority', 0)
+                    session.vrrp_advert_count += 1
+                    session.vrrp_events.append({
+                        "vrid": vrid, "priority": priority,
+                        "src": src_ip, "ts": ts,
+                    })
+                    key = (vrid, src_ip)
+                    prev_pri = session._vrrp_last_priority.get(key)
+                    if prev_pri is not None and prev_pri != priority:
+                        session.vrrp_priority_changes.append({
+                            "vrid": vrid, "src": src_ip,
+                            "from_priority": prev_pri,
+                            "to_priority": priority, "ts": ts,
+                        })
+                    session._vrrp_last_priority[key] = priority
+                except Exception:
+                    pass
+            elif not _SCAPY_VRRP and ip_layer.proto == 112:
+                session.vrrp_advert_count += 1
+
+            # OSPF (IP protocol 89)
+            if _SCAPY_OSPF and pkt.haslayer(_OSPF_Layer):
+                try:
+                    ospf = pkt[_OSPF_Layer]
+                    msg_type = getattr(ospf, 'type', 0)
+                    area = getattr(ospf, 'area', '')
+                    router_id = getattr(ospf, 'src', src_ip)
+                    session.ospf_total_count += 1
+                    if msg_type == 1:
+                        session.ospf_hello_count += 1
+                        pair = tuple(sorted([src_ip, dst_ip]))
+                        session.ospf_neighbor_hellos[pair].append(ts)
+                    elif msg_type == 2:
+                        session.ospf_dbd_count += 1
+                    elif msg_type == 3:
+                        session.ospf_lsrequest_count += 1
+                    elif msg_type == 4:
+                        session.ospf_lsupdate_count += 1
+                        if len(session._ospf_lsupdate_timestamps) < 10000:
+                            session._ospf_lsupdate_timestamps.append(ts)
+                    elif msg_type == 5:
+                        session.ospf_lsack_count += 1
+                    if area:
+                        session.ospf_areas.add(str(area))
+                    if router_id:
+                        session.ospf_router_ids.add(str(router_id))
+                except Exception:
+                    pass
+            elif not _SCAPY_OSPF and ip_layer.proto == 89:
+                session.ospf_total_count += 1
+
+            # EIGRP (IP protocol 88)
+            if _SCAPY_EIGRP and pkt.haslayer(_EIGRP_Layer):
+                try:
+                    eigrp = pkt[_EIGRP_Layer]
+                    opcode = getattr(eigrp, 'opcode', 0)
+                    asn = getattr(eigrp, 'asn', 0)
+                    session.eigrp_total_count += 1
+                    if opcode == 5:
+                        session.eigrp_hello_count += 1
+                    elif opcode == 1:
+                        session.eigrp_update_count += 1
+                    elif opcode == 3:
+                        session.eigrp_query_count += 1
+                    elif opcode == 4:
+                        session.eigrp_reply_count += 1
+                    if asn:
+                        session.eigrp_as_numbers.add(asn)
+                except Exception:
+                    pass
+            elif not _SCAPY_EIGRP and ip_layer.proto == 88:
+                session.eigrp_total_count += 1
+
     return session
 
 
@@ -631,6 +862,46 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
                         session._arp_timestamps.append(ts)
                 except Exception:
                     pass
+
+            # --- STP extraction (Layer 2, before IP filter) ---
+            # STP BPDUs use LLC/SNAP with dst MAC 01:80:c2:00:00:00
+            if len(buf) >= 14:
+                dst_mac_bytes = buf[0:6]
+                # STP multicast: 01:80:c2:00:00:00
+                if dst_mac_bytes == b'\x01\x80\xc2\x00\x00\x00':
+                    try:
+                        # LLC header starts at byte 14 for Ethernet
+                        # DSAP=0x42, SSAP=0x42, Control=0x03 is STP
+                        llc_start = 14
+                        if len(buf) > llc_start + 3:
+                            dsap = buf[llc_start]
+                            ssap = buf[llc_start + 1]
+                            if dsap == 0x42 and ssap == 0x42:
+                                # BPDU starts after LLC header (3 bytes)
+                                bpdu_start = llc_start + 3
+                                if len(buf) > bpdu_start + 4:
+                                    bpdu_type = buf[bpdu_start + 3]
+                                    if bpdu_type == 0x80:
+                                        # TCN BPDU
+                                        session.stp_tcn_count += 1
+                                    else:
+                                        session.stp_bpdu_count += 1
+                                        # Config BPDU: parse root bridge MAC and flags
+                                        if len(buf) > bpdu_start + 20:
+                                            flags = buf[bpdu_start + 4]
+                                            # Root bridge MAC at offset 5+2 (priority+ext) = bytes 7-12
+                                            root_mac_bytes = buf[bpdu_start + 7:bpdu_start + 13]
+                                            root_mac = ":".join(f"{b:02x}" for b in root_mac_bytes)
+                                            bridge_mac_bytes = buf[bpdu_start + 15:bpdu_start + 21]
+                                            bridge_mac = ":".join(f"{b:02x}" for b in bridge_mac_bytes)
+                                            session.stp_root_bridges[root_mac].append(ts)
+                                            session.stp_bridges[bridge_mac] += 1
+                                            if flags & 0x01:  # TC flag
+                                                session.stp_tc_flag_count += 1
+                                    if len(session._stp_timestamps) < 10000:
+                                        session._stp_timestamps.append(ts)
+                    except Exception:
+                        pass
 
             # Only process IPv4
             if not isinstance(eth.data, dpkt.ip.IP):
@@ -834,6 +1105,119 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
             _extract_cleartext_creds_dpkt(
                 session, src_ip, dst_ip, sport, dport, ts, tcp_data,
             )
+
+            # ---------------------------------------------------------------
+            # Control plane protocol extraction (dpkt)
+            # ---------------------------------------------------------------
+            # HSRP (UDP port 1985)
+            if dport == 1985 and proto == "UDP" and len(tcp_data) >= 20:
+                try:
+                    # HSRP v1 header: ver(1) opcode(1) state(1) hellotime(1)
+                    # holdtime(1) priority(1) group(1) reserved(1) auth(8) vip(4)
+                    state = tcp_data[2]
+                    priority = tcp_data[5]
+                    group = tcp_data[6]
+                    vip = socket.inet_ntoa(tcp_data[16:20])
+                    session.hsrp_hello_count += 1
+                    session.hsrp_events.append({
+                        "group": group, "state": state,
+                        "state_name": _HSRP_STATES.get(state, f"Unknown({state})"),
+                        "src": src_ip, "priority": priority,
+                        "virtual_ip": vip, "ts": ts,
+                    })
+                    key = (group, src_ip)
+                    prev = session._hsrp_last_state.get(key)
+                    if prev is not None and prev != state:
+                        session.hsrp_state_changes.append({
+                            "group": group, "src": src_ip,
+                            "from_state": _HSRP_STATES.get(prev, str(prev)),
+                            "to_state": _HSRP_STATES.get(state, str(state)),
+                            "ts": ts,
+                        })
+                    session._hsrp_last_state[key] = state
+                except Exception:
+                    pass
+
+            # VRRP (IP protocol 112)
+            if ip.p == 112:
+                try:
+                    vrrp_data = bytes(ip.data)
+                    if len(vrrp_data) >= 8:
+                        # VRRP header: ver+type(1) vrid(1) priority(1) count(1) ...
+                        vrid = vrrp_data[1]
+                        priority = vrrp_data[2]
+                        session.vrrp_advert_count += 1
+                        session.vrrp_events.append({
+                            "vrid": vrid, "priority": priority,
+                            "src": src_ip, "ts": ts,
+                        })
+                        key = (vrid, src_ip)
+                        prev_pri = session._vrrp_last_priority.get(key)
+                        if prev_pri is not None and prev_pri != priority:
+                            session.vrrp_priority_changes.append({
+                                "vrid": vrid, "src": src_ip,
+                                "from_priority": prev_pri,
+                                "to_priority": priority, "ts": ts,
+                            })
+                        session._vrrp_last_priority[key] = priority
+                except Exception:
+                    pass
+
+            # OSPF (IP protocol 89)
+            if ip.p == 89:
+                try:
+                    ospf_data = bytes(ip.data)
+                    if len(ospf_data) >= 24:
+                        # OSPF header: ver(1) type(1) length(2) router_id(4) area_id(4) ...
+                        msg_type = ospf_data[1]
+                        router_id = socket.inet_ntoa(ospf_data[4:8])
+                        area_id = socket.inet_ntoa(ospf_data[8:12])
+                        session.ospf_total_count += 1
+                        if msg_type == 1:
+                            session.ospf_hello_count += 1
+                            pair = tuple(sorted([src_ip, dst_ip]))
+                            session.ospf_neighbor_hellos[pair].append(ts)
+                        elif msg_type == 2:
+                            session.ospf_dbd_count += 1
+                        elif msg_type == 3:
+                            session.ospf_lsrequest_count += 1
+                        elif msg_type == 4:
+                            session.ospf_lsupdate_count += 1
+                            if len(session._ospf_lsupdate_timestamps) < 10000:
+                                session._ospf_lsupdate_timestamps.append(ts)
+                        elif msg_type == 5:
+                            session.ospf_lsack_count += 1
+                        if area_id and area_id != "0.0.0.0":
+                            session.ospf_areas.add(area_id)
+                        elif area_id == "0.0.0.0":
+                            session.ospf_areas.add("0.0.0.0 (backbone)")
+                        if router_id:
+                            session.ospf_router_ids.add(router_id)
+                except Exception:
+                    pass
+
+            # EIGRP (IP protocol 88)
+            if ip.p == 88:
+                try:
+                    eigrp_data = bytes(ip.data)
+                    if len(eigrp_data) >= 20:
+                        # EIGRP header: ver(1) opcode(1) checksum(2) flags(4)
+                        # seq(4) ack(4) asn(4)
+                        opcode = eigrp_data[1]
+                        asn = struct.unpack('!I', eigrp_data[16:20])[0]
+                        session.eigrp_total_count += 1
+                        if opcode == 5:
+                            session.eigrp_hello_count += 1
+                        elif opcode == 1:
+                            session.eigrp_update_count += 1
+                        elif opcode == 3:
+                            session.eigrp_query_count += 1
+                        elif opcode == 4:
+                            session.eigrp_reply_count += 1
+                        if asn:
+                            session.eigrp_as_numbers.add(asn)
+                except Exception:
+                    pass
 
     return session
 
