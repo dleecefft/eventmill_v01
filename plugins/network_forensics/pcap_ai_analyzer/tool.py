@@ -341,10 +341,10 @@ ARP HEALTH ANALYSIS:
   failure) or broadcast storm. This is a CRITICAL finding.
 - IP address conflicts (same IP, multiple MACs) cause intermittent connectivity loss
   and are notoriously hard to diagnose without PCAP evidence.
-- Gratuitous ARP floods may indicate ARP spoofing (MITM attack), or legitimate
-  VRRP/HSRP/GLBP failover events. Check if the MACs belong to known gateway pairs.
+- Gratuitous ARP floods typically indicate VRRP/HSRP/GLBP failover events or
+  MAC table instability. Check if the MACs belong to known gateway pairs.
 - High request/reply ratio (>5:1) suggests many dead or unreachable hosts, a subnet
-  misconfiguration, or an active ARP scan.
+  misconfiguration, or a device scanning for available addresses.
 - ARP >5% of total traffic is abnormal for production networks.
 
 CONTROL PLANE & TOPOLOGY ANALYSIS:
@@ -429,7 +429,7 @@ ANALYSIS TASKS:
 5. ARP HEALTH CHECK: Review ARP statistics for Layer 2 issues:
    - ARP storm indicators (rate, % of traffic)
    - IP address conflicts (same IP, multiple MACs) — identify affected IPs
-   - Gratuitous ARP anomalies — distinguish VRRP/HSRP failover from spoofing
+   - Gratuitous ARP anomalies — correlate with VRRP/HSRP failover events
    - Unanswered ARP requests — dead hosts or wrong-subnet devices
 6. CONTROL PLANE CHECK: Review STP, HSRP/VRRP, OSPF, and EIGRP sections:
    - STP: Are there TCN storms or root bridge changes? Flag root instability as CRITICAL.
@@ -438,6 +438,9 @@ ANALYSIS TASKS:
    - EIGRP: Any queries (routes going ACTIVE)? High query count = convergence event.
    Summarize control plane health as STABLE / CONVERGING / UNSTABLE.
 7. QUICK WINS: Recommend 2-3 immediate fixes a network engineer can implement.
+8. SUBNET IMPACT: Review the Subnet Anomaly Summary table. Call out the top 3 most
+   impacted /24 networks and explain what combination of indicators make them stand out.
+   For each, identify the specific IPs contributing most to the anomaly score.
 
 Keep response concise and action-oriented for NOC staff.
 
@@ -479,7 +482,7 @@ ANALYSIS TASKS:
      same vendor (OUI lookup hint). Two different vendor MACs = true conflict.
      Same vendor MACs may indicate a virtualization issue (duplicate VM).
    - Gratuitous ARP patterns: if concentrated in short bursts, likely failover.
-     If sustained, likely spoofing or misconfiguration.
+     If sustained, likely misconfiguration or device flapping.
    - Map unanswered ARP targets to subnet ranges to identify dead subnets.
 4. DNS HEALTH:
    - Failed DNS lookups (queries without matching responses).
@@ -521,6 +524,14 @@ ANALYSIS TASKS:
 7. ROOT CAUSE HYPOTHESES: For each major issue found, propose the most likely
    root cause and what additional data (SNMP, syslog, interface counters) would
    confirm it.
+8. SUBNET IMPACT ANALYSIS: Use the Subnet Anomaly Summary to identify the most
+   impacted /24 networks. For each top-3 subnet:
+   - What combination of indicators (RSTs, retransmissions, ICMP errors, loops,
+     unanswered ARPs, IP conflicts) make it stand out?
+   - Which specific IPs in that subnet are the primary contributors?
+   - What is the likely root cause for that subnet specifically?
+   - Could a single event (power outage, link failure, device reboot) explain
+     the cluster of anomalies in that subnet?
 
 End with:
 ⚡ TL;DR
@@ -575,10 +586,16 @@ ANALYSIS TASKS:
    - Top bandwidth consumers
    - Growth trends if visible from conversation patterns
    - Links or paths that appear near capacity
-5. RECOMMENDED MONITORING: What metrics should be continuously monitored
+6. SUBNET IMPACT REPORT: Present the Subnet Anomaly Summary as a ranked table
+   of the most impacted /24 networks. For each top subnet, summarize:
+   - The primary anomaly indicators and their severity
+   - Specific affected hosts and their role in the anomalies
+   - Whether the anomaly cluster suggests a localized event (power outage,
+     link failure, device reboot) vs. a systemic issue
+7. RECOMMENDED MONITORING: What metrics should be continuously monitored
    based on issues found. Suggest specific SNMP OIDs, syslog patterns,
    or NetFlow fields to track.
-6. LIMITATIONS: What cannot be determined from this PCAP capture alone.
+8. LIMITATIONS: What cannot be determined from this PCAP capture alone.
 
 Format as a professional network operations report.
 
@@ -2459,13 +2476,12 @@ class PcapAiAnalyzer:
         from plugins.network_forensics.pcap_metadata_summary.tool import (
             is_internal, _format_bytes,
         )
-        from plugins.network_forensics.pcap_threat_hunter.tool import PcapThreatHunter
         from collections import Counter, defaultdict
 
         lines = []
 
-        # --- Standard PCAP header ---
-        header = PcapAiAnalyzer._build_pcap_header(session)
+        # --- Standard PCAP header (no security items for netops) ---
+        header = PcapAiAnalyzer._build_pcap_header(session, netops=True)
         lines.append(header)
 
         # --- TCP Health Overview ---
@@ -2719,10 +2735,10 @@ class PcapAiAnalyzer:
                     lines.append(f"    {ip} → {len(macs)} MACs: {mac_list}")
                     if len(macs) == 2:
                         lines.append(f"      Possible: IP conflict, VRRP/HSRP failover, "
-                                     f"or ARP spoofing")
+                                     f"or duplicate addressing")
                     elif len(macs) > 2:
                         lines.append(f"      ⚠️  {len(macs)} MACs for one IP is highly "
-                                     f"abnormal — likely ARP spoofing or misconfiguration")
+                                     f"abnormal — likely misconfiguration or device flapping")
 
             # Unanswered ARP requests (targets that never replied)
             unanswered = {ip: count for ip, count in session._arp_request_targets.items()
@@ -2739,7 +2755,7 @@ class PcapAiAnalyzer:
             # Gratuitous ARP analysis
             if session.arp_gratuitous_count > 10:
                 lines.append(f"\n  ⚠️  {session.arp_gratuitous_count} gratuitous ARPs "
-                             f"— possible VRRP/HSRP flapping or ARP spoofing attempt")
+                             f"— possible VRRP/HSRP flapping or gateway failover")
         else:
             lines.append("\n  No ARP traffic captured.")
             lines.append("  (Capture may be from a routed interface or span port "
@@ -2783,7 +2799,7 @@ class PcapAiAnalyzer:
                         count = len(session.stp_root_bridges[rb])
                         lines.append(f"    {rb}: {count:,} BPDUs")
                     lines.append(f"    ⚠️  Root bridge instability indicates "
-                                 f"STP reconvergence or attack")
+                                 f"STP reconvergence — check for priority misconfiguration")
 
                 # TCN rate analysis
                 if session.stp_tcn_count > 10:
@@ -3052,21 +3068,193 @@ class PcapAiAnalyzer:
                     f"{_format_bytes(stats['bytes_out'])}, {stats['packets']} pkts"
                 )
 
-        # --- Port Analysis (from threat hunter, reused for ops context) ---
-        hunter = PcapThreatHunter()
-        ports_result = hunter.execute({"hunt": "ports"}, None)
-        if ports_result.ok and ports_result.result:
-            port_text = ports_result.result.get("summary_text", "")
-            if port_text:
-                lines.append(f"\n{'=' * 60}")
-                lines.append("PORT ANALYSIS")
-                lines.append(f"{'=' * 60}")
-                lines.append(port_text)
+        # --- Service Port Distribution (ops-focused, no threat context) ---
+        # Well-known service names for operational context
+        _SVC_NAMES = {
+            22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS", 67: "DHCP-S",
+            68: "DHCP-C", 69: "TFTP", 80: "HTTP", 110: "POP3", 123: "NTP",
+            135: "RPC", 137: "NetBIOS-NS", 138: "NetBIOS-DG", 139: "NetBIOS-SS",
+            143: "IMAP", 161: "SNMP", 162: "SNMP-Trap", 389: "LDAP",
+            443: "HTTPS", 445: "SMB", 465: "SMTPS", 502: "Modbus",
+            514: "Syslog", 636: "LDAPS", 993: "IMAPS", 995: "POP3S",
+            1433: "MSSQL", 1521: "Oracle", 3306: "MySQL", 3389: "RDP",
+            5060: "SIP", 5432: "PostgreSQL", 5900: "VNC", 8080: "HTTP-Alt",
+            8443: "HTTPS-Alt", 44818: "EtherNet/IP", 47808: "BACnet",
+            20000: "DNP3", 102: "S7comm",
+        }
+        port_stats: dict = defaultdict(lambda: {"flows": 0, "sources": set(),
+                                                "bytes": 0, "pkts": 0})
+        for (src, dst, dport, proto), stats in session.conversations.items():
+            if dport > 0:
+                port_stats[dport]["flows"] += 1
+                port_stats[dport]["sources"].add(src)
+                port_stats[dport]["bytes"] += stats.get("bytes_out", 0)
+                port_stats[dport]["pkts"] += stats.get("packets", 0)
+
+        if port_stats:
+            lines.append(f"\n{'=' * 60}")
+            lines.append("SERVICE PORT DISTRIBUTION")
+            lines.append(f"{'=' * 60}")
+
+            # Known services
+            known = [(p, s) for p, s in port_stats.items() if p in _SVC_NAMES]
+            known.sort(key=lambda x: x[1]["flows"], reverse=True)
+            if known:
+                lines.append("\n📋 KNOWN SERVICES")
+                lines.append("-" * 60)
+                for port, stats_d in known[:20]:
+                    svc = _SVC_NAMES[port]
+                    lines.append(
+                        f"  {port:<7} {svc:<16} flows={stats_d['flows']:<5} "
+                        f"sources={len(stats_d['sources']):<4} "
+                        f"{_format_bytes(stats_d['bytes'])}"
+                    )
+
+            # Unknown high ports (summary only, no threat framing)
+            unknown = [(p, s) for p, s in port_stats.items()
+                       if p not in _SVC_NAMES and p > 1024]
+            if unknown:
+                lines.append(f"\n❓ OTHER HIGH PORTS — {len(unknown)} port(s)")
+                lines.append("-" * 60)
+                unknown.sort(key=lambda x: x[1]["flows"], reverse=True)
+                for port, stats_d in unknown[:15]:
+                    lines.append(
+                        f"  {port:<7} flows={stats_d['flows']:<5} "
+                        f"sources={len(stats_d['sources']):<4} "
+                        f"{_format_bytes(stats_d['bytes'])}"
+                    )
+
+        # --- Subnet Anomaly Summary ---
+        # Aggregate anomaly indicators by /24 subnet to highlight problem networks
+        subnet_scores: dict = defaultdict(lambda: {
+            "rst": 0, "retransmit": 0, "icmp_errors": 0,
+            "unanswered_arp": 0, "loop_packets": 0,
+            "arp_requests": 0, "ip_conflicts": 0,
+            "ips_seen": set(), "total_score": 0,
+        })
+
+        def _to_subnet(ip: str) -> str:
+            parts = ip.rsplit(".", 1)
+            return f"{parts[0]}.0/24" if len(parts) == 2 else ip
+
+        # TCP health by subnet
+        for (src, dst, dport, proto), health in session.conv_health.items():
+            for ip in (src, dst):
+                if is_internal(ip):
+                    sn = _to_subnet(ip)
+                    subnet_scores[sn]["rst"] += health.get("rst", 0)
+                    subnet_scores[sn]["retransmit"] += health.get("retransmit", 0)
+                    subnet_scores[sn]["ips_seen"].add(ip)
+
+        # ICMP errors by subnet
+        for err in session.icmp_errors:
+            for ip in (err.get("src", ""), err.get("dst", "")):
+                if ip and is_internal(ip):
+                    subnet_scores[_to_subnet(ip)]["icmp_errors"] += 1
+                    subnet_scores[_to_subnet(ip)]["ips_seen"].add(ip)
+
+        # Unanswered ARP targets by subnet
+        unanswered_arp = {ip: count for ip, count in session._arp_request_targets.items()
+                          if ip not in session._arp_reply_targets and count >= 2}
+        for ip, count in unanswered_arp.items():
+            if is_internal(ip):
+                subnet_scores[_to_subnet(ip)]["unanswered_arp"] += count
+                subnet_scores[_to_subnet(ip)]["ips_seen"].add(ip)
+
+        # IP conflicts by subnet
+        for ip, macs in session.arp_ip_to_macs.items():
+            if len(macs) > 1 and is_internal(ip):
+                subnet_scores[_to_subnet(ip)]["ip_conflicts"] += 1
+                subnet_scores[_to_subnet(ip)]["ips_seen"].add(ip)
+
+        # Routing loop involvement by subnet
+        for pkt_info in session.suspected_loop_packets:
+            for ip in (pkt_info.get("src", ""), pkt_info.get("dst", "")):
+                if ip and is_internal(ip):
+                    subnet_scores[_to_subnet(ip)]["loop_packets"] += 1
+                    subnet_scores[_to_subnet(ip)]["ips_seen"].add(ip)
+
+        # ARP flood sources by subnet (map MAC→IP via arp_ip_to_macs)
+        mac_to_ips: dict = defaultdict(set)
+        for ip, macs in session.arp_ip_to_macs.items():
+            for mac in macs:
+                mac_to_ips[mac].add(ip)
+        for mac, count in session.arp_requests_by_src.most_common():
+            if count >= 50:
+                for ip in mac_to_ips.get(mac, set()):
+                    if is_internal(ip):
+                        subnet_scores[_to_subnet(ip)]["arp_requests"] += count
+                        subnet_scores[_to_subnet(ip)]["ips_seen"].add(ip)
+
+        # Calculate composite score
+        for sn, scores in subnet_scores.items():
+            scores["total_score"] = (
+                scores["rst"] * 2
+                + scores["retransmit"]
+                + scores["icmp_errors"] * 5
+                + scores["unanswered_arp"]
+                + scores["loop_packets"] * 10
+                + scores["ip_conflicts"] * 50
+                + scores["arp_requests"] // 100
+            )
+
+        # Rank and display
+        ranked = sorted(subnet_scores.items(),
+                        key=lambda x: x[1]["total_score"], reverse=True)
+        # Filter to subnets with actual anomalies
+        ranked = [(sn, s) for sn, s in ranked if s["total_score"] > 0]
+
+        if ranked:
+            lines.append(f"\n{'=' * 60}")
+            lines.append("SUBNET ANOMALY SUMMARY (ranked by impact)")
+            lines.append(f"{'=' * 60}")
+            lines.append(
+                f"  {'Subnet':<20} {'Score':<8} {'RSTs':<7} {'Retx':<7} "
+                f"{'ICMP':<6} {'Loops':<7} {'ARP-Unans':<10} {'Conflicts':<10} "
+                f"{'IPs'}"
+            )
+            lines.append("  " + "-" * 90)
+            for sn, s in ranked[:25]:
+                lines.append(
+                    f"  {sn:<20} {s['total_score']:<8} "
+                    f"{s['rst']:<7} {s['retransmit']:<7} "
+                    f"{s['icmp_errors']:<6} {s['loop_packets']:<7} "
+                    f"{s['unanswered_arp']:<10} {s['ip_conflicts']:<10} "
+                    f"{len(s['ips_seen'])}"
+                )
+
+            # Highlight top problem subnet
+            top_sn, top_s = ranked[0]
+            top_indicators = []
+            if top_s["rst"] > 0:
+                top_indicators.append(f"{top_s['rst']} RSTs")
+            if top_s["retransmit"] > 0:
+                top_indicators.append(f"{top_s['retransmit']} retransmissions")
+            if top_s["loop_packets"] > 0:
+                top_indicators.append(f"{top_s['loop_packets']} loop packets")
+            if top_s["icmp_errors"] > 0:
+                top_indicators.append(f"{top_s['icmp_errors']} ICMP errors")
+            if top_s["ip_conflicts"] > 0:
+                top_indicators.append(f"{top_s['ip_conflicts']} IP conflict(s)")
+            if top_s["unanswered_arp"] > 0:
+                top_indicators.append(f"{top_s['unanswered_arp']} unanswered ARPs")
+            lines.append(f"\n  🔴 HIGHEST IMPACT SUBNET: {top_sn}")
+            lines.append(f"     {', '.join(top_indicators)}")
+            lines.append(f"     {len(top_s['ips_seen'])} unique IPs affected")
+
+            if len(ranked) > 1:
+                sn2, s2 = ranked[1]
+                lines.append(f"  ⚠️  SECOND: {sn2} (score={s2['total_score']}, "
+                             f"{len(s2['ips_seen'])} IPs)")
+            if len(ranked) > 2:
+                sn3, s3 = ranked[2]
+                lines.append(f"  ⚠️  THIRD: {sn3} (score={s3['total_score']}, "
+                             f"{len(s3['ips_seen'])} IPs)")
 
         return "\n".join(lines)
 
     @staticmethod
-    def _build_pcap_header(session: Any) -> str:
+    def _build_pcap_header(session: Any, *, netops: bool = False) -> str:
         """Build a PCAP context header with key metadata."""
         from plugins.network_forensics.pcap_metadata_summary.tool import is_internal, _format_bytes
 
@@ -3104,7 +3292,7 @@ class PcapAiAnalyzer:
 
         if session.ot_transactions:
             lines.append(f"OT/ICS: {len(session.ot_transactions):,} transactions")
-        if session.cleartext_creds:
+        if not netops and session.cleartext_creds:
             lines.append(f"⚠️  Cleartext credentials: {len(session.cleartext_creds)} detection(s)")
 
         return "\n".join(lines)
