@@ -718,7 +718,10 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
 
             # --- Network Ops: TTL and fragmentation tracking ---
             session.ttl_distribution[ip.ttl] += 1
-            if ip.off & (dpkt.ip.IP_MF | dpkt.ip.IP_OFFMASK):
+            # Check MF flag or fragment offset via raw flags_offset field
+            # (ip.off is deprecated in newer dpkt)
+            _flags_off = struct.unpack('!H', bytes(ip)[6:8])[0]
+            if _flags_off & 0x3FFF:  # MF bit (0x2000) or offset (0x1FFF)
                 session.ip_fragment_count += 1
 
             # --- Loop detection: duplicate IP ID tracking ---
