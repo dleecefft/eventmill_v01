@@ -124,6 +124,57 @@ class PcapSession:
         self.src_ips: Counter = Counter()
         self.dst_ips: Counter = Counter()
 
+        # --- Network Operations / Health metrics ---
+        # TCP flag counters (RST, FIN, SYN)
+        self.tcp_rst_count: int = 0
+        self.tcp_fin_count: int = 0
+        self.tcp_syn_count: int = 0
+
+        # TCP retransmissions (detected via duplicate SEQ numbers per flow)
+        self.tcp_retransmissions: int = 0
+        self._tcp_seq_tracker: Dict[Tuple[str, str, int, int], set] = defaultdict(set)
+
+        # ICMP error messages
+        self.icmp_errors: List[Dict] = []  # {type, code, src, dst, ts, description}
+
+        # TCP zero-window events (receiver buffer full)
+        self.tcp_zero_window_count: int = 0
+
+        # IP fragment count
+        self.ip_fragment_count: int = 0
+
+        # TTL distribution (for hop-count anomaly detection)
+        self.ttl_distribution: Counter = Counter()
+
+        # Per-conversation TCP flag & retransmit stats
+        # conv_key -> {"rst": int, "retransmit": int, "zero_window": int}
+        self.conv_health: Dict[Tuple, Dict] = defaultdict(
+            lambda: {"rst": 0, "retransmit": 0, "zero_window": 0}
+        )
+
+        # --- Routing loop detection ---
+        # Duplicate IP ID tracker: (src_ip, dst_ip, ip_id, proto) -> list of TTLs seen
+        self._ip_id_tracker: Dict[Tuple[str, str, int, str], List[int]] = defaultdict(list)
+        # Suspected loop packets (same packet seen with different TTLs)
+        self.suspected_loop_packets: List[Dict] = []
+        # ICMP TTL Exceeded sources grouped by original destination
+        # original_dst -> [router_ip that generated TTL Exceeded, ...]
+        self.ttl_exceeded_by_dest: Dict[str, List[Dict]] = defaultdict(list)
+
+        # --- ARP health tracking ---
+        self.arp_request_count: int = 0
+        self.arp_reply_count: int = 0
+        self.arp_gratuitous_count: int = 0
+        # Per-source MAC ARP request counter (detect scanners / storms)
+        self.arp_requests_by_src: Counter = Counter()  # src_mac -> count
+        # IP-to-MAC mapping for conflict detection: ip -> set of MACs
+        self.arp_ip_to_macs: Dict[str, set] = defaultdict(set)
+        # ARP requests without replies (unanswered): target_ip -> count
+        self._arp_request_targets: Counter = Counter()
+        self._arp_reply_targets: set = set()
+        # Timestamps for rate analysis (capped)
+        self._arp_timestamps: List[float] = []
+
     @property
     def unique_ips(self) -> set:
         """All unique IPs seen (src + dst)."""
@@ -224,6 +275,7 @@ try:
 
     from scapy.utils import PcapReader
     from scapy.layers.inet import IP, TCP, UDP, ICMP
+    from scapy.layers.l2 import ARP, Ether
     from scapy.layers.dns import DNS, DNSQR, DNSRR
     from scapy.layers.http import HTTPRequest, HTTPResponse
     from scapy.packet import Raw
@@ -268,6 +320,35 @@ def parse_pcap_file(file_path: str) -> PcapSession:
             if session.end_time is None or ts > session.end_time:
                 session.end_time = ts
 
+            # --- ARP extraction (Layer 2, before IP filter) ---
+            if pkt.haslayer(ARP):
+                arp = pkt[ARP]
+                src_mac = arp.hwsrc
+                src_arp_ip = arp.psrc
+                dst_arp_ip = arp.pdst
+                if arp.op == 1:  # ARP Request (who-has)
+                    session.arp_request_count += 1
+                    session.arp_requests_by_src[src_mac] += 1
+                    session._arp_request_targets[dst_arp_ip] += 1
+                    # Gratuitous ARP: src IP == dst IP (announcing own address)
+                    if src_arp_ip == dst_arp_ip and src_arp_ip != "0.0.0.0":
+                        session.arp_gratuitous_count += 1
+                    # Record IP→MAC mapping from sender
+                    if src_arp_ip and src_arp_ip != "0.0.0.0":
+                        session.arp_ip_to_macs[src_arp_ip].add(src_mac)
+                elif arp.op == 2:  # ARP Reply (is-at)
+                    session.arp_reply_count += 1
+                    session._arp_reply_targets.add(src_arp_ip)
+                    # Record IP→MAC mapping from reply
+                    if src_arp_ip and src_arp_ip != "0.0.0.0":
+                        session.arp_ip_to_macs[src_arp_ip].add(src_mac)
+                    # Gratuitous ARP reply (unsolicited, src == dst)
+                    if src_arp_ip == dst_arp_ip:
+                        session.arp_gratuitous_count += 1
+                # Track ARP timestamps for rate analysis
+                if len(session._arp_timestamps) < 10000:
+                    session._arp_timestamps.append(ts)
+
             if not pkt.haslayer(IP):
                 continue
 
@@ -288,14 +369,87 @@ def parse_pcap_file(file_path: str) -> PcapSession:
                 proto = "TCP"
                 sport = pkt[TCP].sport
                 dport = pkt[TCP].dport
+                # --- Network Ops: TCP flag tracking ---
+                tcp_flags = pkt[TCP].flags
+                if tcp_flags & 0x04:  # RST
+                    session.tcp_rst_count += 1
+                if tcp_flags & 0x01:  # FIN
+                    session.tcp_fin_count += 1
+                if tcp_flags & 0x02:  # SYN
+                    session.tcp_syn_count += 1
+                # Zero-window detection
+                if pkt[TCP].window == 0 and not (tcp_flags & 0x04):
+                    session.tcp_zero_window_count += 1
+                # Retransmission detection (duplicate SEQ on data packets)
+                seq = pkt[TCP].seq
+                payload_len = len(pkt[TCP].payload) if pkt[TCP].payload else 0
+                if payload_len > 0:
+                    flow_key = (src_ip, dst_ip, sport, dport)
+                    if seq in session._tcp_seq_tracker[flow_key]:
+                        session.tcp_retransmissions += 1
+                    else:
+                        session._tcp_seq_tracker[flow_key].add(seq)
             elif pkt.haslayer(UDP):
                 proto = "UDP"
                 sport = pkt[UDP].sport
                 dport = pkt[UDP].dport
             elif pkt.haslayer(ICMP):
                 proto = "ICMP"
+                # --- Network Ops: ICMP error tracking ---
+                icmp_type = pkt[ICMP].type
+                icmp_code = pkt[ICMP].code
+                if icmp_type in (3, 4, 5, 11, 12):  # error types
+                    desc = {
+                        3: "Destination Unreachable",
+                        4: "Source Quench",
+                        5: "Redirect",
+                        11: "Time Exceeded (TTL)",
+                        12: "Parameter Problem",
+                    }.get(icmp_type, f"ICMP Type {icmp_type}")
+                    session.icmp_errors.append({
+                        "type": icmp_type, "code": icmp_code,
+                        "src": src_ip, "dst": dst_ip, "ts": ts,
+                        "description": desc,
+                    })
+                    # --- Loop detection: extract original packet from ICMP payload ---
+                    if icmp_type == 11:  # Time Exceeded
+                        # ICMP TTL Exceeded contains the original IP header in payload
+                        try:
+                            icmp_payload = pkt[ICMP].payload
+                            if icmp_payload and hasattr(icmp_payload, 'dst'):
+                                orig_dst = icmp_payload.dst
+                                session.ttl_exceeded_by_dest[orig_dst].append({
+                                    "router": src_ip,
+                                    "original_src": dst_ip,
+                                    "ts": ts,
+                                })
+                        except Exception:
+                            pass
 
             session.protocols[proto] += 1
+
+            # --- Network Ops: TTL and fragmentation tracking ---
+            session.ttl_distribution[ip_layer.ttl] += 1
+            if ip_layer.frag > 0 or (ip_layer.flags & 0x1):  # MF flag or frag offset
+                session.ip_fragment_count += 1
+
+            # --- Loop detection: duplicate IP ID tracking ---
+            ip_id = ip_layer.id
+            if ip_id != 0:  # ID 0 is common for non-fragmented, skip
+                id_key = (src_ip, dst_ip, ip_id, proto)
+                prev_ttls = session._ip_id_tracker[id_key]
+                if prev_ttls and ip_layer.ttl not in prev_ttls:
+                    # Same packet seen with different TTL = likely looping
+                    if len(session.suspected_loop_packets) < 500:
+                        session.suspected_loop_packets.append({
+                            "src": src_ip, "dst": dst_ip,
+                            "ip_id": ip_id, "proto": proto,
+                            "ttl": ip_layer.ttl,
+                            "prev_ttls": list(prev_ttls[:5]),
+                            "ts": ts,
+                        })
+                if len(prev_ttls) < 10:  # cap memory per flow
+                    prev_ttls.append(ip_layer.ttl)
 
             if dport:
                 session.dst_ports[dport] += 1
@@ -314,6 +468,13 @@ def parse_pcap_file(file_path: str) -> PcapSession:
                 conv["last_seen"] = ts
             if len(conv["timestamps"]) < 2000:
                 conv["timestamps"].append(ts)
+            # --- Network Ops: per-conversation health tracking ---
+            if proto == "TCP" and pkt.haslayer(TCP):
+                tcp_flags = pkt[TCP].flags
+                if tcp_flags & 0x04:
+                    session.conv_health[conv_key]["rst"] += 1
+                if pkt[TCP].window == 0 and not (tcp_flags & 0x04):
+                    session.conv_health[conv_key]["zero_window"] += 1
 
             # DNS extraction
             if pkt.haslayer(DNS):
@@ -444,6 +605,33 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
             except (dpkt.dpkt.NeedData, dpkt.dpkt.UnpackError):
                 continue
 
+            # --- ARP extraction (Layer 2, before IP filter) ---
+            if eth.type == dpkt.ethernet.ETH_TYPE_ARP:
+                try:
+                    arp = dpkt.arp.ARP(bytes(eth.data))
+                    src_mac = ":".join(f"{b:02x}" for b in arp.sha)
+                    src_arp_ip = _ip_to_str(arp.spa)
+                    dst_arp_ip = _ip_to_str(arp.tpa)
+                    if arp.op == dpkt.arp.ARP_OP_REQUEST:
+                        session.arp_request_count += 1
+                        session.arp_requests_by_src[src_mac] += 1
+                        session._arp_request_targets[dst_arp_ip] += 1
+                        if src_arp_ip == dst_arp_ip and src_arp_ip != "0.0.0.0":
+                            session.arp_gratuitous_count += 1
+                        if src_arp_ip and src_arp_ip != "0.0.0.0":
+                            session.arp_ip_to_macs[src_arp_ip].add(src_mac)
+                    elif arp.op == dpkt.arp.ARP_OP_REPLY:
+                        session.arp_reply_count += 1
+                        session._arp_reply_targets.add(src_arp_ip)
+                        if src_arp_ip and src_arp_ip != "0.0.0.0":
+                            session.arp_ip_to_macs[src_arp_ip].add(src_mac)
+                        if src_arp_ip == dst_arp_ip:
+                            session.arp_gratuitous_count += 1
+                    if len(session._arp_timestamps) < 10000:
+                        session._arp_timestamps.append(ts)
+                except Exception:
+                    pass
+
             # Only process IPv4
             if not isinstance(eth.data, dpkt.ip.IP):
                 continue
@@ -468,6 +656,24 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
                 sport = tcp_obj.sport
                 dport = tcp_obj.dport
                 tcp_data = bytes(tcp_obj.data)
+                # --- Network Ops: TCP flag tracking ---
+                tcp_flags = tcp_obj.flags
+                if tcp_flags & dpkt.tcp.TH_RST:
+                    session.tcp_rst_count += 1
+                if tcp_flags & dpkt.tcp.TH_FIN:
+                    session.tcp_fin_count += 1
+                if tcp_flags & dpkt.tcp.TH_SYN:
+                    session.tcp_syn_count += 1
+                # Zero-window detection
+                if tcp_obj.win == 0 and not (tcp_flags & dpkt.tcp.TH_RST):
+                    session.tcp_zero_window_count += 1
+                # Retransmission detection (duplicate SEQ on data packets)
+                if len(tcp_data) > 0:
+                    flow_key = (src_ip, dst_ip, sport, dport)
+                    if tcp_obj.seq in session._tcp_seq_tracker[flow_key]:
+                        session.tcp_retransmissions += 1
+                    else:
+                        session._tcp_seq_tracker[flow_key].add(tcp_obj.seq)
             elif isinstance(ip.data, dpkt.udp.UDP):
                 proto = "UDP"
                 udp_obj = ip.data
@@ -476,8 +682,61 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
                 tcp_data = bytes(udp_obj.data)  # reuse var for payload
             elif ip.p == 1:  # ICMP
                 proto = "ICMP"
+                # --- Network Ops: ICMP error tracking ---
+                try:
+                    icmp_obj = dpkt.icmp.ICMP(bytes(ip.data))
+                    if icmp_obj.type in (3, 4, 5, 11, 12):
+                        desc = {
+                            3: "Destination Unreachable",
+                            4: "Source Quench",
+                            5: "Redirect",
+                            11: "Time Exceeded (TTL)",
+                            12: "Parameter Problem",
+                        }.get(icmp_obj.type, f"ICMP Type {icmp_obj.type}")
+                        session.icmp_errors.append({
+                            "type": icmp_obj.type, "code": icmp_obj.code,
+                            "src": src_ip, "dst": dst_ip, "ts": ts,
+                            "description": desc,
+                        })
+                        # --- Loop detection: extract original dest from ICMP payload ---
+                        if icmp_obj.type == 11:  # Time Exceeded
+                            try:
+                                # ICMP TTL Exceeded payload contains original IP header
+                                orig_ip = dpkt.ip.IP(icmp_obj.data.data)
+                                orig_dst = _ip_to_str(orig_ip.dst)
+                                session.ttl_exceeded_by_dest[orig_dst].append({
+                                    "router": src_ip,
+                                    "original_src": dst_ip,
+                                    "ts": ts,
+                                })
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
             session.protocols[proto] += 1
+
+            # --- Network Ops: TTL and fragmentation tracking ---
+            session.ttl_distribution[ip.ttl] += 1
+            if ip.off & (dpkt.ip.IP_MF | dpkt.ip.IP_OFFMASK):
+                session.ip_fragment_count += 1
+
+            # --- Loop detection: duplicate IP ID tracking ---
+            ip_id = ip.id
+            if ip_id != 0:
+                id_key = (src_ip, dst_ip, ip_id, proto)
+                prev_ttls = session._ip_id_tracker[id_key]
+                if prev_ttls and ip.ttl not in prev_ttls:
+                    if len(session.suspected_loop_packets) < 500:
+                        session.suspected_loop_packets.append({
+                            "src": src_ip, "dst": dst_ip,
+                            "ip_id": ip_id, "proto": proto,
+                            "ttl": ip.ttl,
+                            "prev_ttls": list(prev_ttls[:5]),
+                            "ts": ts,
+                        })
+                if len(prev_ttls) < 10:
+                    prev_ttls.append(ip.ttl)
 
             if dport:
                 session.dst_ports[dport] += 1
@@ -496,6 +755,13 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
                 conv["last_seen"] = ts
             if len(conv["timestamps"]) < 2000:
                 conv["timestamps"].append(ts)
+            # --- Network Ops: per-conversation health tracking ---
+            if proto == "TCP":
+                tcp_obj = ip.data
+                if tcp_obj.flags & dpkt.tcp.TH_RST:
+                    session.conv_health[conv_key]["rst"] += 1
+                if tcp_obj.win == 0 and not (tcp_obj.flags & dpkt.tcp.TH_RST):
+                    session.conv_health[conv_key]["zero_window"] += 1
 
             # DNS extraction
             if dport == 53 or sport == 53:

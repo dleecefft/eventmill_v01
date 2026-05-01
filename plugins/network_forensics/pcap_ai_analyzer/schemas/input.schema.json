@@ -6,7 +6,9 @@
       "type": "string",
       "enum": [
         "triage_summary", "hunt_talkers", "hunt_beacons", "hunt_dns",
-        "hunt_tls", "hunt_lateral", "hunt_exfil", "report"
+        "hunt_tls", "hunt_lateral", "hunt_exfil", "report",
+        "ot_triage", "ot_threat_hunt", "ot_report",
+        "netops_triage", "netops_health", "netops_report"
       ],
       "description": "AI analysis mode to execute."
     },
