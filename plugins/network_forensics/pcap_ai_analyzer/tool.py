@@ -687,15 +687,23 @@ _DMZ_PORTS = {80, 443, 8080, 8443, 25, 587, 993, 995}
 
 # Purdue zone definitions and visual layout
 _PURDUE_ZONES = [
-    ("External",      "#1a5276",  0.95),   # dark blue
-    ("Corporate",     "#e67e22",  0.76),   # orange
-    ("DMZ",           "#27ae60",  0.57),   # green
-    ("SCADA",         "#8e44ad",  0.38),   # purple
-    ("CONTROL/FIELD", "#2980b9",  0.19),   # blue
+    ("External",      "#1a5276",  0.95),   # dark blue (parent container)
+    ("Corporate",     "#e67e22",  0.73),   # orange
+    ("DMZ",           "#27ae60",  0.54),   # green
+    ("SCADA",         "#8e44ad",  0.35),   # purple
+    ("CONTROL/FIELD", "#2980b9",  0.16),   # blue
+]
+
+# Sub-zones within External (rendered as inner boxes)
+_EXTERNAL_SUBZONES = [
+    ("Ext_Infra",  "Multicast/Broadcast/APIPA", "#85c1e9", 0.25),  # left side
+    ("Ext_Public", "Public Internet",           "#aed6f1", 0.70),  # right side
 ]
 
 _ZONE_BG_COLORS = {
     "External":      "#d6eaf8",
+    "Ext_Infra":     "#ebf5fb",
+    "Ext_Public":    "#ebf5fb",
     "Corporate":     "#fdebd0",
     "DMZ":           "#d5f5e3",
     "SCADA":         "#f4ecf7",
@@ -703,12 +711,25 @@ _ZONE_BG_COLORS = {
 }
 
 
+def _is_infra_local(ip: str) -> bool:
+    """Return True if IP is multicast, broadcast, or link-local (not real external)."""
+    return (
+        ip.startswith("224.") or ip.startswith("225.") or ip.startswith("226.")
+        or ip.startswith("239.")              # multicast
+        or ip.startswith("255.")              # broadcast
+        or ip.startswith("169.254.")          # APIPA / link-local
+        or ip == "0.0.0.0"
+    )
+
+
 def _classify_ip_zone(ip: str, session: Any) -> str:
     """Classify an IP into a Purdue zone based on traffic patterns."""
     from plugins.network_forensics.pcap_metadata_summary.tool import is_internal
 
     if not is_internal(ip):
-        return "External"
+        if _is_infra_local(ip):
+            return "Ext_Infra"
+        return "Ext_Public"
 
     # Gather ports this IP connects TO (client) vs SERVES (server)
     dst_ports: set[int] = set()   # ports this IP connects to as client
@@ -785,11 +806,17 @@ def _render_purdue_zone_graph(session: Any) -> bytes | None:
     # Zone assignment per /24 — majority of IPs in that subnet
     net_zones: dict[str, str] = {}
     zone_nets: dict[str, list[str]] = {z[0]: [] for z in _PURDUE_ZONES}
+    zone_nets["Ext_Infra"] = []
+    zone_nets["Ext_Public"] = []
     for net, ips in network_ips.items():
         zone_votes = _Counter(ip_zones[ip] for ip in ips)
         zone = zone_votes.most_common(1)[0][0]
         net_zones[net] = zone
-        zone_nets[zone].append(net)
+        if zone in ("Ext_Infra", "Ext_Public"):
+            zone_nets[zone].append(net)
+            zone_nets["External"].append(net)  # also track in parent
+        else:
+            zone_nets[zone].append(net)
 
     # --- Aggregate traffic between /24 networks ---
     net_pair_bytes: dict[tuple[str, str], int] = {}
@@ -804,8 +831,8 @@ def _render_purdue_zone_graph(session: Any) -> bytes | None:
     # Zone-to-zone aggregate for byte labels
     zone_flows: dict[tuple[str, str], int] = {}
     for (net_a, net_b), total_bytes in net_pair_bytes.items():
-        z_a = net_zones.get(net_a, "External")
-        z_b = net_zones.get(net_b, "External")
+        z_a = net_zones.get(net_a, "Ext_Public")
+        z_b = net_zones.get(net_b, "Ext_Public")
         if z_a == z_b:
             continue
         key = (z_a, z_b)
@@ -851,9 +878,61 @@ def _render_purdue_zone_graph(session: Any) -> bytes | None:
         zone_rects[zone_name] = (zone_margin, y_bottom,
                                  1 - 2 * zone_margin, zone_height)
 
-    # Place /24 network nodes within their zones
+    # Draw External sub-zone boxes (inside the External zone)
+    ext_y = zone_y.get("External", 0.95)
+    sub_box_height = zone_height * 0.65
+    sub_box_top = ext_y - sub_box_height / 2
+    for sub_zone, sub_label, sub_border, x_center in _EXTERNAL_SUBZONES:
+        sub_width = 0.38
+        sub_x = zone_margin + 0.02 + x_center * (1 - 2 * zone_margin - sub_width) - 0.01
+        sub_bg = _ZONE_BG_COLORS[sub_zone]
+
+        sub_rect = mpatches.FancyBboxPatch(
+            (sub_x, sub_box_top), sub_width, sub_box_height,
+            boxstyle="round,pad=0.008",
+            linewidth=1.5, edgecolor=sub_border,
+            facecolor=sub_bg, alpha=0.7,
+            linestyle="--",
+        )
+        ax.add_patch(sub_rect)
+
+        # Sub-zone label
+        ax.text(sub_x + 0.01, sub_box_top + sub_box_height - 0.008,
+                sub_label, fontsize=7.5, fontstyle="italic",
+                color=sub_border, va="top")
+
+        zone_y[sub_zone] = ext_y
+        zone_rects[sub_zone] = (sub_x, sub_box_top, sub_width, sub_box_height)
+
+    # Place /24 network nodes within their zones (sub-zones for External)
     node_positions: dict[str, tuple[float, float]] = {}
+
+    # Place External sub-zone nodes
+    for sub_zone, sub_label, sub_border, x_center in _EXTERNAL_SUBZONES:
+        nets = sorted(zone_nets[sub_zone])
+        if not nets:
+            continue
+        sub_width = 0.38
+        sub_x = zone_margin + 0.02 + x_center * (1 - 2 * zone_margin - sub_width) - 0.01
+        n = len(nets)
+        max_show = min(n, 4)
+        for i, net in enumerate(nets[:max_show]):
+            x = sub_x + 0.03 + (i + 0.5) * ((sub_width - 0.06) / max_show)
+            y = ext_y
+            node_positions[net] = (x, y)
+            ax.plot(x, y, "o", color="#2c3e50", markersize=6, zorder=5)
+            label = net + ".x"
+            ax.text(x, y - 0.022, label, fontsize=5.5,
+                    ha="center", va="top", color="#2c3e50")
+        if n > max_show:
+            ax.text(sub_x + sub_width - 0.03, ext_y, f"+{n - max_show}",
+                    fontsize=8, ha="center", va="center",
+                    color="#7f8c8d", style="italic")
+
+    # Place non-External zone nodes
     for zone_name, _, y_center in _PURDUE_ZONES:
+        if zone_name == "External":
+            continue
         nets = sorted(zone_nets[zone_name])
         if not nets:
             continue
@@ -879,8 +958,8 @@ def _render_purdue_zone_graph(session: Any) -> bytes | None:
     # --- Draw /24-to-/24 traffic flow edges (cross-zone only) ---
     cross_zone_flows: list[tuple[str, str, int]] = []
     for (net_a, net_b), total_bytes in net_pair_bytes.items():
-        zone_a = net_zones.get(net_a, "External")
-        zone_b = net_zones.get(net_b, "External")
+        zone_a = net_zones.get(net_a, "Ext_Public")
+        zone_b = net_zones.get(net_b, "Ext_Public")
         if zone_a == zone_b:
             continue
         cross_zone_flows.append((net_a, net_b, total_bytes))
@@ -891,8 +970,8 @@ def _render_purdue_zone_graph(session: Any) -> bytes | None:
         max_flow = 1
 
     for net_a, net_b, total_bytes in sorted(cross_zone_flows, key=lambda x: x[2]):
-        zone_a = net_zones.get(net_a, "External")
-        zone_b = net_zones.get(net_b, "External")
+        zone_a = net_zones.get(net_a, "Ext_Public")
+        zone_b = net_zones.get(net_b, "Ext_Public")
 
         ax_pos = node_positions.get(net_a, (0.5, zone_y.get(zone_a, 0.5)))
         bx_pos = node_positions.get(net_b, (0.5, zone_y.get(zone_b, 0.5)))
@@ -949,6 +1028,19 @@ def _render_purdue_zone_graph(session: Any) -> bytes | None:
     ]
     # Zone /24 network counts
     for zone_name, _, _ in _PURDUE_ZONES:
+        if zone_name == "External":
+            # Show sub-zone breakdown
+            n_infra = len(zone_nets["Ext_Infra"])
+            n_public = len(zone_nets["Ext_Public"])
+            if n_infra + n_public > 0:
+                legend_elements.append(
+                    mpatches.Patch(
+                        facecolor=_ZONE_BG_COLORS["External"],
+                        edgecolor="#7f8c8d",
+                        label=f"External: {n_public} public, {n_infra} infra/local",
+                    )
+                )
+            continue
         n = len(zone_nets[zone_name])
         if n > 0:
             legend_elements.append(
