@@ -823,6 +823,7 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
             reader = dpkt.pcapng.Reader(f)
 
         for ts, buf in reader:
+            ts = float(ts)  # pcapng returns decimal.Decimal timestamps
             session.packet_count += 1
 
             if session.start_time is None or ts < session.start_time:
