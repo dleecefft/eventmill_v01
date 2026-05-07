@@ -687,11 +687,11 @@ _DMZ_PORTS = {80, 443, 8080, 8443, 25, 587, 993, 995}
 
 # Purdue zone definitions and visual layout
 _PURDUE_ZONES = [
-    ("External",      "#1a5276",  0.95),   # dark blue (parent container)
-    ("Corporate",     "#e67e22",  0.73),   # orange
-    ("DMZ",           "#27ae60",  0.54),   # green
-    ("SCADA",         "#8e44ad",  0.35),   # purple
-    ("CONTROL/FIELD", "#2980b9",  0.16),   # blue
+    ("External",      "#1a5276",  0.88),   # dark blue (parent container)
+    ("Corporate",     "#e67e22",  0.67),   # orange
+    ("DMZ",           "#27ae60",  0.48),   # green
+    ("SCADA",         "#8e44ad",  0.29),   # purple
+    ("CONTROL/FIELD", "#2980b9",  0.10),   # blue
 ]
 
 # Sub-zones within External (rendered as inner boxes)
@@ -844,9 +844,9 @@ def _render_purdue_zone_graph(session: Any) -> bytes | None:
     max_bytes = max(zone_flows.values()) if zone_flows else 1
 
     # --- Draw the diagram ---
-    fig, ax = plt.subplots(figsize=(10, 7))
+    fig, ax = plt.subplots(figsize=(11, 8))
     ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
+    ax.set_ylim(-0.02, 1.0)
     ax.set_aspect("auto")
     ax.axis("off")
     fig.patch.set_facecolor("white")
@@ -915,15 +915,16 @@ def _render_purdue_zone_graph(session: Any) -> bytes | None:
         sub_width = 0.38
         sub_x = zone_margin + 0.02 + x_center * (1 - 2 * zone_margin - sub_width) - 0.01
         n = len(nets)
-        max_show = min(n, 4)
+        max_show = min(n, 6)
         for i, net in enumerate(nets[:max_show]):
-            x = sub_x + 0.03 + (i + 0.5) * ((sub_width - 0.06) / max_show)
+            x = sub_x + 0.02 + (i + 0.5) * ((sub_width - 0.04) / max_show)
             y = ext_y
             node_positions[net] = (x, y)
-            ax.plot(x, y, "o", color="#2c3e50", markersize=6, zorder=5)
+            ax.plot(x, y, "o", color="#2c3e50", markersize=5, zorder=5)
             label = net + ".x"
-            ax.text(x, y - 0.022, label, fontsize=5.5,
-                    ha="center", va="top", color="#2c3e50")
+            ax.text(x, y - 0.022, label, fontsize=4.8,
+                    ha="center", va="top", color="#2c3e50",
+                    rotation=20)
         if n > max_show:
             ax.text(sub_x + sub_width - 0.03, ext_y, f"+{n - max_show}",
                     fontsize=8, ha="center", va="center",
