@@ -988,8 +988,9 @@ def _render_purdue_zone_graph(session: Any, context: Any = None) -> bytes | None
 
     # Draw External sub-zone boxes (inside the External zone)
     ext_y = zone_y.get("External", 0.95)
-    sub_box_height = zone_height * 0.65
-    sub_box_top = ext_y - sub_box_height / 2
+    sub_box_height = zone_height * 0.55
+    # Position sub-boxes below the External label (leave room at top)
+    sub_box_top = ext_y - zone_height / 2 + 0.01
     # Available width inside External box, split into two sub-boxes with a gap
     inner_left = zone_margin + 0.015
     inner_right = 1 - zone_margin - 0.015
@@ -1014,13 +1015,14 @@ def _render_purdue_zone_graph(session: Any, context: Any = None) -> bytes | None
                 sub_label, fontsize=7.5, fontstyle="italic",
                 color=sub_border, va="top")
 
-        zone_y[sub_zone] = ext_y
+        zone_y[sub_zone] = sub_box_top + sub_box_height / 2
         zone_rects[sub_zone] = (sub_x, sub_box_top, sub_width, sub_box_height)
 
     # Place /24 network nodes within their zones (sub-zones for External)
     node_positions: dict[str, tuple[float, float]] = {}
 
-    # Place External sub-zone nodes
+    # Place External sub-zone nodes (centered vertically in sub-boxes)
+    ext_node_y = sub_box_top + sub_box_height / 2
     for idx, (sub_zone, sub_label, sub_border, _x_center) in enumerate(_EXTERNAL_SUBZONES):
         nets = sorted(zone_nets[sub_zone])
         if not nets:
@@ -1030,7 +1032,7 @@ def _render_purdue_zone_graph(session: Any, context: Any = None) -> bytes | None
         max_show = min(n, 6)
         for i, net in enumerate(nets[:max_show]):
             x = sub_x_node + 0.02 + (i + 0.5) * ((sub_width - 0.04) / max_show)
-            y = ext_y
+            y = ext_node_y
             node_positions[net] = (x, y)
             ax.plot(x, y, "o", color="#2c3e50", markersize=5, zorder=5)
             label = net + ".x"
@@ -1038,7 +1040,7 @@ def _render_purdue_zone_graph(session: Any, context: Any = None) -> bytes | None
                     ha="center", va="top", color="#2c3e50",
                     rotation=20)
         if n > max_show:
-            ax.text(sub_x_node + sub_width - 0.03, ext_y, f"+{n - max_show}",
+            ax.text(sub_x_node + sub_width - 0.03, ext_node_y, f"+{n - max_show}",
                     fontsize=8, ha="center", va="center",
                     color="#7f8c8d", style="italic")
 
