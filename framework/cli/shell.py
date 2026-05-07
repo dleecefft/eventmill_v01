@@ -642,12 +642,16 @@ class EventMillShell(cmd.Cmd):
     def do_load(self, arg: str) -> None:
         """Load an artifact file into the current session.
         
-        Usage: load <file_path_or_name> [artifact_type] [--large]
+        Usage: load <file_path_or_name> [artifact_type] [--large] [--networks]
         
         Options:
-          --large    Use dpkt (fast C-backed parser) instead of scapy.
-                     Recommended for PCAPs >100 MB / >500K packets.
-                     5-10x faster, identical report output.
+          --large      Use dpkt (fast C-backed parser) instead of scapy.
+                       Recommended for PCAPs >100 MB / >500K packets.
+                       5-10x faster, identical report output.
+          --networks   Tag this file as a network/subnet reference (IPAM export).
+                       Subnet-to-zone mappings (SCADA, DMZ, etc.) will be
+                       extracted and used to improve Purdue zone classification
+                       in the traffic flow graph.
         
         Resolution order:
           1. Local file path (if exists on disk)
@@ -674,6 +678,11 @@ class EventMillShell(cmd.Cmd):
         use_dpkt = "--large" in parts
         if use_dpkt:
             parts = [p for p in parts if p != "--large"]
+
+        # Check for --networks flag
+        is_network_ref = "--networks" in parts
+        if is_network_ref:
+            parts = [p for p in parts if p != "--networks"]
         
         file_ref = parts[0]
         file_path = Path(file_ref)
@@ -681,7 +690,7 @@ class EventMillShell(cmd.Cmd):
         # Try local file first
         if file_path.exists():
             artifact_type = parts[1] if len(parts) > 1 else self._infer_artifact_type(file_path)
-            self._register_local_artifact(file_path, artifact_type, use_dpkt=use_dpkt)
+            self._register_local_artifact(file_path, artifact_type, use_dpkt=use_dpkt, network_reference=is_network_ref)
             return
         
         # Try storage resolver (gs:// URI or filename lookup in buckets)
@@ -713,7 +722,7 @@ class EventMillShell(cmd.Cmd):
                     return
                 
                 artifact_type = parts[1] if len(parts) > 1 else self._infer_artifact_type(local_dest)
-                self._register_local_artifact(local_dest, artifact_type, source_info=resolved.display, use_dpkt=use_dpkt)
+                self._register_local_artifact(local_dest, artifact_type, source_info=resolved.display, use_dpkt=use_dpkt, network_reference=is_network_ref)
                 return
         
         # Nothing found
@@ -731,19 +740,23 @@ class EventMillShell(cmd.Cmd):
         artifact_type: str,
         source_info: str | None = None,
         use_dpkt: bool = False,
+        network_reference: bool = False,
     ) -> None:
         """Register a local file as an artifact in the current session."""
+        meta = {"original_filename": file_path.name}
+        if network_reference:
+            meta["network_reference"] = True
         artifact = self.session_manager.register_artifact(
             artifact_type=artifact_type,
             file_path=str(file_path.resolve()),
-            metadata={"original_filename": file_path.name},
+            metadata=meta,
         )
         
         if self.artifact_registry:
             self.artifact_registry.register(
                 artifact_type=artifact_type,
                 source_path=file_path,
-                metadata={"original_filename": file_path.name},
+                metadata=meta,
                 copy_file=False,
             )
         
@@ -757,6 +770,8 @@ class EventMillShell(cmd.Cmd):
         print(f"  Loaded artifact: {artifact.artifact_id}")
         print(f"  Type: {artifact_type}")
         print(f"  File: {file_path.name}")
+        if network_reference:
+            print(f"  🗺️  Tagged as network reference — subnet zones will be used for Purdue graph classification")
         if source_info:
             print(f"  Source: {source_info}")
 

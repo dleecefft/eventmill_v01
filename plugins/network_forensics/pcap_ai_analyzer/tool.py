@@ -13,8 +13,10 @@ Ported from Event Mill v1.0 pcap_hunting.py (ai_hunt_*) and system_context.py
 
 from __future__ import annotations
 
+import ipaddress as _ipaddress
 import logging
 import os
+import re as _re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -685,6 +687,90 @@ _CORP_PORTS = {53, 88, 135, 139, 389, 445, 636, 3389, 5985, 5986}
 # DMZ ports → "DMZ"
 _DMZ_PORTS = {80, 443, 8080, 8443, 25, 587, 993, 995}
 
+# Keyword→Purdue zone mapping for network reference files
+_SUBNET_ZONE_KEYWORDS: list[tuple[str, str]] = [
+    # Order matters: more specific patterns first
+    (r"SCADA|ICS|PLC|RTU|HMI|DCS|SIS|Modbus|DNP3|OPC|BACnet"
+     r"|Compressor|Dehy|Gathering|Pipeline", "SCADA"),
+    (r"Control|Field|Process|Safety", "CONTROL/FIELD"),
+    (r"\bIDMZ\b|\bDMZ\b", "DMZ"),
+    (r"Corporate|Office|Desktop|User|Workstation", "Corporate"),
+]
+
+
+def _parse_network_zones_from_artifacts(context: Any) -> dict[_ipaddress.IPv4Network, str]:
+    """Parse loaded --networks artifacts for CIDR→Purdue zone mappings.
+
+    Scans artifacts tagged with metadata["network_reference"]=True for lines
+    containing a valid CIDR prefix followed by a description with a zone keyword.
+    Returns a dict mapping IPv4Network → zone string, sorted longest-prefix-first
+    so lookup does most-specific match.
+    """
+    if not context or not hasattr(context, "artifacts"):
+        return {}
+
+    zone_map: dict[_ipaddress.IPv4Network, str] = {}
+    cidr_re = _re.compile(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2})")
+
+    # Compile zone keyword patterns once
+    compiled_kw = [(_re.compile(pat, _re.IGNORECASE), zone)
+                   for pat, zone in _SUBNET_ZONE_KEYWORDS]
+
+    for artifact in context.artifacts:
+        meta = getattr(artifact, "metadata", {}) or {}
+        if not meta.get("network_reference"):
+            continue
+        file_path = getattr(artifact, "file_path", None)
+        if not file_path:
+            continue
+        try:
+            with open(file_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    m = cidr_re.search(line)
+                    if not m:
+                        continue
+                    try:
+                        net = _ipaddress.IPv4Network(m.group(1), strict=False)
+                    except (ValueError, _ipaddress.AddressValueError):
+                        continue
+                    # Match description against zone keywords
+                    desc = line[m.end():]  # text after the CIDR
+                    for kw_re, zone in compiled_kw:
+                        if kw_re.search(desc):
+                            zone_map[net] = zone
+                            break
+        except Exception:
+            pass  # skip unreadable files
+
+    if zone_map:
+        n = len(zone_map)
+        print(f"  🗺️  Network reference loaded: {n} subnet→zone mappings")
+
+    return zone_map
+
+
+def _lookup_subnet_zone(
+    ip: str,
+    subnet_zones: dict[_ipaddress.IPv4Network, str],
+) -> str | None:
+    """Return the Purdue zone for an IP based on loaded subnet mappings.
+
+    Uses longest-prefix (most specific) match.  Returns None if no match.
+    """
+    if not subnet_zones:
+        return None
+    try:
+        addr = _ipaddress.IPv4Address(ip)
+    except (ValueError, _ipaddress.AddressValueError):
+        return None
+    best_match: str | None = None
+    best_prefix = -1
+    for net, zone in subnet_zones.items():
+        if addr in net and net.prefixlen > best_prefix:
+            best_match = zone
+            best_prefix = net.prefixlen
+    return best_match
+
 # Purdue zone definitions and visual layout
 _PURDUE_ZONES = [
     ("External",      "#1a5276",  0.88),   # dark blue (parent container)
@@ -722,14 +808,30 @@ def _is_infra_local(ip: str) -> bool:
     )
 
 
-def _classify_ip_zone(ip: str, session: Any) -> str:
-    """Classify an IP into a Purdue zone based on traffic patterns."""
+def _classify_ip_zone(
+    ip: str,
+    session: Any,
+    subnet_zones: dict | None = None,
+) -> str:
+    """Classify an IP into a Purdue zone.
+
+    If *subnet_zones* is provided (from a ``--networks`` reference file),
+    subnet-based classification takes priority over port heuristics.
+    """
     from plugins.network_forensics.pcap_metadata_summary.tool import is_internal
 
     if not is_internal(ip):
         if _is_infra_local(ip):
             return "Ext_Infra"
         return "Ext_Public"
+
+    # --- Subnet-based classification (highest priority) ---
+    if subnet_zones:
+        zone = _lookup_subnet_zone(ip, subnet_zones)
+        if zone:
+            return zone
+
+    # --- Port-heuristic fallback ---
 
     # Gather ports this IP connects TO (client) vs SERVES (server)
     dst_ports: set[int] = set()   # ports this IP connects to as client
@@ -768,8 +870,11 @@ def _classify_ip_zone(ip: str, session: Any) -> str:
     return "Corporate"
 
 
-def _render_purdue_zone_graph(session: Any) -> bytes | None:
+def _render_purdue_zone_graph(session: Any, context: Any = None) -> bytes | None:
     """Render a Purdue model zone traffic diagram as PNG bytes.
+
+    If *context* is provided and contains artifacts loaded with ``--networks``,
+    subnet-to-zone mappings override port-based heuristics.
 
     Returns PNG image bytes or None if matplotlib is not available.
     """
@@ -784,6 +889,9 @@ def _render_purdue_zone_graph(session: Any) -> bytes | None:
 
     from plugins.network_forensics.pcap_metadata_summary.tool import is_internal
 
+    # --- Parse subnet-to-zone mappings from --networks artifacts ---
+    subnet_zones = _parse_network_zones_from_artifacts(context)
+
     # --- Classify all IPs into zones, then group by /24 network ---
     all_ips: set[str] = set()
     for (src, dst, dport, proto), stats in session.conversations.items():
@@ -792,7 +900,7 @@ def _render_purdue_zone_graph(session: Any) -> bytes | None:
 
     ip_zones: dict[str, str] = {}
     for ip in all_ips:
-        ip_zones[ip] = _classify_ip_zone(ip, session)
+        ip_zones[ip] = _classify_ip_zone(ip, session, subnet_zones=subnet_zones)
 
     # Group IPs into /24 networks and assign zone by majority vote
     from collections import Counter as _Counter
@@ -1080,6 +1188,7 @@ def _export_pdf(
     mode: str = "",
     condition_orange: bool = False,
     session: Any | None = None,
+    context: Any | None = None,
 ) -> Path | None:
     """Render a professional, executive-readable PDF report using fpdf2."""
     try:
@@ -1216,7 +1325,7 @@ def _export_pdf(
         # PURDUE ZONE TRAFFIC DIAGRAM (OT reports only)
         # ===================================================================
         if mode.startswith("ot_") and session is not None:
-            graph_png = _render_purdue_zone_graph(session)
+            graph_png = _render_purdue_zone_graph(session, context=context)
             if graph_png:
                 import tempfile
                 pdf.add_page()
@@ -2251,6 +2360,7 @@ class PcapAiAnalyzer:
                     mode=mode,
                     condition_orange=condition_orange,
                     session=session,
+                    context=context,
                 )
 
             # Register the markdown file as an artifact
