@@ -696,8 +696,8 @@ _PURDUE_ZONES = [
 
 # Sub-zones within External (rendered as inner boxes)
 _EXTERNAL_SUBZONES = [
-    ("Ext_Infra",  "Multicast/Broadcast/APIPA", "#85c1e9", 0.25),  # left side
-    ("Ext_Public", "Public Internet",           "#aed6f1", 0.70),  # right side
+    ("Ext_Infra",  "Multicast/Broadcast/APIPA", "#85c1e9", 0.05),  # left side
+    ("Ext_Public", "Public Internet",           "#aed6f1", 0.95),  # right side
 ]
 
 _ZONE_BG_COLORS = {
@@ -882,9 +882,14 @@ def _render_purdue_zone_graph(session: Any) -> bytes | None:
     ext_y = zone_y.get("External", 0.95)
     sub_box_height = zone_height * 0.65
     sub_box_top = ext_y - sub_box_height / 2
-    for sub_zone, sub_label, sub_border, x_center in _EXTERNAL_SUBZONES:
-        sub_width = 0.38
-        sub_x = zone_margin + 0.02 + x_center * (1 - 2 * zone_margin - sub_width) - 0.01
+    # Available width inside External box, split into two sub-boxes with a gap
+    inner_left = zone_margin + 0.015
+    inner_right = 1 - zone_margin - 0.015
+    inner_width = inner_right - inner_left
+    sub_gap = 0.03  # gap between the two sub-boxes
+    sub_width = (inner_width - sub_gap) / 2
+    for idx, (sub_zone, sub_label, sub_border, _x_center) in enumerate(_EXTERNAL_SUBZONES):
+        sub_x = inner_left + idx * (sub_width + sub_gap)
         sub_bg = _ZONE_BG_COLORS[sub_zone]
 
         sub_rect = mpatches.FancyBboxPatch(
@@ -908,16 +913,15 @@ def _render_purdue_zone_graph(session: Any) -> bytes | None:
     node_positions: dict[str, tuple[float, float]] = {}
 
     # Place External sub-zone nodes
-    for sub_zone, sub_label, sub_border, x_center in _EXTERNAL_SUBZONES:
+    for idx, (sub_zone, sub_label, sub_border, _x_center) in enumerate(_EXTERNAL_SUBZONES):
         nets = sorted(zone_nets[sub_zone])
         if not nets:
             continue
-        sub_width = 0.38
-        sub_x = zone_margin + 0.02 + x_center * (1 - 2 * zone_margin - sub_width) - 0.01
+        sub_x_node = inner_left + idx * (sub_width + sub_gap)
         n = len(nets)
         max_show = min(n, 6)
         for i, net in enumerate(nets[:max_show]):
-            x = sub_x + 0.02 + (i + 0.5) * ((sub_width - 0.04) / max_show)
+            x = sub_x_node + 0.02 + (i + 0.5) * ((sub_width - 0.04) / max_show)
             y = ext_y
             node_positions[net] = (x, y)
             ax.plot(x, y, "o", color="#2c3e50", markersize=5, zorder=5)
@@ -926,7 +930,7 @@ def _render_purdue_zone_graph(session: Any) -> bytes | None:
                     ha="center", va="top", color="#2c3e50",
                     rotation=20)
         if n > max_show:
-            ax.text(sub_x + sub_width - 0.03, ext_y, f"+{n - max_show}",
+            ax.text(sub_x_node + sub_width - 0.03, ext_y, f"+{n - max_show}",
                     fontsize=8, ha="center", va="center",
                     color="#7f8c8d", style="italic")
 
