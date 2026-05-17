@@ -642,16 +642,12 @@ class EventMillShell(cmd.Cmd):
     def do_load(self, arg: str) -> None:
         """Load an artifact file into the current session.
         
-        Usage: load <file_path_or_name> [artifact_type] [--large] [--networks]
+        Usage: load <file_path_or_name> [artifact_type] [--large]
         
         Options:
-          --large      Use dpkt (fast C-backed parser) instead of scapy.
-                       Recommended for PCAPs >100 MB / >500K packets.
-                       5-10x faster, identical report output.
-          --networks   Tag this file as a network/subnet reference (IPAM export).
-                       Subnet-to-zone mappings (SCADA, DMZ, etc.) will be
-                       extracted and used to improve Purdue zone classification
-                       in the traffic flow graph.
+          --large    Use dpkt (fast C-backed parser) instead of scapy.
+                     Recommended for PCAPs >100 MB / >500K packets.
+                     5-10x faster, identical report output.
         
         Resolution order:
           1. Local file path (if exists on disk)
@@ -678,11 +674,6 @@ class EventMillShell(cmd.Cmd):
         use_dpkt = "--large" in parts
         if use_dpkt:
             parts = [p for p in parts if p != "--large"]
-
-        # Check for --networks flag
-        is_network_ref = "--networks" in parts
-        if is_network_ref:
-            parts = [p for p in parts if p != "--networks"]
         
         file_ref = parts[0]
         file_path = Path(file_ref)
@@ -690,7 +681,7 @@ class EventMillShell(cmd.Cmd):
         # Try local file first
         if file_path.exists():
             artifact_type = parts[1] if len(parts) > 1 else self._infer_artifact_type(file_path)
-            self._register_local_artifact(file_path, artifact_type, use_dpkt=use_dpkt, network_reference=is_network_ref)
+            self._register_local_artifact(file_path, artifact_type, use_dpkt=use_dpkt)
             return
         
         # Try storage resolver (gs:// URI or filename lookup in buckets)
@@ -722,7 +713,7 @@ class EventMillShell(cmd.Cmd):
                     return
                 
                 artifact_type = parts[1] if len(parts) > 1 else self._infer_artifact_type(local_dest)
-                self._register_local_artifact(local_dest, artifact_type, source_info=resolved.display, use_dpkt=use_dpkt, network_reference=is_network_ref)
+                self._register_local_artifact(local_dest, artifact_type, source_info=resolved.display, use_dpkt=use_dpkt)
                 return
         
         # Nothing found
@@ -740,23 +731,19 @@ class EventMillShell(cmd.Cmd):
         artifact_type: str,
         source_info: str | None = None,
         use_dpkt: bool = False,
-        network_reference: bool = False,
     ) -> None:
         """Register a local file as an artifact in the current session."""
-        meta = {"original_filename": file_path.name}
-        if network_reference:
-            meta["network_reference"] = True
         artifact = self.session_manager.register_artifact(
             artifact_type=artifact_type,
             file_path=str(file_path.resolve()),
-            metadata=meta,
+            metadata={"original_filename": file_path.name},
         )
         
         if self.artifact_registry:
             self.artifact_registry.register(
                 artifact_type=artifact_type,
                 source_path=file_path,
-                metadata=meta,
+                metadata={"original_filename": file_path.name},
                 copy_file=False,
             )
         
@@ -770,8 +757,6 @@ class EventMillShell(cmd.Cmd):
         print(f"  Loaded artifact: {artifact.artifact_id}")
         print(f"  Type: {artifact_type}")
         print(f"  File: {file_path.name}")
-        if network_reference:
-            print(f"  🗺️  Tagged as network reference — subnet zones will be used for Purdue graph classification")
         if source_info:
             print(f"  Source: {source_info}")
 
@@ -836,6 +821,457 @@ class EventMillShell(cmd.Cmd):
             print("  Note: pcap_metadata_summary plugin not available; manual 'run' with mode=load required.")
         except Exception as e:
             print(f"  Warning: auto-parse failed ({e}); use 'run pcap_metadata_summary {{\"mode\": \"load\", \"file_path\": \"{file_path.name}\"}}' manually.")
+
+    # -------------------------------------------------------------------
+    # Zeek Commands — Large PCAP Processing via Cloud Build
+    # -------------------------------------------------------------------
+
+    # Persistent state for tracking Zeek jobs across commands
+    _zeek_jobs: dict[str, dict] = {}
+
+    def do_zeek(self, arg: str) -> None:
+        """Process a large PCAP with Zeek via Cloud Build.
+
+        Submits the PCAP to a Cloud Build job running Zeek, then loads
+        the resulting logs so all downstream tools work identically to
+        a local PCAP load.
+
+        File resolution uses the same order as 'load':
+          1. Explicit gs:// URI
+          2. Network forensics pillar bucket (workspace, then root)
+          3. Common bucket
+
+        Zeek output is stored in the network forensics bucket under
+        zeek-output/<pcap_name>-<timestamp>/.
+
+        Usage:
+          zeek <filename_or_gs_uri>                Submit Zeek job and wait
+          zeek <filename_or_gs_uri> --async        Submit and return immediately
+          zeek status [build_id]                   Check job status
+          zeek load [folder_name]                  Load Zeek logs (from bucket or gs://)
+          zeek jobs                                List submitted jobs
+          zeek list                                List available Zeek outputs
+
+        Examples:
+          zeek massive.pcap                        Resolve from network forensics bucket
+          zeek gs://my-bucket/captures/big.pcap    Explicit URI
+          zeek massive.pcap --async
+          zeek status
+          zeek load massive-20260514-abc12345      Load from zeek-output/ in bucket
+          zeek load                                Load most recent Zeek output
+          zeek list                                Show available Zeek output folders
+        """
+        if not arg.strip():
+            print("  Usage: zeek <filename_or_gs_uri> [--async]")
+            print("         zeek status [build_id]")
+            print("         zeek load [folder_name]")
+            print("         zeek list")
+            print("         zeek jobs")
+            return
+
+        parts = shlex.split(arg.strip())
+        subcommand = parts[0]
+
+        if subcommand == "status":
+            self._zeek_status(parts[1] if len(parts) > 1 else None)
+        elif subcommand == "load":
+            self._zeek_load(parts[1] if len(parts) > 1 else None)
+        elif subcommand == "list":
+            self._zeek_list_outputs()
+        elif subcommand == "jobs":
+            self._zeek_list_jobs()
+        else:
+            # It's a PCAP reference — resolve it
+            async_mode = "--async" in parts
+            pcap_ref = subcommand
+            pcap_uri = self._zeek_resolve_pcap(pcap_ref)
+            if pcap_uri:
+                self._zeek_submit(pcap_uri, async_mode=async_mode)
+
+    def _zeek_get_nf_bucket(self) -> str | None:
+        """Get the network forensics bucket name from the storage resolver."""
+        if self.storage_resolver:
+            return self.storage_resolver.config.bucket_for_pillar("network_forensics")
+        return None
+
+    def _zeek_resolve_pcap(self, pcap_ref: str) -> str | None:
+        """Resolve a PCAP reference to a gs:// URI.
+
+        Resolution order:
+          1. Already a gs:// URI → use as-is
+          2. Filename → look in network forensics bucket (workspace, then root)
+          3. Filename → look in common bucket
+        """
+        # 1. Explicit gs:// URI
+        if pcap_ref.startswith("gs://"):
+            return pcap_ref
+
+        # 2. Resolve via storage resolver (same as 'load' command)
+        session = self.session_manager.get_current_session()
+        if not session:
+            print("  No active session. Use 'new' to create one first.")
+            return None
+
+        pillar = "network_forensics"
+
+        if self.storage_resolver:
+            resolved = self.storage_resolver.resolve(
+                filename=pcap_ref,
+                pillar=pillar,
+                workspace_folder=session.workspace_folder,
+            )
+            if resolved:
+                print(f"  Found: {resolved.display}")
+                return resolved.uri
+
+        # Not found
+        nf_bucket = self._zeek_get_nf_bucket()
+        print(f"  File not found: {pcap_ref}")
+        if nf_bucket:
+            print(f"  Searched: gs://{nf_bucket}/")
+            if session.workspace_folder:
+                print(f"  Workspace: {session.workspace_folder}")
+            print(f"\n  Upload first: gsutil cp {pcap_ref} gs://{nf_bucket}/")
+        return None
+
+    def _zeek_submit(self, pcap_uri: str, async_mode: bool = False) -> None:
+        """Submit a Zeek Cloud Build job."""
+        if not os.environ.get("K_SERVICE"):
+            print("  ⚠  Zeek Cloud Build integration requires Cloud Run (GCP).")
+            print("  For local use, install Zeek directly:")
+            print("    zeek -r file.pcap LogAscii::use_json=T local")
+            return
+
+        print(f"  Submitting Zeek job for: {pcap_uri}")
+        print(f"  Machine: E2_HIGHCPU_32 (32 vCPU, 32 GB RAM, 500 GB disk)")
+
+        try:
+            from ..cloud.gcp.zeek import ZeekCloudBuildClient
+
+            client = ZeekCloudBuildClient()
+            job = client.submit_zeek_job(pcap_uri=pcap_uri)
+
+            build_id = job["build_id"]
+            output_prefix = job["output_prefix"]
+
+            # Track the job
+            self._zeek_jobs[build_id] = job
+
+            print(f"  ✓ Build submitted: {build_id}")
+            print(f"  Output will be at: {output_prefix}/")
+
+            log_user_activity("zeek_submit", {
+                "build_id": build_id,
+                "pcap_uri": pcap_uri,
+                "output_prefix": output_prefix,
+            })
+
+            if async_mode:
+                print()
+                print(f"  Running in background. Check with:")
+                print(f"    zeek status {build_id}")
+                print(f"  When complete, load with:")
+                print(f"    zeek load {output_prefix}")
+                return
+
+            # Synchronous — wait for completion
+            print(f"  ⏳ Waiting for Zeek to finish (polling every 30s)...")
+            print(f"  This may take 30-60 minutes for large PCAPs.")
+            print(f"  Press Ctrl+C to stop waiting (job continues in background).")
+            print()
+
+            try:
+                def _progress(status):
+                    s = status.get("status", "?")
+                    d = status.get("duration", "")
+                    if d:
+                        print(f"\r  Status: {s} ({d})   ", end="", flush=True)
+                    else:
+                        print(f"\r  Status: {s}   ", end="", flush=True)
+
+                final = client.wait_for_completion(
+                    build_id,
+                    poll_interval=30,
+                    progress_callback=_progress,
+                )
+                print()  # newline after \r progress
+
+                self._zeek_jobs[build_id] = {**job, **final}
+
+                if final.get("status") == "SUCCESS":
+                    duration = final.get("duration", "unknown")
+                    print(f"  ✓ Zeek complete in {duration}.")
+                    print(f"  Loading Zeek logs from {output_prefix}/...")
+                    self._zeek_load(output_prefix)
+                else:
+                    status = final.get("status", "UNKNOWN")
+                    print(f"  ✗ Zeek job finished with status: {status}")
+                    if final.get("log_url"):
+                        print(f"  Logs: {final['log_url']}")
+            except KeyboardInterrupt:
+                print()
+                print(f"  Stopped waiting. Job continues in background.")
+                print(f"  Check:  zeek status {build_id}")
+                print(f"  Load:   zeek load {output_prefix}")
+
+        except ImportError:
+            print("  ✗ google-cloud-build not installed.")
+            print("  Install with: pip install google-cloud-build")
+        except Exception as e:
+            print(f"  ✗ Failed to submit Zeek job: {e}")
+            logger.exception("Zeek submit failed")
+
+    def _zeek_status(self, build_id: str | None = None) -> None:
+        """Check Zeek job status."""
+        if not build_id:
+            if not self._zeek_jobs:
+                print("  No Zeek jobs submitted this session.")
+                return
+            # Show latest job
+            build_id = list(self._zeek_jobs.keys())[-1]
+
+        try:
+            from ..cloud.gcp.zeek import ZeekCloudBuildClient
+
+            client = ZeekCloudBuildClient()
+            status = client.get_build_status(build_id)
+
+            print(f"  Build ID: {build_id}")
+            print(f"  Status:   {status.get('status', 'UNKNOWN')}")
+            if status.get("duration"):
+                print(f"  Duration: {status['duration']}")
+            if status.get("log_url"):
+                print(f"  Logs:     {status['log_url']}")
+
+            # Update tracked job
+            if build_id in self._zeek_jobs:
+                self._zeek_jobs[build_id].update(status)
+
+            if status.get("status") == "SUCCESS":
+                output = self._zeek_jobs.get(build_id, {}).get("output_prefix")
+                if output:
+                    print(f"\n  Ready to load: zeek load {output}")
+
+        except ImportError:
+            print("  ✗ google-cloud-build not installed.")
+        except Exception as e:
+            print(f"  ✗ Failed to check status: {e}")
+
+    def _zeek_load(self, folder_ref: str | None = None) -> None:
+        """Download and load Zeek logs from GCS into the session.
+
+        Resolution:
+          - No argument: load most recent Zeek output from the NF bucket
+          - Bare folder name: resolve from zeek-output/ in NF bucket
+          - gs:// URI: use as-is
+        """
+        if not self.session_manager.get_current_session():
+            print("  No active session. Use 'new' to create one first.")
+            return
+
+        try:
+            from google.cloud import storage as gcs_storage
+            from plugins.network_forensics.pcap_metadata_summary.zeek_loader import parse_zeek_logs
+            from plugins.network_forensics.pcap_metadata_summary.tool import (
+                set_pcap_session, is_internal, _format_duration,
+            )
+            import tempfile
+
+            client = gcs_storage.Client()
+            nf_bucket = self._zeek_get_nf_bucket()
+
+            # Resolve the output prefix
+            if folder_ref and folder_ref.startswith("gs://"):
+                # Explicit gs:// URI
+                output_prefix = folder_ref.rstrip("/")
+                prefix_clean = output_prefix.replace("gs://", "")
+                parts = prefix_clean.split("/", 1)
+                bucket_name = parts[0]
+                prefix_path = parts[1] + "/" if len(parts) > 1 else ""
+            elif folder_ref:
+                # Bare folder name → look in zeek-output/ in NF bucket
+                if not nf_bucket:
+                    print("  ✗ No network forensics bucket configured.")
+                    return
+                bucket_name = nf_bucket
+                prefix_path = f"zeek-output/{folder_ref}/"
+                output_prefix = f"gs://{bucket_name}/zeek-output/{folder_ref}"
+            else:
+                # No argument → find most recent zeek-output folder
+                if not nf_bucket:
+                    print("  ✗ No network forensics bucket configured.")
+                    return
+                bucket_name = nf_bucket
+
+                # List zeek-output/ subfolders and pick the latest
+                bucket_obj = client.bucket(bucket_name)
+                blobs = list(bucket_obj.list_blobs(prefix="zeek-output/", delimiter="/"))
+
+                # Get subfolder prefixes
+                prefixes = []
+                # list_blobs with delimiter populates bucket_obj.list_blobs().prefixes
+                iterator = bucket_obj.list_blobs(prefix="zeek-output/", delimiter="/")
+                # Consume the iterator to populate prefixes
+                _ = list(iterator)
+                for p in iterator.prefixes:
+                    prefixes.append(p.rstrip("/"))
+
+                if not prefixes:
+                    print(f"  No Zeek outputs found in gs://{bucket_name}/zeek-output/")
+                    print(f"  Submit a job first: zeek <filename.pcap>")
+                    return
+
+                # Most recent (sorted alphabetically — timestamps in folder name)
+                latest = sorted(prefixes)[-1]
+                prefix_path = latest + "/"
+                output_prefix = f"gs://{bucket_name}/{latest}"
+                folder_name = latest.rsplit("/", 1)[-1]
+                print(f"  Auto-selected latest output: {folder_name}")
+
+            # Check for the most recent job's output prefix
+            if not folder_ref and self._zeek_jobs:
+                latest_job = list(self._zeek_jobs.values())[-1]
+                if latest_job.get("output_prefix"):
+                    output_prefix = latest_job["output_prefix"].rstrip("/")
+                    prefix_clean = output_prefix.replace("gs://", "")
+                    parts = prefix_clean.split("/", 1)
+                    bucket_name = parts[0]
+                    prefix_path = parts[1] + "/" if len(parts) > 1 else ""
+
+            # Download Zeek logs from GCS to local temp dir
+            local_dir = Path(tempfile.mkdtemp(prefix="eventmill_zeek_"))
+
+            bucket_obj = client.bucket(bucket_name)
+            blobs = list(bucket_obj.list_blobs(prefix=prefix_path))
+
+            log_files = [b for b in blobs if b.name.endswith(".log")]
+            if not log_files:
+                print(f"  No .log files found at {output_prefix}/")
+                if nf_bucket:
+                    print(f"  Try: zeek list")
+                return
+
+            print(f"  Downloading {len(log_files)} Zeek log files from {output_prefix}/...")
+            for blob in log_files:
+                filename = blob.name.rsplit("/", 1)[-1]
+                local_path = local_dir / filename
+                blob.download_to_filename(str(local_path))
+                size_mb = blob.size / (1024 * 1024) if blob.size else 0
+                print(f"    ✓ {filename} ({size_mb:.1f} MB)")
+
+            # Parse Zeek logs into PcapSession
+            print(f"  Parsing Zeek logs...")
+            session = parse_zeek_logs(local_dir)
+            set_pcap_session(session)
+
+            # Print summary (same format as _auto_parse_pcap)
+            internal = sum(1 for ip in session.unique_ips if is_internal(ip))
+            external = len(session.unique_ips) - internal
+            duration = session.duration_seconds
+
+            print(
+                f"  ✓ {len(session.conversations):,} connections, "
+                f"{len(session.unique_ips)} IPs ({internal} internal, {external} external), "
+                f"duration {_format_duration(duration)}"
+            )
+            if session.dns_queries:
+                print(f"  ✓ {len(session.dns_queries):,} DNS queries")
+            if session.tls_handshakes:
+                print(f"  ✓ {len(session.tls_handshakes):,} TLS handshakes")
+            if session.http_requests:
+                print(f"  ✓ {len(session.http_requests):,} HTTP requests")
+            if session.ot_transactions:
+                from collections import Counter as _Counter
+                ot_protos = _Counter(t["protocol"] for t in session.ot_transactions)
+                ot_summary = ", ".join(f"{p}:{c}" for p, c in ot_protos.most_common(5))
+                print(f"  ✓ OT/ICS protocols: {ot_summary}")
+            if session.cleartext_creds:
+                print(f"  ⚠️  Cleartext credentials detected: {len(session.cleartext_creds)}")
+
+            # Register as artifact
+            session_data = self.session_manager.get_current_session()
+            if session_data:
+                self.session_manager.register_artifact(
+                    artifact_type="json_events",
+                    file_path=str(local_dir),
+                    metadata={
+                        "source": "zeek",
+                        "gcs_prefix": output_prefix,
+                        "connections": len(session.conversations),
+                        "unique_ips": len(session.unique_ips),
+                    },
+                )
+
+            print()
+            print(f"  PCAP session ready — use any pcap tool:")
+            print(f"    run pcap_threat_hunter")
+            print(f"    run pcap_ai_analyzer {{\"mode\": \"threat_hunt\"}}")
+            print(f"    run pcap_ip_search {{\"query\": \"10.1.5.22\"}}")
+
+            log_user_activity("zeek_load", {
+                "source": output_prefix,
+                "connections": len(session.conversations),
+                "unique_ips": len(session.unique_ips),
+            })
+
+        except ImportError as e:
+            print(f"  ✗ Missing dependency: {e}")
+        except Exception as e:
+            print(f"  ✗ Failed to load Zeek logs: {e}")
+            logger.exception("Zeek load failed")
+
+    def _zeek_list_jobs(self) -> None:
+        """List all Zeek jobs submitted this session."""
+        if not self._zeek_jobs:
+            print("  No Zeek jobs submitted this session.")
+            return
+
+        print(f"  {'Build ID':40s} {'Status':12s} {'PCAP':40s}")
+        print(f"  {'─' * 40} {'─' * 12} {'─' * 40}")
+        for build_id, job in self._zeek_jobs.items():
+            status = job.get("status", "UNKNOWN")
+            pcap = job.get("pcap_uri", "?")
+            # Truncate PCAP URI for display
+            if len(pcap) > 40:
+                pcap = "..." + pcap[-37:]
+            print(f"  {build_id:40s} {status:12s} {pcap:40s}")
+
+    def _zeek_list_outputs(self) -> None:
+        """List available Zeek output folders in the network forensics bucket."""
+        nf_bucket = self._zeek_get_nf_bucket()
+        if not nf_bucket:
+            print("  ✗ No network forensics bucket configured.")
+            return
+
+        try:
+            from google.cloud import storage as gcs_storage
+
+            client = gcs_storage.Client()
+            bucket = client.bucket(nf_bucket)
+
+            # List subfolders under zeek-output/
+            iterator = bucket.list_blobs(prefix="zeek-output/", delimiter="/")
+            # Consume iterator to populate prefixes
+            _ = list(iterator)
+            prefixes = sorted(iterator.prefixes)
+
+            if not prefixes:
+                print(f"  No Zeek outputs in gs://{nf_bucket}/zeek-output/")
+                print(f"  Submit a job: zeek <filename.pcap>")
+                return
+
+            print(f"  Zeek outputs in gs://{nf_bucket}/zeek-output/:")
+            print(f"  {'Folder':50s} Load command")
+            print(f"  {'─' * 50} {'─' * 40}")
+            for p in prefixes:
+                folder = p.replace("zeek-output/", "").rstrip("/")
+                if folder:
+                    print(f"  {folder:50s} zeek load {folder}")
+
+        except ImportError:
+            print("  ✗ google-cloud-storage not installed.")
+        except Exception as e:
+            print(f"  ✗ Failed to list Zeek outputs: {e}")
 
     def do_artifacts(self, arg: str) -> None:
         """List loaded artifacts in the current session.
