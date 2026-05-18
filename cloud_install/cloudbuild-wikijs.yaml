@@ -12,18 +12,10 @@ steps:
     args:
       - 'build'
       - '-t'
-      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/eventmill/wikijs:$COMMIT_SHA'
-      - '-t'
       - '${_REGION}-docker.pkg.dev/$PROJECT_ID/eventmill/wikijs:latest'
       - '-f'
       - 'cloud_install/Dockerfile.wikijs'
       - '.'
-
-  # Push commit-tagged image
-  - name: 'gcr.io/cloud-builders/docker'
-    args:
-      - 'push'
-      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/eventmill/wikijs:$COMMIT_SHA'
 
   # Push latest image
   - name: 'gcr.io/cloud-builders/docker'
@@ -32,7 +24,6 @@ steps:
       - '${_REGION}-docker.pkg.dev/$PROJECT_ID/eventmill/wikijs:latest'
 
 images:
-  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/eventmill/wikijs:$COMMIT_SHA'
   - '${_REGION}-docker.pkg.dev/$PROJECT_ID/eventmill/wikijs:latest'
 
 substitutions:

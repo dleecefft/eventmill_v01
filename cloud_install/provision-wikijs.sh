@@ -39,6 +39,7 @@ SA_NAME="wikijs-runner"
 SA_DISPLAY_NAME="Wiki.js Cloud Run Service Account"
 
 # Secrets
+SECRET_DB_USERNAME="wikijs-db-user"
 SECRET_DB_PASSWORD="wikijs-db-password"
 
 echo "⚙ Wiki.js — GCP Infrastructure Provisioning"
@@ -123,7 +124,6 @@ else
         --storage-auto-increase \
         --availability-type=zonal \
         --backup-start-time=03:00 \
-        --enable-bin-log \
         --quiet
     echo "   ✓ Created Cloud SQL instance: ${SQL_INSTANCE_NAME}"
 fi
@@ -195,6 +195,23 @@ echo ""
 echo "🔐 Section 5: Storing secrets..."
 echo ""
 
+# Store DB username in Secret Manager
+if gcloud secrets describe "${SECRET_DB_USERNAME}" --project="${PROJECT_ID}" > /dev/null 2>&1; then
+    echo "   Username secret exists, adding new version..."
+else
+    gcloud secrets create "${SECRET_DB_USERNAME}" \
+        --project="${PROJECT_ID}" \
+        --replication-policy=automatic \
+        --quiet
+    echo "   ✓ Created secret: ${SECRET_DB_USERNAME}"
+fi
+
+echo -n "${SQL_USER}" | gcloud secrets versions add "${SECRET_DB_USERNAME}" \
+    --project="${PROJECT_ID}" \
+    --data-file=- \
+    --quiet
+echo "   ✓ Stored DB username in ${SECRET_DB_USERNAME}"
+
 # Store DB password in Secret Manager
 if gcloud secrets describe "${SECRET_DB_PASSWORD}" --project="${PROJECT_ID}" > /dev/null 2>&1; then
     echo "   Secret exists, adding new version..."
@@ -232,6 +249,14 @@ gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
     --condition='expression=true,title=wikijs-cloudsql,description=Wiki.js Cloud SQL access' \
     --quiet > /dev/null 2>&1
 echo "   ✓ roles/cloudsql.client"
+
+# Grant SA access to the DB username secret
+gcloud secrets add-iam-policy-binding "${SECRET_DB_USERNAME}" \
+    --project="${PROJECT_ID}" \
+    --member="serviceAccount:${SA_EMAIL}" \
+    --role="roles/secretmanager.secretAccessor" \
+    --quiet > /dev/null 2>&1
+echo "   ✓ Secret accessor for ${SECRET_DB_USERNAME}"
 
 # Grant SA access to the DB password secret
 gcloud secrets add-iam-policy-binding "${SECRET_DB_PASSWORD}" \
@@ -275,6 +300,7 @@ echo "Cloud SQL instance:  ${SQL_INSTANCE_NAME}"
 echo "Connection name:     ${SQL_CONNECTION_NAME}"
 echo "Database:            ${SQL_DB_NAME}"
 echo "User:                ${SQL_USER}"
+echo "Username secret:     ${SECRET_DB_USERNAME}"
 echo "Password secret:     ${SECRET_DB_PASSWORD}"
 echo "Service account:     ${SA_EMAIL}"
 echo ""

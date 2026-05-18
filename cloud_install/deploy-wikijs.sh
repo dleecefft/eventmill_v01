@@ -29,9 +29,9 @@ IMAGE_NAME="${REGION}-docker.pkg.dev/${PROJECT_ID}/eventmill/${SERVICE_NAME}"
 # Cloud SQL
 SQL_INSTANCE_NAME="${WIKIJS_SQL_INSTANCE:-wikijs-db}"
 SQL_DB_NAME="wikijs"
-SQL_USER="wikijs"
 
 # Secret
+SECRET_DB_USERNAME="${WIKIJS_SECRET_DB_USERNAME:-wikijs-db-user}"
 SECRET_DB_PASSWORD="wikijs-db-password"
 
 # Service account
@@ -100,9 +100,8 @@ gcloud run deploy "${SERVICE_NAME}" \
     --set-env-vars="DB_HOST=/cloudsql/${SQL_CONNECTION_NAME}" \
     --set-env-vars="DB_PORT=5432" \
     --set-env-vars="DB_NAME=${SQL_DB_NAME}" \
-    --set-env-vars="DB_USER=${SQL_USER}" \
     --set-env-vars="DB_SSL=false" \
-    --set-secrets="DB_PASS=${SECRET_DB_PASSWORD}:latest" \
+    --set-secrets="DB_USER=${SECRET_DB_USERNAME}:latest,DB_PASS=${SECRET_DB_PASSWORD}:latest" \
     --allow-unauthenticated
 
 # ---------------------------------------------------------------------------
