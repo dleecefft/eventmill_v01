@@ -218,6 +218,14 @@ else
     echo "   ⚠ Could not grant roles/logging.logWriter to ${SA_EMAIL}"
 fi
 
+# Allow the SA to submit Cloud Build jobs (Zeek PCAP processing)
+echo "   Granting Cloud Build Editor (Zeek integration)..."
+if add_project_binding "serviceAccount:${SA_EMAIL}" "roles/cloudbuild.builds.editor"; then
+    echo "   ✓ roles/cloudbuild.builds.editor"
+else
+    echo "   ⚠ Could not grant roles/cloudbuild.builds.editor to ${SA_EMAIL}"
+fi
+
 # Allow Cloud Build's default SA to deploy to Cloud Run
 # (Cloud Build uses the project's default compute SA for builds)
 DEFAULT_COMPUTE_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"

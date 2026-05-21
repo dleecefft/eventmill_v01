@@ -13,10 +13,8 @@ Ported from Event Mill v1.0 pcap_hunting.py (ai_hunt_*) and system_context.py
 
 from __future__ import annotations
 
-import ipaddress as _ipaddress
 import logging
 import os
-import re as _re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -289,324 +287,6 @@ End with:
 - Top 1-3 bullet points: most urgent safety/security actions
 """
 
-# ---------------------------------------------------------------------------
-# Network Operations / Infrastructure Health System Identity
-# ---------------------------------------------------------------------------
-
-PCAP_NETOPS_SYSTEM_IDENTITY = """SYSTEM IDENTITY:
-You are an AI-powered Network Operations Analyst specializing in network health, performance,
-and infrastructure troubleshooting.
-
-CRITICAL UNDERSTANDING:
-- You are analyzing PARSED metadata from network traffic captures (PCAP files).
-- These are EXPORTED captures, not live traffic. You cannot interact with the network.
-- Your focus is OPERATIONAL HEALTH — not security threats. You are looking for network
-  performance issues, misconfigurations, infrastructure problems, and service degradation.
-- You can only READ and ANALYZE — you CANNOT take remediation actions.
-
-YOUR ROLE:
-1. DIAGNOSE: Identify network performance issues — packet loss, retransmissions, congestion,
-   latency indicators, MTU problems, routing anomalies, and DNS failures.
-2. BASELINE: Assess whether traffic patterns indicate a healthy or degraded network.
-3. CAPACITY: Identify bandwidth hogs, overloaded links, and capacity planning concerns.
-4. RECOMMEND: Suggest specific infrastructure fixes, configuration changes, or monitoring
-   improvements for network engineers to implement.
-
-KEY NETWORK OPS PRINCIPLES:
-- TCP retransmissions indicate packet loss or network congestion.
-- TCP RST floods suggest connection issues, firewall resets, or application failures.
-- TCP zero-window events indicate receiver buffer exhaustion (application or host overload).
-- ICMP Destination Unreachable messages indicate routing problems or blocked services.
-- ICMP Time Exceeded (TTL) indicates routing loops or misconfigured hop counts.
-- High IP fragmentation suggests MTU mismatches across network paths.
-- Asymmetric traffic ratios may indicate link saturation or path asymmetry.
-- Unusual TTL distributions can reveal misconfigured devices or unexpected routing paths.
-- DNS failures and timeouts directly impact application availability.
-- Long-lived connections to standard service ports may indicate stuck sessions or keepalive issues.
-
-ROUTING LOOP DETECTION:
-- Routing loops occur when packets cycle between routers indefinitely until TTL expires.
-- Three detection methods are used:
-  1. ICMP TTL Exceeded analysis: When multiple different routers generate TTL Exceeded
-     for packets destined to the same IP, those routers form the loop path.
-  2. Duplicate IP ID detection: The same packet (identified by IP ID) captured with
-     different TTL values means it passed the capture point multiple times while looping.
-     The TTL spread reveals the number of hops in the loop cycle.
-  3. TTL Exceeded rate: A rate above 0.1% of total traffic is abnormal and suggests
-     routing instability. Normal, well-routed networks produce near-zero TTL Exceeded.
-- When interpreting loop evidence, consider: OSPF/EIGRP route redistribution, static route
-  conflicts, spanning-tree failures, and asymmetric routing as common root causes.
-
-ARP HEALTH ANALYSIS:
-- ARP is Layer 2 — it operates below IP and reveals switch/VLAN-level health.
-- ARP storms (>100 ARP/s sustained) typically indicate a Layer 2 loop (spanning-tree
-  failure) or broadcast storm. This is a CRITICAL finding.
-- IP address conflicts (same IP, multiple MACs) cause intermittent connectivity loss
-  and are notoriously hard to diagnose without PCAP evidence.
-- Gratuitous ARP floods typically indicate VRRP/HSRP/GLBP failover events or
-  MAC table instability. Check if the MACs belong to known gateway pairs.
-- High request/reply ratio (>5:1) suggests many dead or unreachable hosts, a subnet
-  misconfiguration, or a device scanning for available addresses.
-- ARP >5% of total traffic is abnormal for production networks.
-
-CONTROL PLANE & TOPOLOGY ANALYSIS:
-- STP (Spanning Tree Protocol):
-  - BPDUs are normal L2 control frames; their RATE matters, not mere presence.
-  - TCN (Topology Change Notification) BPDUs signal that the L2 topology changed —
-    a port went up/down, a device joined/left. Occasional TCNs are normal; sustained
-    floods (>10/min) indicate port flapping, cable issues, or misconfiguration.
-  - TC flag set in Config BPDUs triggers MAC table aging acceleration across bridges.
-    Many TC flags = many topology changes = network instability.
-  - Multiple root bridges seen means root bridge election occurred during the capture.
-    This is a CRITICAL event that causes seconds-long traffic blackout.
-  - BPDU rate >5/s on a single bridge is elevated; standard STP sends every 2s.
-- HSRP (Hot Standby Router Protocol):
-  - HSRP state transitions (Standby→Active or Active→Standby) represent gateway
-    failover events. Each transition causes brief traffic disruption for hosts
-    using that HSRP virtual IP as their default gateway.
-  - Rapid state oscillation (multiple transitions in seconds) indicates a flapping
-    peer, WAN link instability, or HSRP timer misconfiguration.
-  - Multiple groups are normal in multi-VLAN environments.
-- VRRP (Virtual Router Redundancy Protocol):
-  - Similar to HSRP but standards-based. Priority changes trigger master election.
-  - Priority 255 means the VRRP router owns the virtual IP (it's the IP owner).
-  - Priority drops from 255 indicate the IP owner is relinquishing mastership.
-- OSPF (Open Shortest Path First):
-  - Hello packets maintain neighbor adjacencies. A gap exceeding the Dead Interval
-    (default 40s) means the neighbor was declared dead — adjacency reset.
-  - LS Update bursts (>10/5s) indicate link flapping or route recalculation (SPF).
-    This causes network-wide reconvergence and potential micro-loops.
-  - DB Description and LS Request packets appear during initial adjacency formation
-    or adjacency reset — many of these suggest neighbors are re-syncing.
-  - Multiple areas and many router IDs help map the OSPF topology.
-- EIGRP (Enhanced Interior Gateway Routing Protocol):
-  - Queries indicate a route went ACTIVE (lost). High query counts suggest routes
-    are frequently being recalculated.
-  - Stuck-In-Active (SIA): if queries exceed 3 minutes without replies, EIGRP
-    resets the neighbor adjacency. Look for high Query counts with low Reply counts.
-  - Update packets carry route changes; elevated Update/Hello ratio indicates
-    active topology changes rather than steady-state operation.
-"""
-
-# ---------------------------------------------------------------------------
-# Network Operations Prompt templates (three tiers)
-# ---------------------------------------------------------------------------
-
-NETOPS_TRIAGE_PROMPT = """{system_identity}
-{alert_condition}
-{investigation_context}CURRENT TASK:
-You are a Network Operations analyst performing initial health assessment on a parsed
-network traffic capture.
-
-SUMMARY DATA:
-{pcap_summary_data}
-
-ANALYSIS TASKS:
-1. NETWORK HEALTH BASELINE: Review TCP health indicators (retransmissions, RSTs,
-   zero-window events). Calculate retransmission rate as a percentage of total TCP packets.
-   Rate the overall network health: HEALTHY (<1% retransmit), DEGRADED (1-5%),
-   or CRITICAL (>5%).
-2. CONNECTION FAILURE ANALYSIS: Review RST patterns. Identify which services or hosts
-   are generating the most connection resets. Distinguish between:
-   - Client-side RSTs (application crashes, timeouts)
-   - Server-side RSTs (service down, port blocked, connection limits)
-   - Firewall RSTs (security policy blocks)
-3. ICMP ERROR ASSESSMENT: Analyze ICMP error messages for routing issues, unreachable
-   hosts/services, and TTL expiry patterns that indicate routing loops.
-4. ROUTING LOOP DETECTION: Review the loop detection evidence:
-   - ICMP TTL Exceeded patterns: multiple routers generating TTL Exceeded for the same
-     destination is a classic routing loop signature. Identify the router IPs involved.
-   - Duplicate IP ID packets: the same packet seen with different TTL values means it
-     was captured multiple times while bouncing between routers. The TTL spread indicates
-     the hop count in the loop cycle.
-   - Elevated TTL Exceeded rate: normal networks have near-zero TTL Exceeded traffic.
-     Any sustained rate above 0.1% warrants investigation.
-   If loops are detected, identify the likely routing boundary (subnet/VLAN) and suggest
-   which routers to check for route table issues or redistribution loops.
-5. TOP ISSUE RANKING: Rank the top 3 operational issues by impact:
-   - CRITICAL: Active service outage, widespread packet loss, routing loops
-   - HIGH: Significant performance degradation, congestion indicators
-   - MEDIUM: Minor inefficiencies, configuration improvements needed
-   - LOW: Informational, optimization opportunities
-5. ARP HEALTH CHECK: Review ARP statistics for Layer 2 issues:
-   - ARP storm indicators (rate, % of traffic)
-   - IP address conflicts (same IP, multiple MACs) — identify affected IPs
-   - Gratuitous ARP anomalies — correlate with VRRP/HSRP failover events
-   - Unanswered ARP requests — dead hosts or wrong-subnet devices
-6. CONTROL PLANE CHECK: Review STP, HSRP/VRRP, OSPF, and EIGRP sections:
-   - STP: Are there TCN storms or root bridge changes? Flag root instability as CRITICAL.
-   - HSRP/VRRP: Any state transitions or priority changes? Each = a gateway failover.
-   - OSPF: Any neighbor hello gaps exceeding dead interval? Any LSUpdate bursts?
-   - EIGRP: Any queries (routes going ACTIVE)? High query count = convergence event.
-   Summarize control plane health as STABLE / CONVERGING / UNSTABLE.
-7. QUICK WINS: Recommend 2-3 immediate fixes a network engineer can implement.
-8. SUBNET IMPACT: Review the Subnet Anomaly Summary table. Call out the top 3 most
-   impacted /24 networks and explain what combination of indicators make them stand out.
-   For each, identify the specific IPs contributing most to the anomaly score.
-
-Keep response concise and action-oriented for NOC staff.
-
-End with:
-⚡ TL;DR
-- One-line network health verdict
-- Top 1-3 bullet points: most impactful operational issues
-"""
-
-NETOPS_HEALTH_PROMPT = """{system_identity}
-{alert_condition}
-{investigation_context}CURRENT TASK:
-You are a Senior Network Engineer performing deep network health analysis on parsed
-PCAP data to identify root causes of performance issues and infrastructure problems.
-
-SUMMARY DATA:
-{pcap_summary_data}
-
-ANALYSIS TASKS:
-1. TCP PERFORMANCE DEEP DIVE:
-   - Retransmission analysis: Which flows have the highest retransmission rates?
-     Are retransmissions concentrated on specific paths or distributed?
-   - Zero-window analysis: Which hosts are running out of receive buffer? Is this
-     an application-level issue (slow consumer) or host-level (memory pressure)?
-   - RST analysis: Map RST sources to determine if resets are from applications,
-     operating systems, or network devices (firewalls/load balancers).
-   - SYN vs established ratio: Are there half-open connections indicating
-     SYN floods, connection timeouts, or unresponsive services?
-2. ROUTING AND PATH ANALYSIS:
-   - TTL distribution: Group by expected hop counts (64, 128, 255 origins).
-     Identify outlier TTL values that suggest unusual routing paths.
-   - IP fragmentation: Assess fragmentation rate. If >1%, identify which flows
-     are fragmenting and the likely MTU mismatch points.
-   - ICMP redirect messages: Identify suboptimal routing being corrected.
-3. ARP AND LAYER 2 HEALTH:
-   - ARP storm detection: correlate ARP rate with traffic patterns. If ARP storm
-     is detected alongside high broadcast traffic, this confirms a Layer 2 loop.
-   - IP conflicts: for each conflicted IP, determine if the MACs belong to the
-     same vendor (OUI lookup hint). Two different vendor MACs = true conflict.
-     Same vendor MACs may indicate a virtualization issue (duplicate VM).
-   - Gratuitous ARP patterns: if concentrated in short bursts, likely failover.
-     If sustained, likely misconfiguration or device flapping.
-   - Map unanswered ARP targets to subnet ranges to identify dead subnets.
-4. DNS HEALTH:
-   - Failed DNS lookups (queries without matching responses).
-   - DNS response latency indicators.
-   - Excessive DNS query volume from specific hosts (misconfigured resolvers,
-     chatty applications, or DNS-based service discovery issues).
-4. ROUTING LOOP ANALYSIS: If loop indicators are present, perform deep analysis:
-   - Correlate TTL Exceeded sources (router IPs) to build a loop path diagram.
-     E.g., "Router A (10.0.1.1) → Router B (10.0.2.1) → Router A" indicates a
-     2-hop loop between those routers.
-   - Examine the TTL spread on duplicate packets: a spread of N indicates an N-hop
-     loop cycle. Decreasing TTL values confirm the direction of the loop.
-   - Check if loops are persistent (continuous TTL Exceeded) or transient (burst
-     during convergence). Transient loops during route changes are less critical.
-   - Common root causes: OSPF/EIGRP redistribution loops, static route conflicts,
-     spanning-tree loops (L2→L3 bleed), asymmetric routing with RPF failures,
-     or misconfigured policy-based routing.
-   - Estimate traffic impact: loop-affected packets consume bandwidth on every hop
-     in the cycle until TTL expires.
-5. CAPACITY AND UTILIZATION:
-   - Top bandwidth consumers (flows, hosts, protocols).
-   - Long-lived connections that may indicate stuck sessions.
-   - Protocol distribution anomalies (unexpected protocol ratios).
-6. CONTROL PLANE DEEP DIVE: If STP/HSRP/VRRP/OSPF/EIGRP data is present:
-   - STP: Correlate TCN count with ARP storms — both together confirm L2 loop.
-     If root bridge changed, estimate reconvergence time from BPDU timestamps.
-     Check if multiple bridges are contending for root (priority war).
-   - HSRP/VRRP: Map state transitions to a timeline. Rapid oscillation (>3
-     transitions/minute) indicates peer reachability issues (WAN flap, interface
-     flap, or timer misconfiguration). Check if all group members are visible.
-   - OSPF: Build neighbor adjacency map from Hello data. Identify dead neighbors
-     (hello gaps >40s). Correlate LSUpdate bursts with topology events.
-     Check for area mismatches if DB Description exchanges are failing.
-   - EIGRP: Calculate Query/Reply ratio. If queries >> replies, suspect SIA
-     condition. Map AS numbers to identify multi-AS boundary issues.
-   - Cross-protocol correlation: STP TCN + HSRP failover + OSPF neighbor reset
-     occurring together indicates a physical link failure cascading through all
-     layers. Build a timeline of control plane events.
-7. ROOT CAUSE HYPOTHESES: For each major issue found, propose the most likely
-   root cause and what additional data (SNMP, syslog, interface counters) would
-   confirm it.
-8. SUBNET IMPACT ANALYSIS: Use the Subnet Anomaly Summary to identify the most
-   impacted /24 networks. For each top-3 subnet:
-   - What combination of indicators (RSTs, retransmissions, ICMP errors, loops,
-     unanswered ARPs, IP conflicts) make it stand out?
-   - Which specific IPs in that subnet are the primary contributors?
-   - What is the likely root cause for that subnet specifically?
-   - Could a single event (power outage, link failure, device reboot) explain
-     the cluster of anomalies in that subnet?
-
-End with:
-⚡ TL;DR
-- One-line network health verdict
-- Top 1-3 bullet points: root causes and recommended fixes
-"""
-
-NETOPS_REPORT_PROMPT = """{system_identity}
-{alert_condition}
-{investigation_context}CURRENT TASK:
-You are a Network Operations Manager preparing a network health report for the
-infrastructure team and IT management.
-
-SUMMARY DATA:
-{pcap_summary_data}
-
-ANALYSIS TASKS:
-1. EXECUTIVE SUMMARY: Concise overview of network health status suitable for
-   IT management. Include overall health grade (A-F scale) with justification.
-2. KEY PERFORMANCE INDICATORS:
-   - TCP retransmission rate (% of total TCP packets)
-   - Connection success rate (SYN vs RST ratio)
-   - ICMP error rate
-   - IP fragmentation rate
-   - Zero-window event frequency
-   - ARP storm rate (pkt/s) and ARP-to-traffic ratio
-   - IP address conflict count
-   - STP TCN count, root bridge stability (stable/changed)
-   - HSRP/VRRP failover count
-   - OSPF dead neighbor events, LSUpdate burst count
-   - EIGRP query count, SIA risk level
-   Present each KPI with: current value, typical healthy range, and status
-   (GREEN/YELLOW/RED).
-3. PROBLEM AREAS: For each identified issue (including routing loops and control
-   plane events if detected):
-   - Affected hosts/subnets (for loops: the router IPs involved and destinations affected)
-   - Impact description (for loops: bandwidth waste, unreachable destinations, application
-     timeouts caused by packets being dropped after TTL expiry)
-   - Recommended remediation (for loops: specific routing protocol checks, route table
-     verification commands, convergence timer adjustments)
-   - For control plane issues: STP root bridge elections cause network-wide traffic
-     blackout (30-50s with legacy STP). HSRP/VRRP failovers cause 1-10s disruption
-     per VLAN. OSPF reconvergence causes micro-loops until SPF completes.
-   - Priority (P1-P4) — active routing loops and root bridge changes are P1/P2
-4. CONTROL PLANE HEALTH SUMMARY:
-   - STP: Root bridge stability, TCN rate, bridge count
-   - HSRP/VRRP: Failover events, group health, VIP availability
-   - OSPF: Adjacency health, convergence events, area topology
-   - EIGRP: Route stability, query volume, SIA risk
-   - Control plane stability grade: STABLE / CONVERGING / UNSTABLE
-5. CAPACITY PLANNING NOTES:
-   - Top bandwidth consumers
-   - Growth trends if visible from conversation patterns
-   - Links or paths that appear near capacity
-6. SUBNET IMPACT REPORT: Present the Subnet Anomaly Summary as a ranked table
-   of the most impacted /24 networks. For each top subnet, summarize:
-   - The primary anomaly indicators and their severity
-   - Specific affected hosts and their role in the anomalies
-   - Whether the anomaly cluster suggests a localized event (power outage,
-     link failure, device reboot) vs. a systemic issue
-7. RECOMMENDED MONITORING: What metrics should be continuously monitored
-   based on issues found. Suggest specific SNMP OIDs, syslog patterns,
-   or NetFlow fields to track.
-8. LIMITATIONS: What cannot be determined from this PCAP capture alone.
-
-Format as a professional network operations report.
-
-End with:
-⚡ TL;DR
-- Network health grade (A-F)
-- Top 1-3 bullet points: highest priority remediation items
-"""
-
 # Mode → (prompt_template, underlying_hunt_type, system_identity_override)
 MODE_CONFIG: dict[str, tuple[str, str | None, str | None]] = {
     "triage_summary": (TRIAGE_PROMPT, None, None),
@@ -621,10 +301,6 @@ MODE_CONFIG: dict[str, tuple[str, str | None, str | None]] = {
     "ot_triage": (OT_TRIAGE_PROMPT, None, PCAP_OT_SYSTEM_IDENTITY),
     "ot_threat_hunt": (OT_THREAT_HUNT_PROMPT, None, PCAP_OT_SYSTEM_IDENTITY),
     "ot_report": (OT_REPORTING_PROMPT, None, PCAP_OT_SYSTEM_IDENTITY),
-    # Network Operations / Infrastructure Health modes
-    "netops_triage": (NETOPS_TRIAGE_PROMPT, None, PCAP_NETOPS_SYSTEM_IDENTITY),
-    "netops_health": (NETOPS_HEALTH_PROMPT, None, PCAP_NETOPS_SYSTEM_IDENTITY),
-    "netops_report": (NETOPS_REPORT_PROMPT, None, PCAP_NETOPS_SYSTEM_IDENTITY),
 }
 
 
@@ -687,109 +363,17 @@ _CORP_PORTS = {53, 88, 135, 139, 389, 445, 636, 3389, 5985, 5986}
 # DMZ ports → "DMZ"
 _DMZ_PORTS = {80, 443, 8080, 8443, 25, 587, 993, 995}
 
-# Keyword→Purdue zone mapping for network reference files
-_SUBNET_ZONE_KEYWORDS: list[tuple[str, str]] = [
-    # Order matters: more specific patterns first
-    (r"SCADA|ICS|PLC|RTU|HMI|DCS|SIS|Modbus|DNP3|OPC|BACnet"
-     r"|Compressor|Dehy|Gathering|Pipeline", "SCADA"),
-    (r"Control|Field|Process|Safety", "CONTROL/FIELD"),
-    (r"\bIDMZ\b|\bDMZ\b", "DMZ"),
-    (r"Corporate|Office|Desktop|User|Workstation", "Corporate"),
-]
-
-
-def _parse_network_zones_from_artifacts(context: Any) -> dict[_ipaddress.IPv4Network, str]:
-    """Parse loaded --networks artifacts for CIDR→Purdue zone mappings.
-
-    Scans artifacts tagged with metadata["network_reference"]=True for lines
-    containing a valid CIDR prefix followed by a description with a zone keyword.
-    Returns a dict mapping IPv4Network → zone string, sorted longest-prefix-first
-    so lookup does most-specific match.
-    """
-    if not context or not hasattr(context, "artifacts"):
-        return {}
-
-    zone_map: dict[_ipaddress.IPv4Network, str] = {}
-    cidr_re = _re.compile(r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2})")
-
-    # Compile zone keyword patterns once
-    compiled_kw = [(_re.compile(pat, _re.IGNORECASE), zone)
-                   for pat, zone in _SUBNET_ZONE_KEYWORDS]
-
-    for artifact in context.artifacts:
-        meta = getattr(artifact, "metadata", {}) or {}
-        if not meta.get("network_reference"):
-            continue
-        file_path = getattr(artifact, "file_path", None)
-        if not file_path:
-            continue
-        try:
-            with open(file_path, "r", encoding="utf-8") as fh:
-                for line in fh:
-                    m = cidr_re.search(line)
-                    if not m:
-                        continue
-                    try:
-                        net = _ipaddress.IPv4Network(m.group(1), strict=False)
-                    except (ValueError, _ipaddress.AddressValueError):
-                        continue
-                    # Match description against zone keywords
-                    desc = line[m.end():]  # text after the CIDR
-                    for kw_re, zone in compiled_kw:
-                        if kw_re.search(desc):
-                            zone_map[net] = zone
-                            break
-        except Exception:
-            pass  # skip unreadable files
-
-    if zone_map:
-        n = len(zone_map)
-        print(f"  🗺️  Network reference loaded: {n} subnet→zone mappings")
-
-    return zone_map
-
-
-def _lookup_subnet_zone(
-    ip: str,
-    subnet_zones: dict[_ipaddress.IPv4Network, str],
-) -> str | None:
-    """Return the Purdue zone for an IP based on loaded subnet mappings.
-
-    Uses longest-prefix (most specific) match.  Returns None if no match.
-    """
-    if not subnet_zones:
-        return None
-    try:
-        addr = _ipaddress.IPv4Address(ip)
-    except (ValueError, _ipaddress.AddressValueError):
-        return None
-    best_match: str | None = None
-    best_prefix = -1
-    for net, zone in subnet_zones.items():
-        if addr in net and net.prefixlen > best_prefix:
-            best_match = zone
-            best_prefix = net.prefixlen
-    return best_match
-
 # Purdue zone definitions and visual layout
 _PURDUE_ZONES = [
-    ("External",      "#1a5276",  0.88),   # dark blue (parent container)
-    ("Corporate",     "#e67e22",  0.67),   # orange
-    ("DMZ",           "#27ae60",  0.48),   # green
-    ("SCADA",         "#8e44ad",  0.29),   # purple
-    ("CONTROL/FIELD", "#2980b9",  0.10),   # blue
-]
-
-# Sub-zones within External (rendered as inner boxes)
-_EXTERNAL_SUBZONES = [
-    ("Ext_Infra",  "Multicast/Broadcast/APIPA", "#85c1e9", 0.05),  # left side
-    ("Ext_Public", "Public Internet",           "#aed6f1", 0.95),  # right side
+    ("External",      "#1a5276",  0.95),   # dark blue
+    ("Corporate",     "#e67e22",  0.76),   # orange
+    ("DMZ",           "#27ae60",  0.57),   # green
+    ("SCADA",         "#8e44ad",  0.38),   # purple
+    ("CONTROL/FIELD", "#2980b9",  0.19),   # blue
 ]
 
 _ZONE_BG_COLORS = {
     "External":      "#d6eaf8",
-    "Ext_Infra":     "#ebf5fb",
-    "Ext_Public":    "#ebf5fb",
     "Corporate":     "#fdebd0",
     "DMZ":           "#d5f5e3",
     "SCADA":         "#f4ecf7",
@@ -797,41 +381,12 @@ _ZONE_BG_COLORS = {
 }
 
 
-def _is_infra_local(ip: str) -> bool:
-    """Return True if IP is multicast, broadcast, or link-local (not real external)."""
-    return (
-        ip.startswith("224.") or ip.startswith("225.") or ip.startswith("226.")
-        or ip.startswith("239.")              # multicast
-        or ip.startswith("255.")              # broadcast
-        or ip.startswith("169.254.")          # APIPA / link-local
-        or ip == "0.0.0.0"
-    )
-
-
-def _classify_ip_zone(
-    ip: str,
-    session: Any,
-    subnet_zones: dict | None = None,
-) -> str:
-    """Classify an IP into a Purdue zone.
-
-    If *subnet_zones* is provided (from a ``--networks`` reference file),
-    subnet-based classification takes priority over port heuristics.
-    """
+def _classify_ip_zone(ip: str, session: Any) -> str:
+    """Classify an IP into a Purdue zone based on traffic patterns."""
     from plugins.network_forensics.pcap_metadata_summary.tool import is_internal
 
     if not is_internal(ip):
-        if _is_infra_local(ip):
-            return "Ext_Infra"
-        return "Ext_Public"
-
-    # --- Subnet-based classification (highest priority) ---
-    if subnet_zones:
-        zone = _lookup_subnet_zone(ip, subnet_zones)
-        if zone:
-            return zone
-
-    # --- Port-heuristic fallback ---
+        return "External"
 
     # Gather ports this IP connects TO (client) vs SERVES (server)
     dst_ports: set[int] = set()   # ports this IP connects to as client
@@ -870,11 +425,8 @@ def _classify_ip_zone(
     return "Corporate"
 
 
-def _render_purdue_zone_graph(session: Any, context: Any = None) -> bytes | None:
+def _render_purdue_zone_graph(session: Any) -> bytes | None:
     """Render a Purdue model zone traffic diagram as PNG bytes.
-
-    If *context* is provided and contains artifacts loaded with ``--networks``,
-    subnet-to-zone mappings override port-based heuristics.
 
     Returns PNG image bytes or None if matplotlib is not available.
     """
@@ -889,9 +441,6 @@ def _render_purdue_zone_graph(session: Any, context: Any = None) -> bytes | None
 
     from plugins.network_forensics.pcap_metadata_summary.tool import is_internal
 
-    # --- Parse subnet-to-zone mappings from --networks artifacts ---
-    subnet_zones = _parse_network_zones_from_artifacts(context)
-
     # --- Classify all IPs into zones, then group by /24 network ---
     all_ips: set[str] = set()
     for (src, dst, dport, proto), stats in session.conversations.items():
@@ -900,7 +449,7 @@ def _render_purdue_zone_graph(session: Any, context: Any = None) -> bytes | None
 
     ip_zones: dict[str, str] = {}
     for ip in all_ips:
-        ip_zones[ip] = _classify_ip_zone(ip, session, subnet_zones=subnet_zones)
+        ip_zones[ip] = _classify_ip_zone(ip, session)
 
     # Group IPs into /24 networks and assign zone by majority vote
     from collections import Counter as _Counter
@@ -914,17 +463,11 @@ def _render_purdue_zone_graph(session: Any, context: Any = None) -> bytes | None
     # Zone assignment per /24 — majority of IPs in that subnet
     net_zones: dict[str, str] = {}
     zone_nets: dict[str, list[str]] = {z[0]: [] for z in _PURDUE_ZONES}
-    zone_nets["Ext_Infra"] = []
-    zone_nets["Ext_Public"] = []
     for net, ips in network_ips.items():
         zone_votes = _Counter(ip_zones[ip] for ip in ips)
         zone = zone_votes.most_common(1)[0][0]
         net_zones[net] = zone
-        if zone in ("Ext_Infra", "Ext_Public"):
-            zone_nets[zone].append(net)
-            zone_nets["External"].append(net)  # also track in parent
-        else:
-            zone_nets[zone].append(net)
+        zone_nets[zone].append(net)
 
     # --- Aggregate traffic between /24 networks ---
     net_pair_bytes: dict[tuple[str, str], int] = {}
@@ -939,8 +482,8 @@ def _render_purdue_zone_graph(session: Any, context: Any = None) -> bytes | None
     # Zone-to-zone aggregate for byte labels
     zone_flows: dict[tuple[str, str], int] = {}
     for (net_a, net_b), total_bytes in net_pair_bytes.items():
-        z_a = net_zones.get(net_a, "Ext_Public")
-        z_b = net_zones.get(net_b, "Ext_Public")
+        z_a = net_zones.get(net_a, "External")
+        z_b = net_zones.get(net_b, "External")
         if z_a == z_b:
             continue
         key = (z_a, z_b)
@@ -952,9 +495,9 @@ def _render_purdue_zone_graph(session: Any, context: Any = None) -> bytes | None
     max_bytes = max(zone_flows.values()) if zone_flows else 1
 
     # --- Draw the diagram ---
-    fig, ax = plt.subplots(figsize=(11, 8))
+    fig, ax = plt.subplots(figsize=(10, 7))
     ax.set_xlim(0, 1)
-    ax.set_ylim(-0.02, 1.0)
+    ax.set_ylim(0, 1)
     ax.set_aspect("auto")
     ax.axis("off")
     fig.patch.set_facecolor("white")
@@ -986,68 +529,9 @@ def _render_purdue_zone_graph(session: Any, context: Any = None) -> bytes | None
         zone_rects[zone_name] = (zone_margin, y_bottom,
                                  1 - 2 * zone_margin, zone_height)
 
-    # Draw External sub-zone boxes (inside the External zone)
-    ext_y = zone_y.get("External", 0.95)
-    sub_box_height = zone_height * 0.55
-    # Position sub-boxes below the External label (leave room at top)
-    sub_box_top = ext_y - zone_height / 2 + 0.01
-    # Available width inside External box, split into two sub-boxes with a gap
-    inner_left = zone_margin + 0.015
-    inner_right = 1 - zone_margin - 0.015
-    inner_width = inner_right - inner_left
-    sub_gap = 0.03  # gap between the two sub-boxes
-    sub_width = (inner_width - sub_gap) / 2
-    for idx, (sub_zone, sub_label, sub_border, _x_center) in enumerate(_EXTERNAL_SUBZONES):
-        sub_x = inner_left + idx * (sub_width + sub_gap)
-        sub_bg = _ZONE_BG_COLORS[sub_zone]
-
-        sub_rect = mpatches.FancyBboxPatch(
-            (sub_x, sub_box_top), sub_width, sub_box_height,
-            boxstyle="round,pad=0.008",
-            linewidth=1.5, edgecolor=sub_border,
-            facecolor=sub_bg, alpha=0.7,
-            linestyle="--",
-        )
-        ax.add_patch(sub_rect)
-
-        # Sub-zone label
-        ax.text(sub_x + 0.01, sub_box_top + sub_box_height - 0.008,
-                sub_label, fontsize=7.5, fontstyle="italic",
-                color=sub_border, va="top")
-
-        zone_y[sub_zone] = sub_box_top + sub_box_height / 2
-        zone_rects[sub_zone] = (sub_x, sub_box_top, sub_width, sub_box_height)
-
-    # Place /24 network nodes within their zones (sub-zones for External)
+    # Place /24 network nodes within their zones
     node_positions: dict[str, tuple[float, float]] = {}
-
-    # Place External sub-zone nodes (centered vertically in sub-boxes)
-    ext_node_y = sub_box_top + sub_box_height / 2
-    for idx, (sub_zone, sub_label, sub_border, _x_center) in enumerate(_EXTERNAL_SUBZONES):
-        nets = sorted(zone_nets[sub_zone])
-        if not nets:
-            continue
-        sub_x_node = inner_left + idx * (sub_width + sub_gap)
-        n = len(nets)
-        max_show = min(n, 6)
-        for i, net in enumerate(nets[:max_show]):
-            x = sub_x_node + 0.02 + (i + 0.5) * ((sub_width - 0.04) / max_show)
-            y = ext_node_y
-            node_positions[net] = (x, y)
-            ax.plot(x, y, "o", color="#2c3e50", markersize=5, zorder=5)
-            label = net + ".x"
-            ax.text(x, y - 0.022, label, fontsize=4.8,
-                    ha="center", va="top", color="#2c3e50",
-                    rotation=20)
-        if n > max_show:
-            ax.text(sub_x_node + sub_width - 0.03, ext_node_y, f"+{n - max_show}",
-                    fontsize=8, ha="center", va="center",
-                    color="#7f8c8d", style="italic")
-
-    # Place non-External zone nodes
     for zone_name, _, y_center in _PURDUE_ZONES:
-        if zone_name == "External":
-            continue
         nets = sorted(zone_nets[zone_name])
         if not nets:
             continue
@@ -1073,8 +557,8 @@ def _render_purdue_zone_graph(session: Any, context: Any = None) -> bytes | None
     # --- Draw /24-to-/24 traffic flow edges (cross-zone only) ---
     cross_zone_flows: list[tuple[str, str, int]] = []
     for (net_a, net_b), total_bytes in net_pair_bytes.items():
-        zone_a = net_zones.get(net_a, "Ext_Public")
-        zone_b = net_zones.get(net_b, "Ext_Public")
+        zone_a = net_zones.get(net_a, "External")
+        zone_b = net_zones.get(net_b, "External")
         if zone_a == zone_b:
             continue
         cross_zone_flows.append((net_a, net_b, total_bytes))
@@ -1085,8 +569,8 @@ def _render_purdue_zone_graph(session: Any, context: Any = None) -> bytes | None
         max_flow = 1
 
     for net_a, net_b, total_bytes in sorted(cross_zone_flows, key=lambda x: x[2]):
-        zone_a = net_zones.get(net_a, "Ext_Public")
-        zone_b = net_zones.get(net_b, "Ext_Public")
+        zone_a = net_zones.get(net_a, "External")
+        zone_b = net_zones.get(net_b, "External")
 
         ax_pos = node_positions.get(net_a, (0.5, zone_y.get(zone_a, 0.5)))
         bx_pos = node_positions.get(net_b, (0.5, zone_y.get(zone_b, 0.5)))
@@ -1143,19 +627,6 @@ def _render_purdue_zone_graph(session: Any, context: Any = None) -> bytes | None
     ]
     # Zone /24 network counts
     for zone_name, _, _ in _PURDUE_ZONES:
-        if zone_name == "External":
-            # Show sub-zone breakdown
-            n_infra = len(zone_nets["Ext_Infra"])
-            n_public = len(zone_nets["Ext_Public"])
-            if n_infra + n_public > 0:
-                legend_elements.append(
-                    mpatches.Patch(
-                        facecolor=_ZONE_BG_COLORS["External"],
-                        edgecolor="#7f8c8d",
-                        label=f"External: {n_public} public, {n_infra} infra/local",
-                    )
-                )
-            continue
         n = len(zone_nets[zone_name])
         if n > 0:
             legend_elements.append(
@@ -1190,7 +661,6 @@ def _export_pdf(
     mode: str = "",
     condition_orange: bool = False,
     session: Any | None = None,
-    context: Any | None = None,
 ) -> Path | None:
     """Render a professional, executive-readable PDF report using fpdf2."""
     try:
@@ -1241,9 +711,6 @@ def _export_pdf(
         pdf.set_font("Helvetica", "B", 22)
         if mode.startswith("ot_"):
             pdf.cell(0, 10, "OT / ICS  PCAP Analysis Report", align="C",
-                     new_x="LMARGIN", new_y="NEXT")
-        elif mode.startswith("netops_"):
-            pdf.cell(0, 10, "Network Operations Health Report", align="C",
                      new_x="LMARGIN", new_y="NEXT")
         else:
             pdf.cell(0, 10, "PCAP AI Analysis Report", align="C",
@@ -1327,7 +794,7 @@ def _export_pdf(
         # PURDUE ZONE TRAFFIC DIAGRAM (OT reports only)
         # ===================================================================
         if mode.startswith("ot_") and session is not None:
-            graph_png = _render_purdue_zone_graph(session, context=context)
+            graph_png = _render_purdue_zone_graph(session)
             if graph_png:
                 import tempfile
                 pdf.add_page()
@@ -1674,8 +1141,7 @@ def _export_pdf(
             is_data_heavy = any(tag in sec_title for tag in _DATA_HEAVY_SECTIONS)
             # Identify the AI analysis section (most important)
             is_ai_section = ("AI ANALYSIS" in sec_title.upper()
-                             or "OT/ICS ANALYSIS" in sec_title.upper()
-                             or "NETWORK OPERATIONS ANALYSIS" in sec_title.upper())
+                             or "OT/ICS ANALYSIS" in sec_title.upper())
 
             # Section header colour
             if is_ai_section:
@@ -2245,19 +1711,15 @@ class PcapAiAnalyzer:
         mode = payload["mode"]
         condition_orange = payload.get("condition_orange", False)
         is_ot_mode = mode.startswith("ot_")
-        is_netops_mode = mode.startswith("netops_")
 
         # Also check context.config for condition_orange (set by CLI --orange flag)
         if not condition_orange and hasattr(context, "config"):
             condition_orange = context.config.get("condition_orange", False)
 
         try:
-            # Step 1: Get static output (OT modes get OT-enriched summary,
-            #         NetOps modes get network health summary)
+            # Step 1: Get static output (OT modes get OT-enriched summary)
             if is_ot_mode:
                 static_output = self._get_ot_static_output(session)
-            elif is_netops_mode:
-                static_output = self._get_netops_static_output(session)
             else:
                 static_output = self._get_static_output(session, mode, payload)
 
@@ -2327,12 +1789,7 @@ class PcapAiAnalyzer:
                 )
 
             ai_text = response.text or ""
-            if is_ot_mode:
-                mode_label = "OT/ICS ANALYSIS"
-            elif is_netops_mode:
-                mode_label = "NETWORK OPERATIONS ANALYSIS"
-            else:
-                mode_label = "AI ANALYSIS"
+            mode_label = f"OT/ICS ANALYSIS" if is_ot_mode else "AI ANALYSIS"
             combined = (
                 static_output
                 + "\n\n" + "=" * 60 + "\n"
@@ -2362,7 +1819,6 @@ class PcapAiAnalyzer:
                     mode=mode,
                     condition_orange=condition_orange,
                     session=session,
-                    context=context,
                 )
 
             # Register the markdown file as an artifact
@@ -2680,790 +2136,7 @@ class PcapAiAnalyzer:
         return "\n".join(lines)
 
     @staticmethod
-    def _get_netops_static_output(session: Any) -> str:
-        """Build network operations / infrastructure health static summary."""
-        from plugins.network_forensics.pcap_metadata_summary.tool import (
-            is_internal, _format_bytes,
-        )
-        from collections import Counter, defaultdict
-
-        lines = []
-
-        # --- Standard PCAP header (no security items for netops) ---
-        header = PcapAiAnalyzer._build_pcap_header(session, netops=True)
-        lines.append(header)
-
-        # --- TCP Health Overview ---
-        tcp_total = session.protocols.get("TCP", 0)
-        lines.append(f"\n{'=' * 60}")
-        lines.append("TCP HEALTH INDICATORS")
-        lines.append(f"{'=' * 60}")
-
-        if tcp_total > 0:
-            retransmit_pct = (session.tcp_retransmissions / tcp_total * 100) if tcp_total else 0
-            rst_pct = (session.tcp_rst_count / tcp_total * 100) if tcp_total else 0
-
-            # Health grade
-            if retransmit_pct < 1:
-                health = "HEALTHY"
-            elif retransmit_pct < 5:
-                health = "DEGRADED"
-            else:
-                health = "CRITICAL"
-
-            lines.append(f"\nOverall TCP Health: {health}")
-            lines.append(f"  Total TCP packets: {tcp_total:,}")
-            lines.append(f"  SYN packets: {session.tcp_syn_count:,}")
-            lines.append(f"  FIN packets: {session.tcp_fin_count:,}")
-            lines.append(f"  RST packets: {session.tcp_rst_count:,} ({rst_pct:.2f}%)")
-            lines.append(f"  Retransmissions: {session.tcp_retransmissions:,} ({retransmit_pct:.2f}%)")
-            lines.append(f"  Zero-window events: {session.tcp_zero_window_count:,}")
-
-            # SYN/FIN ratio (indicates connection completion rate)
-            if session.tcp_syn_count > 0:
-                completion = session.tcp_fin_count / session.tcp_syn_count * 100
-                lines.append(f"  Connection completion rate (FIN/SYN): {completion:.1f}%")
-
-            # RST/SYN ratio (indicates connection failure rate)
-            if session.tcp_syn_count > 0:
-                failure = session.tcp_rst_count / session.tcp_syn_count * 100
-                lines.append(f"  Connection failure rate (RST/SYN): {failure:.1f}%")
-        else:
-            lines.append("\nNo TCP traffic in this capture.")
-
-        # --- Conversations with most health issues ---
-        if session.conv_health:
-            # Sort by total issues (RST + retransmit + zero_window)
-            problem_convs = sorted(
-                session.conv_health.items(),
-                key=lambda x: x[1]["rst"] + x[1]["retransmit"] + x[1]["zero_window"],
-                reverse=True,
-            )
-            top_problem = [c for c in problem_convs
-                           if c[1]["rst"] + c[1]["retransmit"] + c[1]["zero_window"] > 0][:20]
-
-            if top_problem:
-                lines.append(f"\n{'=' * 60}")
-                lines.append("TOP PROBLEM CONVERSATIONS")
-                lines.append(f"{'=' * 60}")
-                lines.append(
-                    f"{'#':<4} {'Source':<18} {'Destination':<18} {'Port':<7} "
-                    f"{'RSTs':<7} {'Retx':<7} {'ZeroWin':<8} {'Pkts':<8}"
-                )
-                lines.append("-" * 85)
-                for i, ((src, dst, dport, proto), health) in enumerate(top_problem, 1):
-                    conv_stats = session.conversations.get((src, dst, dport, proto), {})
-                    pkts = conv_stats.get("packets", 0)
-                    lines.append(
-                        f"{i:<4} {src:<18} {dst:<18} {dport:<7} "
-                        f"{health['rst']:<7} {health['retransmit']:<7} "
-                        f"{health['zero_window']:<8} {pkts:<8}"
-                    )
-
-        # --- ICMP Errors ---
-        if session.icmp_errors:
-            lines.append(f"\n{'=' * 60}")
-            lines.append(f"ICMP ERROR MESSAGES: {len(session.icmp_errors):,}")
-            lines.append(f"{'=' * 60}")
-
-            # Group by type
-            icmp_by_type = defaultdict(list)
-            for err in session.icmp_errors:
-                icmp_by_type[err["description"]].append(err)
-
-            for desc, errors in sorted(icmp_by_type.items(), key=lambda x: len(x[1]), reverse=True):
-                lines.append(f"\n  {desc}: {len(errors):,} occurrence(s)")
-                # Show affected source → destination pairs
-                pairs = Counter((e["src"], e["dst"]) for e in errors)
-                for (src, dst), count in pairs.most_common(10):
-                    lines.append(f"    {src} → {dst}  ({count} times)")
-                if len(pairs) > 10:
-                    lines.append(f"    ... +{len(pairs) - 10} more pairs")
-        else:
-            lines.append(f"\n{'=' * 60}")
-            lines.append("ICMP ERROR MESSAGES")
-            lines.append(f"{'=' * 60}")
-            lines.append("No ICMP error messages detected.")
-
-        # --- Routing Loop Detection ---
-        has_loop_evidence = False
-        lines.append(f"\n{'=' * 60}")
-        lines.append("ROUTING LOOP DETECTION")
-        lines.append(f"{'=' * 60}")
-
-        # Evidence 1: ICMP TTL Exceeded grouped by original destination
-        if session.ttl_exceeded_by_dest:
-            # A loop is indicated when multiple different routers generate
-            # TTL Exceeded for the same destination — the packet bounces
-            # between routers until TTL expires
-            loop_suspects = []
-            for orig_dst, entries in session.ttl_exceeded_by_dest.items():
-                routers = set(e["router"] for e in entries)
-                sources = set(e["original_src"] for e in entries)
-                count = len(entries)
-                if len(routers) >= 2 or count >= 5:
-                    # Multiple routers or high volume = strong loop signal
-                    loop_suspects.append({
-                        "destination": orig_dst,
-                        "routers": sorted(routers),
-                        "original_sources": sorted(sources),
-                        "ttl_exceeded_count": count,
-                        "confidence": "HIGH" if len(routers) >= 2 and count >= 5 else "MEDIUM",
-                    })
-
-            if loop_suspects:
-                has_loop_evidence = True
-                loop_suspects.sort(key=lambda x: x["ttl_exceeded_count"], reverse=True)
-                lines.append(f"\n  🔴 SUSPECTED ROUTING LOOPS (ICMP TTL Exceeded analysis):")
-                lines.append(f"  Found {len(loop_suspects)} destination(s) with loop indicators")
-                for ls in loop_suspects[:10]:
-                    lines.append(f"\n  Destination: {ls['destination']}  "
-                                 f"[Confidence: {ls['confidence']}]")
-                    lines.append(f"    TTL Exceeded count: {ls['ttl_exceeded_count']}")
-                    lines.append(f"    Routers generating TTL Exceeded: "
-                                 f"{', '.join(ls['routers'][:8])}")
-                    if len(ls['routers']) > 8:
-                        lines.append(f"      ... +{len(ls['routers']) - 8} more routers")
-                    lines.append(f"    Original sources: "
-                                 f"{', '.join(ls['original_sources'][:5])}")
-                    if ls['confidence'] == "HIGH":
-                        lines.append(f"    ⚠️  Multiple routers ({len(ls['routers'])}) "
-                                     f"dropping same-dest packets — classic loop signature")
-            else:
-                # TTL exceeded present but no loop pattern
-                ttl_exc_total = sum(len(v) for v in session.ttl_exceeded_by_dest.values())
-                if ttl_exc_total > 0:
-                    lines.append(f"\n  ICMP TTL Exceeded: {ttl_exc_total} message(s) "
-                                 f"— no definitive loop pattern detected")
-
-        # Evidence 2: Duplicate IP ID packets (same packet seen with different TTLs)
-        if session.suspected_loop_packets:
-            has_loop_evidence = True
-            # Group by (src, dst, proto) to identify affected paths
-            loop_paths: dict = defaultdict(list)
-            for pkt_info in session.suspected_loop_packets:
-                path_key = (pkt_info["src"], pkt_info["dst"], pkt_info["proto"])
-                loop_paths[path_key].append(pkt_info)
-
-            lines.append(f"\n  🔴 DUPLICATE PACKETS (same IP ID, different TTLs):")
-            lines.append(f"  {len(session.suspected_loop_packets)} duplicate packet(s) "
-                         f"across {len(loop_paths)} path(s)")
-            for (src, dst, proto), pkts in sorted(
-                loop_paths.items(), key=lambda x: len(x[1]), reverse=True
-            )[:10]:
-                ttls_seen = sorted(set(p["ttl"] for p in pkts) |
-                                   set(t for p in pkts for t in p["prev_ttls"]))
-                lines.append(f"\n    {src} → {dst} ({proto}): "
-                             f"{len(pkts)} duplicate(s)")
-                lines.append(f"      TTL values seen: {', '.join(str(t) for t in ttls_seen[:10])}")
-                if len(ttls_seen) > 2:
-                    ttl_diff = max(ttls_seen) - min(ttls_seen)
-                    lines.append(f"      TTL spread: {ttl_diff} hops — "
-                                 f"suggests {ttl_diff}-hop loop cycle")
-
-        # Evidence 3: High ICMP TTL Exceeded rate relative to traffic
-        ttl_exc_errors = [e for e in session.icmp_errors if e["type"] == 11]
-        if ttl_exc_errors and session.packet_count > 0:
-            ttl_exc_pct = len(ttl_exc_errors) / session.packet_count * 100
-            if ttl_exc_pct > 0.1:  # >0.1% of all packets are TTL exceeded = abnormal
-                has_loop_evidence = True
-                lines.append(f"\n  ⚠️  TTL Exceeded rate: {ttl_exc_pct:.3f}% of all traffic "
-                             f"({len(ttl_exc_errors):,} messages)")
-                lines.append(f"      Normal rate is near 0% — elevated rate "
-                             f"indicates routing instability or loops")
-
-        if not has_loop_evidence:
-            lines.append("\n  ✅ No routing loop indicators detected.")
-
-        # --- ARP Health ---
-        total_arp = session.arp_request_count + session.arp_reply_count
-        lines.append(f"\n{'=' * 60}")
-        lines.append("ARP HEALTH")
-        lines.append(f"{'=' * 60}")
-
-        if total_arp > 0:
-            lines.append(f"\n  Total ARP packets: {total_arp:,}")
-            lines.append(f"  ARP Requests: {session.arp_request_count:,}")
-            lines.append(f"  ARP Replies: {session.arp_reply_count:,}")
-            lines.append(f"  Gratuitous ARP: {session.arp_gratuitous_count:,}")
-
-            # Request/Reply ratio (healthy networks have roughly balanced ARP)
-            if session.arp_reply_count > 0:
-                req_reply_ratio = session.arp_request_count / session.arp_reply_count
-                lines.append(f"  Request/Reply ratio: {req_reply_ratio:.1f}:1")
-                if req_reply_ratio > 5:
-                    lines.append("  ⚠️  High request/reply ratio — many unanswered ARPs "
-                                 "(dead hosts, wrong subnet, or ARP scan)")
-            elif session.arp_request_count > 10:
-                lines.append("  ⚠️  ARP requests with ZERO replies — network isolation "
-                             "or capture point issue")
-
-            # ARP rate (packets per second)
-            if len(session._arp_timestamps) >= 2:
-                arp_duration = max(session._arp_timestamps) - min(session._arp_timestamps)
-                if arp_duration > 0:
-                    arp_rate = total_arp / arp_duration
-                    lines.append(f"  ARP rate: {arp_rate:.1f} pkt/s")
-                    if arp_rate > 100:
-                        lines.append("  🔴 ARP STORM detected — >100 ARP/s indicates "
-                                     "broadcast storm or L2 loop")
-                    elif arp_rate > 30:
-                        lines.append("  ⚠️  Elevated ARP rate — possible ARP scan or "
-                                     "unstable L2 network")
-
-            # ARP-to-total-traffic ratio
-            if session.packet_count > 0:
-                arp_pct = total_arp / session.packet_count * 100
-                lines.append(f"  ARP as % of total traffic: {arp_pct:.2f}%")
-                if arp_pct > 5:
-                    lines.append("  ⚠️  ARP exceeds 5% of traffic — abnormal for "
-                                 "most networks (check for broadcast storm)")
-
-            # Top ARP senders (potential scanners or storm sources)
-            if session.arp_requests_by_src:
-                top_senders = session.arp_requests_by_src.most_common(10)
-                lines.append(f"\n  Top ARP requesters (by MAC):")
-                for mac, count in top_senders:
-                    pct_of_arp = count / session.arp_request_count * 100
-                    marker = ""
-                    if count > 100 and pct_of_arp > 30:
-                        marker = "  🔴 FLOOD SOURCE"
-                    elif count > 50:
-                        marker = "  ⚠️  HIGH"
-                    lines.append(f"    {mac}: {count:,} requests ({pct_of_arp:.1f}%){marker}")
-
-            # IP Address Conflicts (same IP claimed by multiple MACs)
-            conflicts = {ip: macs for ip, macs in session.arp_ip_to_macs.items()
-                         if len(macs) > 1}
-            if conflicts:
-                lines.append(f"\n  🔴 IP ADDRESS CONFLICTS: {len(conflicts)} IP(s) "
-                             f"claimed by multiple MACs")
-                for ip, macs in sorted(conflicts.items(),
-                                       key=lambda x: len(x[1]), reverse=True)[:15]:
-                    mac_list = ", ".join(sorted(macs))
-                    lines.append(f"    {ip} → {len(macs)} MACs: {mac_list}")
-                    if len(macs) == 2:
-                        lines.append(f"      Possible: IP conflict, VRRP/HSRP failover, "
-                                     f"or duplicate addressing")
-                    elif len(macs) > 2:
-                        lines.append(f"      ⚠️  {len(macs)} MACs for one IP is highly "
-                                     f"abnormal — likely misconfiguration or device flapping")
-
-            # Unanswered ARP requests (targets that never replied)
-            unanswered = {ip: count for ip, count in session._arp_request_targets.items()
-                          if ip not in session._arp_reply_targets and count >= 2}
-            if unanswered:
-                top_unanswered = sorted(unanswered.items(), key=lambda x: x[1], reverse=True)
-                lines.append(f"\n  UNANSWERED ARP TARGETS: {len(unanswered)} IP(s) "
-                             f"never replied")
-                for ip, count in top_unanswered[:15]:
-                    lines.append(f"    {ip}: {count} unanswered request(s)")
-                if len(unanswered) > 15:
-                    lines.append(f"    ... +{len(unanswered) - 15} more")
-
-            # Gratuitous ARP analysis
-            if session.arp_gratuitous_count > 10:
-                lines.append(f"\n  ⚠️  {session.arp_gratuitous_count} gratuitous ARPs "
-                             f"— possible VRRP/HSRP flapping or gateway failover")
-        else:
-            lines.append("\n  No ARP traffic captured.")
-            lines.append("  (Capture may be from a routed interface or span port "
-                         "that strips L2 headers)")
-
-        # --- Control Plane & Topology ---
-        has_control_plane = (
-            session.stp_bpdu_count + session.stp_tcn_count > 0
-            or session.hsrp_hello_count > 0
-            or session.vrrp_advert_count > 0
-            or session.ospf_total_count > 0
-            or session.eigrp_total_count > 0
-        )
-
-        lines.append(f"\n{'=' * 60}")
-        lines.append("CONTROL PLANE & TOPOLOGY")
-        lines.append(f"{'=' * 60}")
-
-        if not has_control_plane:
-            lines.append("\n  No control plane protocol traffic detected.")
-            lines.append("  (STP, HSRP, VRRP, OSPF, EIGRP — none captured)")
-        else:
-            # --- STP ---
-            total_stp = session.stp_bpdu_count + session.stp_tcn_count
-            if total_stp > 0:
-                lines.append(f"\n  SPANNING TREE PROTOCOL (STP)")
-                lines.append(f"  {'─' * 40}")
-                lines.append(f"  Config BPDUs: {session.stp_bpdu_count:,}")
-                lines.append(f"  TCN BPDUs (Topology Change Notifications): "
-                             f"{session.stp_tcn_count:,}")
-                lines.append(f"  BPDUs with TC flag set: {session.stp_tc_flag_count:,}")
-
-                # Root bridge stability
-                root_bridges = list(session.stp_root_bridges.keys())
-                if len(root_bridges) == 1:
-                    lines.append(f"  Root Bridge: {root_bridges[0]} (stable)")
-                elif len(root_bridges) > 1:
-                    lines.append(f"  🔴 ROOT BRIDGE CHANGES DETECTED: "
-                                 f"{len(root_bridges)} different root bridges seen!")
-                    for rb in root_bridges:
-                        count = len(session.stp_root_bridges[rb])
-                        lines.append(f"    {rb}: {count:,} BPDUs")
-                    lines.append(f"    ⚠️  Root bridge instability indicates "
-                                 f"STP reconvergence — check for priority misconfiguration")
-
-                # TCN rate analysis
-                if session.stp_tcn_count > 10:
-                    lines.append(f"  ⚠️  HIGH TCN COUNT: {session.stp_tcn_count} topology "
-                                 f"change notifications — indicates L2 flapping")
-
-                # STP rate
-                if len(session._stp_timestamps) >= 2:
-                    stp_duration = max(session._stp_timestamps) - min(session._stp_timestamps)
-                    if stp_duration > 0:
-                        stp_rate = total_stp / stp_duration
-                        lines.append(f"  STP rate: {stp_rate:.1f} BPDU/s")
-                        if stp_rate > 5:
-                            lines.append(f"  ⚠️  Elevated BPDU rate — possible STP storm")
-
-                # Number of bridges participating
-                if session.stp_bridges:
-                    lines.append(f"  Bridges seen: {len(session.stp_bridges)}")
-                    for bridge, count in session.stp_bridges.most_common(10):
-                        lines.append(f"    {bridge}: {count:,} BPDUs")
-
-            # --- HSRP ---
-            if session.hsrp_hello_count > 0:
-                lines.append(f"\n  HSRP (Hot Standby Router Protocol)")
-                lines.append(f"  {'─' * 40}")
-                lines.append(f"  HSRP Hellos: {session.hsrp_hello_count:,}")
-
-                # Group summary
-                if session.hsrp_events:
-                    groups = set(e["group"] for e in session.hsrp_events)
-                    lines.append(f"  Groups: {', '.join(str(g) for g in sorted(groups))}")
-                    for grp in sorted(groups):
-                        grp_events = [e for e in session.hsrp_events if e["group"] == grp]
-                        sources = set(e["src"] for e in grp_events)
-                        states = set(e["state_name"] for e in grp_events)
-                        vips = set(e["virtual_ip"] for e in grp_events if e["virtual_ip"])
-                        lines.append(f"    Group {grp}: routers={', '.join(sorted(sources))}"
-                                     f"  states={', '.join(sorted(states))}"
-                                     f"  VIP={', '.join(sorted(vips))}")
-
-                # State transitions
-                if session.hsrp_state_changes:
-                    lines.append(f"\n  🔴 HSRP STATE TRANSITIONS: "
-                                 f"{len(session.hsrp_state_changes)}")
-                    for sc in session.hsrp_state_changes[:15]:
-                        lines.append(f"    Group {sc['group']} {sc['src']}: "
-                                     f"{sc['from_state']} → {sc['to_state']}")
-                    if len(session.hsrp_state_changes) > 15:
-                        lines.append(f"    ... +{len(session.hsrp_state_changes) - 15} more")
-                    lines.append(f"    ⚠️  State transitions indicate failover events — "
-                                 f"correlate with network drops")
-
-            # --- VRRP ---
-            if session.vrrp_advert_count > 0:
-                lines.append(f"\n  VRRP (Virtual Router Redundancy Protocol)")
-                lines.append(f"  {'─' * 40}")
-                lines.append(f"  VRRP Advertisements: {session.vrrp_advert_count:,}")
-
-                if session.vrrp_events:
-                    vrids = set(e["vrid"] for e in session.vrrp_events)
-                    lines.append(f"  VRIDs: {', '.join(str(v) for v in sorted(vrids))}")
-                    for vrid in sorted(vrids):
-                        vrid_events = [e for e in session.vrrp_events if e["vrid"] == vrid]
-                        sources = set(e["src"] for e in vrid_events)
-                        priorities = set(e["priority"] for e in vrid_events)
-                        lines.append(f"    VRID {vrid}: routers={', '.join(sorted(sources))}"
-                                     f"  priorities={', '.join(str(p) for p in sorted(priorities))}")
-
-                if session.vrrp_priority_changes:
-                    lines.append(f"\n  ⚠️  VRRP PRIORITY CHANGES: "
-                                 f"{len(session.vrrp_priority_changes)}")
-                    for pc in session.vrrp_priority_changes[:10]:
-                        lines.append(f"    VRID {pc['vrid']} {pc['src']}: "
-                                     f"priority {pc['from_priority']} → {pc['to_priority']}")
-                    lines.append(f"    Priority changes trigger master election — "
-                                 f"may cause brief traffic disruption")
-
-            # --- OSPF ---
-            if session.ospf_total_count > 0:
-                lines.append(f"\n  OSPF (Open Shortest Path First)")
-                lines.append(f"  {'─' * 40}")
-                lines.append(f"  Total OSPF packets: {session.ospf_total_count:,}")
-                lines.append(f"    Hello: {session.ospf_hello_count:,}")
-                lines.append(f"    DB Description: {session.ospf_dbd_count:,}")
-                lines.append(f"    LS Request: {session.ospf_lsrequest_count:,}")
-                lines.append(f"    LS Update: {session.ospf_lsupdate_count:,}")
-                lines.append(f"    LS Ack: {session.ospf_lsack_count:,}")
-
-                if session.ospf_areas:
-                    lines.append(f"  Areas: {', '.join(sorted(session.ospf_areas))}")
-                if session.ospf_router_ids:
-                    lines.append(f"  Router IDs: {', '.join(sorted(session.ospf_router_ids))}"
-                                 f" ({len(session.ospf_router_ids)} routers)")
-
-                # Neighbor hello gap analysis (detect dead neighbors)
-                if session.ospf_neighbor_hellos:
-                    dead_suspects = []
-                    for pair, timestamps in session.ospf_neighbor_hellos.items():
-                        if len(timestamps) < 2:
-                            continue
-                        sorted_ts = sorted(timestamps)
-                        gaps = [sorted_ts[i+1] - sorted_ts[i]
-                                for i in range(len(sorted_ts) - 1)]
-                        max_gap = max(gaps) if gaps else 0
-                        # OSPF default dead interval is 40s (4x hello of 10s)
-                        if max_gap > 40:
-                            dead_suspects.append((pair, max_gap, len(timestamps)))
-
-                    if dead_suspects:
-                        lines.append(f"\n  🔴 OSPF NEIGHBOR GAPS (possible adjacency resets):")
-                        dead_suspects.sort(key=lambda x: x[1], reverse=True)
-                        for (ip_a, ip_b), gap, hello_count in dead_suspects[:10]:
-                            lines.append(
-                                f"    {ip_a} ↔ {ip_b}: max gap={gap:.1f}s "
-                                f"({hello_count} hellos) — "
-                                f"{'DEAD NEIGHBOR' if gap > 120 else 'near dead interval'}")
-
-                # LSUpdate burst detection (link flapping)
-                if len(session._ospf_lsupdate_timestamps) >= 5:
-                    sorted_lsu = sorted(session._ospf_lsupdate_timestamps)
-                    # Check for bursts: >10 LSUpdates in any 5-second window
-                    burst_windows = []
-                    for i in range(len(sorted_lsu) - 10):
-                        window = sorted_lsu[i+10] - sorted_lsu[i]
-                        if window <= 5.0:
-                            burst_windows.append((sorted_lsu[i], 10 / window if window > 0 else 999))
-
-                    if burst_windows:
-                        lines.append(f"\n  ⚠️  OSPF LSUpdate BURSTS DETECTED:")
-                        lines.append(f"    {len(burst_windows)} burst window(s) "
-                                     f"(>10 LSUpdates in 5s)")
-                        max_rate = max(bw[1] for bw in burst_windows)
-                        lines.append(f"    Peak rate: {max_rate:.1f} LSUpdate/s")
-                        lines.append(f"    Indicates link flapping or route recalculation")
-
-            # --- EIGRP ---
-            if session.eigrp_total_count > 0:
-                lines.append(f"\n  EIGRP (Enhanced Interior Gateway Routing Protocol)")
-                lines.append(f"  {'─' * 40}")
-                lines.append(f"  Total EIGRP packets: {session.eigrp_total_count:,}")
-                lines.append(f"    Hello: {session.eigrp_hello_count:,}")
-                lines.append(f"    Update: {session.eigrp_update_count:,}")
-                lines.append(f"    Query: {session.eigrp_query_count:,}")
-                lines.append(f"    Reply: {session.eigrp_reply_count:,}")
-
-                if session.eigrp_as_numbers:
-                    lines.append(f"  AS Numbers: "
-                                 f"{', '.join(str(a) for a in sorted(session.eigrp_as_numbers))}")
-
-                # EIGRP queries indicate route recalculation (active state)
-                if session.eigrp_query_count > 0:
-                    lines.append(f"\n  ⚠️  EIGRP QUERIES: {session.eigrp_query_count:,}")
-                    lines.append(f"    Queries indicate routes going ACTIVE — "
-                                 f"neighbors are recalculating paths")
-                    if session.eigrp_query_count > 20:
-                        lines.append(f"    🔴 HIGH query volume — possible convergence "
-                                     f"event or Stuck-In-Active (SIA) condition")
-
-                # High update count relative to hellos indicates instability
-                if (session.eigrp_hello_count > 0
-                        and session.eigrp_update_count > session.eigrp_hello_count * 0.1):
-                    lines.append(f"    ⚠️  Update/Hello ratio is elevated — "
-                                 f"topology changes in progress")
-
-        # --- IP Fragmentation ---
-        lines.append(f"\n{'=' * 60}")
-        lines.append("IP FRAGMENTATION")
-        lines.append(f"{'=' * 60}")
-        if session.ip_fragment_count > 0:
-            frag_pct = session.ip_fragment_count / session.packet_count * 100
-            lines.append(f"  Fragmented packets: {session.ip_fragment_count:,} ({frag_pct:.2f}%)")
-            if frag_pct > 1:
-                lines.append("  ⚠️  High fragmentation rate — possible MTU mismatch")
-        else:
-            lines.append("  No IP fragmentation detected.")
-
-        # --- TTL Distribution ---
-        if session.ttl_distribution:
-            lines.append(f"\n{'=' * 60}")
-            lines.append("TTL DISTRIBUTION")
-            lines.append(f"{'=' * 60}")
-            # Group by common OS defaults: 64 (Linux), 128 (Windows), 255 (network devices)
-            ttl_groups = {"Linux/macOS (TTL ~64)": 0, "Windows (TTL ~128)": 0,
-                          "Network devices (TTL ~255)": 0, "Other": 0}
-            for ttl, count in session.ttl_distribution.items():
-                if 56 <= ttl <= 64:
-                    ttl_groups["Linux/macOS (TTL ~64)"] += count
-                elif 120 <= ttl <= 128:
-                    ttl_groups["Windows (TTL ~128)"] += count
-                elif 250 <= ttl <= 255:
-                    ttl_groups["Network devices (TTL ~255)"] += count
-                else:
-                    ttl_groups["Other"] += count
-            for group, count in sorted(ttl_groups.items(), key=lambda x: x[1], reverse=True):
-                if count > 0:
-                    pct = count / session.packet_count * 100
-                    lines.append(f"  {group}: {count:,} ({pct:.1f}%)")
-
-            # Unusual TTL values (low TTLs suggest many hops or TTL manipulation)
-            low_ttl = [(ttl, c) for ttl, c in session.ttl_distribution.items() if ttl < 10]
-            if low_ttl:
-                lines.append("\n  ⚠️  LOW TTL PACKETS (< 10):")
-                for ttl, count in sorted(low_ttl):
-                    lines.append(f"    TTL={ttl}: {count:,} packets")
-
-        # --- DNS Health (failed lookups, heavy resolvers) ---
-        if session.dns_queries:
-            lines.append(f"\n{'=' * 60}")
-            lines.append("DNS HEALTH")
-            lines.append(f"{'=' * 60}")
-            lines.append(f"  Total DNS queries: {len(session.dns_queries):,}")
-            lines.append(f"  Total DNS responses: {len(session.dns_responses):,}")
-
-            # Queries without responses (potential failures)
-            query_names = Counter(q["query"] for q in session.dns_queries)
-            response_names = set(r["query"] for r in session.dns_responses)
-            unanswered = {q: c for q, c in query_names.items() if q not in response_names}
-            if unanswered:
-                lines.append(f"\n  ⚠️  UNANSWERED DNS QUERIES: {len(unanswered)} unique domains")
-                for domain, count in sorted(unanswered.items(), key=lambda x: x[1], reverse=True)[:15]:
-                    lines.append(f"    {domain}  ({count} queries)")
-
-            # Top DNS clients
-            dns_by_src = Counter(q["src"] for q in session.dns_queries)
-            lines.append(f"\n  Top DNS clients:")
-            for ip, count in dns_by_src.most_common(10):
-                lines.append(f"    {ip}: {count:,} queries")
-
-        # --- Top Bandwidth Consumers ---
-        conv_list = []
-        for (src, dst, dport, proto), stats in session.conversations.items():
-            conv_list.append((src, dst, dport, proto, stats["bytes_out"], stats["packets"],
-                              stats.get("last_seen", 0) - stats.get("first_seen", 0)))
-        conv_list.sort(key=lambda c: c[4], reverse=True)
-
-        if conv_list:
-            lines.append(f"\n{'=' * 60}")
-            lines.append(f"TOP BANDWIDTH CONSUMERS")
-            lines.append(f"{'=' * 60}")
-            lines.append(
-                f"{'#':<4} {'Source':<18} {'Destination':<18} {'Port':<7} {'Proto':<6} "
-                f"{'Bytes':<10} {'Pkts':<8} {'Duration'}"
-            )
-            lines.append("-" * 85)
-            for i, (src, dst, dport, proto, bytes_out, pkts, dur) in enumerate(conv_list[:15], 1):
-                dur_str = f"{dur:.1f}s" if dur < 60 else f"{dur/60:.1f}min"
-                lines.append(
-                    f"{i:<4} {src:<18} {dst:<18} {dport:<7} {proto:<6} "
-                    f"{_format_bytes(bytes_out):<10} {pkts:<8} {dur_str}"
-                )
-
-        # --- Long-lived Connections ---
-        long_convs = [(k, s) for k, s in session.conversations.items()
-                       if (s.get("last_seen", 0) - s.get("first_seen", 0)) > 300]
-        long_convs.sort(key=lambda x: x[1].get("last_seen", 0) - x[1].get("first_seen", 0),
-                         reverse=True)
-        if long_convs:
-            lines.append(f"\n{'=' * 60}")
-            lines.append(f"LONG-LIVED CONNECTIONS (> 5 min): {len(long_convs)}")
-            lines.append(f"{'=' * 60}")
-            for (src, dst, dport, proto), stats in long_convs[:15]:
-                dur = stats.get("last_seen", 0) - stats.get("first_seen", 0)
-                dur_str = f"{dur/60:.1f}min" if dur < 3600 else f"{dur/3600:.1f}hrs"
-                lines.append(
-                    f"  {src} → {dst}:{dport} ({proto}) — {dur_str}, "
-                    f"{_format_bytes(stats['bytes_out'])}, {stats['packets']} pkts"
-                )
-
-        # --- Service Port Distribution (ops-focused, no threat context) ---
-        # Well-known service names for operational context
-        _SVC_NAMES = {
-            22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS", 67: "DHCP-S",
-            68: "DHCP-C", 69: "TFTP", 80: "HTTP", 110: "POP3", 123: "NTP",
-            135: "RPC", 137: "NetBIOS-NS", 138: "NetBIOS-DG", 139: "NetBIOS-SS",
-            143: "IMAP", 161: "SNMP", 162: "SNMP-Trap", 389: "LDAP",
-            443: "HTTPS", 445: "SMB", 465: "SMTPS", 502: "Modbus",
-            514: "Syslog", 636: "LDAPS", 993: "IMAPS", 995: "POP3S",
-            1433: "MSSQL", 1521: "Oracle", 3306: "MySQL", 3389: "RDP",
-            5060: "SIP", 5432: "PostgreSQL", 5900: "VNC", 8080: "HTTP-Alt",
-            8443: "HTTPS-Alt", 44818: "EtherNet/IP", 47808: "BACnet",
-            20000: "DNP3", 102: "S7comm",
-        }
-        port_stats: dict = defaultdict(lambda: {"flows": 0, "sources": set(),
-                                                "bytes": 0, "pkts": 0})
-        for (src, dst, dport, proto), stats in session.conversations.items():
-            if dport > 0:
-                port_stats[dport]["flows"] += 1
-                port_stats[dport]["sources"].add(src)
-                port_stats[dport]["bytes"] += stats.get("bytes_out", 0)
-                port_stats[dport]["pkts"] += stats.get("packets", 0)
-
-        if port_stats:
-            lines.append(f"\n{'=' * 60}")
-            lines.append("SERVICE PORT DISTRIBUTION")
-            lines.append(f"{'=' * 60}")
-
-            # Known services
-            known = [(p, s) for p, s in port_stats.items() if p in _SVC_NAMES]
-            known.sort(key=lambda x: x[1]["flows"], reverse=True)
-            if known:
-                lines.append("\n📋 KNOWN SERVICES")
-                lines.append("-" * 60)
-                for port, stats_d in known[:20]:
-                    svc = _SVC_NAMES[port]
-                    lines.append(
-                        f"  {port:<7} {svc:<16} flows={stats_d['flows']:<5} "
-                        f"sources={len(stats_d['sources']):<4} "
-                        f"{_format_bytes(stats_d['bytes'])}"
-                    )
-
-            # Unknown high ports (summary only, no threat framing)
-            unknown = [(p, s) for p, s in port_stats.items()
-                       if p not in _SVC_NAMES and p > 1024]
-            if unknown:
-                lines.append(f"\n❓ OTHER HIGH PORTS — {len(unknown)} port(s)")
-                lines.append("-" * 60)
-                unknown.sort(key=lambda x: x[1]["flows"], reverse=True)
-                for port, stats_d in unknown[:15]:
-                    lines.append(
-                        f"  {port:<7} flows={stats_d['flows']:<5} "
-                        f"sources={len(stats_d['sources']):<4} "
-                        f"{_format_bytes(stats_d['bytes'])}"
-                    )
-
-        # --- Subnet Anomaly Summary ---
-        # Aggregate anomaly indicators by /24 subnet to highlight problem networks
-        subnet_scores: dict = defaultdict(lambda: {
-            "rst": 0, "retransmit": 0, "icmp_errors": 0,
-            "unanswered_arp": 0, "loop_packets": 0,
-            "arp_requests": 0, "ip_conflicts": 0,
-            "ips_seen": set(), "total_score": 0,
-        })
-
-        def _to_subnet(ip: str) -> str:
-            parts = ip.rsplit(".", 1)
-            return f"{parts[0]}.0/24" if len(parts) == 2 else ip
-
-        # TCP health by subnet
-        for (src, dst, dport, proto), health in session.conv_health.items():
-            for ip in (src, dst):
-                if is_internal(ip):
-                    sn = _to_subnet(ip)
-                    subnet_scores[sn]["rst"] += health.get("rst", 0)
-                    subnet_scores[sn]["retransmit"] += health.get("retransmit", 0)
-                    subnet_scores[sn]["ips_seen"].add(ip)
-
-        # ICMP errors by subnet
-        for err in session.icmp_errors:
-            for ip in (err.get("src", ""), err.get("dst", "")):
-                if ip and is_internal(ip):
-                    subnet_scores[_to_subnet(ip)]["icmp_errors"] += 1
-                    subnet_scores[_to_subnet(ip)]["ips_seen"].add(ip)
-
-        # Unanswered ARP targets by subnet
-        unanswered_arp = {ip: count for ip, count in session._arp_request_targets.items()
-                          if ip not in session._arp_reply_targets and count >= 2}
-        for ip, count in unanswered_arp.items():
-            if is_internal(ip):
-                subnet_scores[_to_subnet(ip)]["unanswered_arp"] += count
-                subnet_scores[_to_subnet(ip)]["ips_seen"].add(ip)
-
-        # IP conflicts by subnet
-        for ip, macs in session.arp_ip_to_macs.items():
-            if len(macs) > 1 and is_internal(ip):
-                subnet_scores[_to_subnet(ip)]["ip_conflicts"] += 1
-                subnet_scores[_to_subnet(ip)]["ips_seen"].add(ip)
-
-        # Routing loop involvement by subnet
-        for pkt_info in session.suspected_loop_packets:
-            for ip in (pkt_info.get("src", ""), pkt_info.get("dst", "")):
-                if ip and is_internal(ip):
-                    subnet_scores[_to_subnet(ip)]["loop_packets"] += 1
-                    subnet_scores[_to_subnet(ip)]["ips_seen"].add(ip)
-
-        # ARP flood sources by subnet (map MAC→IP via arp_ip_to_macs)
-        mac_to_ips: dict = defaultdict(set)
-        for ip, macs in session.arp_ip_to_macs.items():
-            for mac in macs:
-                mac_to_ips[mac].add(ip)
-        for mac, count in session.arp_requests_by_src.most_common():
-            if count >= 50:
-                for ip in mac_to_ips.get(mac, set()):
-                    if is_internal(ip):
-                        subnet_scores[_to_subnet(ip)]["arp_requests"] += count
-                        subnet_scores[_to_subnet(ip)]["ips_seen"].add(ip)
-
-        # Calculate composite score
-        for sn, scores in subnet_scores.items():
-            scores["total_score"] = (
-                scores["rst"] * 2
-                + scores["retransmit"]
-                + scores["icmp_errors"] * 5
-                + scores["unanswered_arp"]
-                + scores["loop_packets"] * 10
-                + scores["ip_conflicts"] * 50
-                + scores["arp_requests"] // 100
-            )
-
-        # Rank and display
-        ranked = sorted(subnet_scores.items(),
-                        key=lambda x: x[1]["total_score"], reverse=True)
-        # Filter to subnets with actual anomalies
-        ranked = [(sn, s) for sn, s in ranked if s["total_score"] > 0]
-
-        if ranked:
-            lines.append(f"\n{'=' * 60}")
-            lines.append("SUBNET ANOMALY SUMMARY (ranked by impact)")
-            lines.append(f"{'=' * 60}")
-            lines.append(
-                f"  {'Subnet':<20} {'Score':<8} {'RSTs':<7} {'Retx':<7} "
-                f"{'ICMP':<6} {'Loops':<7} {'ARP-Unans':<10} {'Conflicts':<10} "
-                f"{'IPs'}"
-            )
-            lines.append("  " + "-" * 90)
-            for sn, s in ranked[:25]:
-                lines.append(
-                    f"  {sn:<20} {s['total_score']:<8} "
-                    f"{s['rst']:<7} {s['retransmit']:<7} "
-                    f"{s['icmp_errors']:<6} {s['loop_packets']:<7} "
-                    f"{s['unanswered_arp']:<10} {s['ip_conflicts']:<10} "
-                    f"{len(s['ips_seen'])}"
-                )
-
-            # Highlight top problem subnet
-            top_sn, top_s = ranked[0]
-            top_indicators = []
-            if top_s["rst"] > 0:
-                top_indicators.append(f"{top_s['rst']} RSTs")
-            if top_s["retransmit"] > 0:
-                top_indicators.append(f"{top_s['retransmit']} retransmissions")
-            if top_s["loop_packets"] > 0:
-                top_indicators.append(f"{top_s['loop_packets']} loop packets")
-            if top_s["icmp_errors"] > 0:
-                top_indicators.append(f"{top_s['icmp_errors']} ICMP errors")
-            if top_s["ip_conflicts"] > 0:
-                top_indicators.append(f"{top_s['ip_conflicts']} IP conflict(s)")
-            if top_s["unanswered_arp"] > 0:
-                top_indicators.append(f"{top_s['unanswered_arp']} unanswered ARPs")
-            lines.append(f"\n  🔴 HIGHEST IMPACT SUBNET: {top_sn}")
-            lines.append(f"     {', '.join(top_indicators)}")
-            lines.append(f"     {len(top_s['ips_seen'])} unique IPs affected")
-
-            if len(ranked) > 1:
-                sn2, s2 = ranked[1]
-                lines.append(f"  ⚠️  SECOND: {sn2} (score={s2['total_score']}, "
-                             f"{len(s2['ips_seen'])} IPs)")
-            if len(ranked) > 2:
-                sn3, s3 = ranked[2]
-                lines.append(f"  ⚠️  THIRD: {sn3} (score={s3['total_score']}, "
-                             f"{len(s3['ips_seen'])} IPs)")
-
-        return "\n".join(lines)
-
-    @staticmethod
-    def _build_pcap_header(session: Any, *, netops: bool = False) -> str:
+    def _build_pcap_header(session: Any) -> str:
         """Build a PCAP context header with key metadata."""
         from plugins.network_forensics.pcap_metadata_summary.tool import is_internal, _format_bytes
 
@@ -3501,7 +2174,7 @@ class PcapAiAnalyzer:
 
         if session.ot_transactions:
             lines.append(f"OT/ICS: {len(session.ot_transactions):,} transactions")
-        if not netops and session.cleartext_creds:
+        if session.cleartext_creds:
             lines.append(f"⚠️  Cleartext credentials: {len(session.cleartext_creds)} detection(s)")
 
         return "\n".join(lines)

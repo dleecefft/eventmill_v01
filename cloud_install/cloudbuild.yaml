@@ -66,7 +66,7 @@ steps:
       - '--set-secrets'
       - 'GEMINI_FLASH_API_KEY=eventmill-gemini-flash-api:latest,GEMINI_PRO_API_KEY=eventmill-gemini-pro-api:latest,TTYD_USERNAME=eventmill-ttyd-user:latest,TTYD_PASSWORD=eventmill-ttyd-cred:latest'
       - '--set-env-vars'
-      - 'EVENTMILL_BUCKET_PREFIX=${_BUCKET_PREFIX},EVENTMILL_LOG_LEVEL=INFO'
+      - 'GOOGLE_CLOUD_PROJECT=$PROJECT_ID,EVENTMILL_BUCKET_PREFIX=${_BUCKET_PREFIX},EVENTMILL_LOG_LEVEL=INFO'
       - '--allow-unauthenticated'
 
 images:

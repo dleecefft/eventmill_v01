@@ -67,6 +67,7 @@ gcloud run deploy "${SERVICE_NAME}" \
     --timeout=3600 \
     --concurrency=5 \
     --session-affinity \
+    --set-env-vars="GOOGLE_CLOUD_PROJECT=${PROJECT_ID}" \
     --set-env-vars="GEMINI_FLASH_API_KEY=${GEMINI_FLASH_API_KEY:-}" \
     --set-env-vars="GEMINI_PRO_API_KEY=${GEMINI_PRO_API_KEY:-}" \
     --set-env-vars="ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}" \
