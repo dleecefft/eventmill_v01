@@ -17,7 +17,7 @@ set -e
 # ---------------------------------------------------------------------------
 PROJECT_ID="${GOOGLE_CLOUD_PROJECT:-your-project-id}"
 REGION="${CLOUD_RUN_REGION:-northamerica-northeast2}"
-SERVICE_NAME="event-mill"
+SERVICE_NAME="${CLOUD_RUN_SERVICE:-event-mill}"
 IMAGE_NAME="${REGION}-docker.pkg.dev/${PROJECT_ID}/eventmill/${SERVICE_NAME}"
 
 # Storage bucket prefix (pillar-based isolation)
