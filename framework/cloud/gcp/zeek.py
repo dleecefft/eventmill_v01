@@ -40,10 +40,34 @@ class ZeekCloudBuildClient:
         region: str | None = None,
         bucket_prefix: str | None = None,
     ):
-        self.project_id = project_id or os.environ.get("GOOGLE_CLOUD_PROJECT")
+        self.project_id = (
+            project_id
+            or os.environ.get("GOOGLE_CLOUD_PROJECT")
+            or os.environ.get("GCP_PROJECT_ID")
+            or self._resolve_project_from_gcloud()
+        )
         self.region = region or os.environ.get("CLOUD_RUN_REGION", "northamerica-northeast2")
         self.bucket_prefix = bucket_prefix or os.environ.get("EVENTMILL_BUCKET_PREFIX", "")
         self._client = None
+
+    @staticmethod
+    def _resolve_project_from_gcloud() -> str | None:
+        """Ask the locally authenticated gcloud for the active project."""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["gcloud", "config", "get-value", "project"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            project = result.stdout.strip()
+            if project and project != "(unset)":
+                logger.debug("Resolved GCP project from gcloud config: %s", project)
+                return project
+        except Exception:
+            pass
+        return None
 
     def _get_client(self):
         """Lazy-init Cloud Build client."""
