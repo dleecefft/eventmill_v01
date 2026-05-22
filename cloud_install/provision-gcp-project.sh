@@ -247,6 +247,14 @@ else
     echo "   ⚠ Could not grant roles/artifactregistry.writer for default compute SA"
 fi
 
+echo "   Granting Event Mill SA permission to act as default compute SA (Zeek Cloud Build)..."
+gcloud iam service-accounts add-iam-policy-binding "${DEFAULT_COMPUTE_SA}" \
+    --project="${PROJECT_ID}" \
+    --member="serviceAccount:${SA_EMAIL}" \
+    --role="roles/iam.serviceAccountUser" \
+    --quiet > /dev/null 2>&1 || true
+echo "   ✓ roles/iam.serviceAccountUser on default compute SA for ${SA_NAME}"
+
 echo "   Granting Cloud Build SA permission to deploy to Cloud Run..."
 if add_project_binding "serviceAccount:${CLOUDBUILD_SA}" "roles/run.admin"; then
     echo "   ✓ roles/run.admin for Cloud Build SA"
