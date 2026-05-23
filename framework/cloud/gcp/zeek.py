@@ -44,11 +44,31 @@ class ZeekCloudBuildClient:
             project_id
             or os.environ.get("GOOGLE_CLOUD_PROJECT")
             or os.environ.get("GCP_PROJECT_ID")
+            or self._resolve_project_from_metadata()
             or self._resolve_project_from_gcloud()
         )
         self.region = region or os.environ.get("CLOUD_RUN_REGION", "northamerica-northeast2")
         self.bucket_prefix = bucket_prefix or os.environ.get("EVENTMILL_BUCKET_PREFIX", "")
         self._client = None
+
+    @staticmethod
+    def _resolve_project_from_metadata() -> str | None:
+        """Resolve project ID from the GCE/Cloud Run metadata server."""
+        try:
+            import urllib.request
+
+            req = urllib.request.Request(
+                "http://metadata.google.internal/computeMetadata/v1/project/project-id",
+                headers={"Metadata-Flavor": "Google"},
+            )
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                project = resp.read().decode("utf-8").strip()
+                if project:
+                    logger.debug("Resolved GCP project from metadata server: %s", project)
+                    return project
+        except Exception:
+            pass
+        return None
 
     @staticmethod
     def _resolve_project_from_gcloud() -> str | None:
