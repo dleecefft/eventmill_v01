@@ -567,7 +567,7 @@ def parse_pcap_file(file_path: str) -> PcapSession:
 
 
 # ---------------------------------------------------------------------------
-# dpkt-based fast parser (--large mode) — 5-10x faster than scapy
+# dpkt-based fast parser (--fast mode) — 5-10x faster than scapy
 # ---------------------------------------------------------------------------
 
 DPKT_AVAILABLE = False
@@ -587,7 +587,7 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
     5-10x faster on large captures (>100 MB / >500K packets).
     """
     if not DPKT_AVAILABLE:
-        raise RuntimeError("dpkt is required for --large mode. Install with: pip install dpkt")
+        raise RuntimeError("dpkt is required for --fast mode. Install with: pip install dpkt")
 
     _build_cred_patterns()
 

@@ -47,7 +47,7 @@ progressively deepen an investigation:
 │  Ingestion (3 paths — all produce identical PcapSession)             │
 │  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────────┐    │
 │  │ Scapy Parser │  │ dpkt Parser  │  │ Zeek Cloud Build        │    │
-│  │ (default)    │  │ (--large,    │  │ (E2_HIGHCPU_32,         │    │
+│  │ (default)    │  │ (--fast,     │  │ (E2_HIGHCPU_32,         │    │
 │  │ < 50 MB      │  │  5-10x fast) │  │  500GB, GCS → JSON logs)│    │
 │  └──────┬───────┘  └──────┬───────┘  └──────────┬──────────────┘    │
 │         └────────────┬─────┘                     │                   │
@@ -163,7 +163,7 @@ regardless of which parser loaded the data.
 | Parser | When to Use | Speed | Invocation |
 |--------|-------------|-------|------------|
 | **Scapy** (streaming) | Default, < 50 MB | Baseline | `load captures/file.pcap` |
-| **dpkt** (C-backed) | 50–500 MB | 5-10× faster | `load captures/file.pcap --large` |
+| **dpkt** (C-backed) | 50–500 MB | 5-10× faster | `load captures/file.pcap --fast` |
 | **Zeek Cloud Build** | 500 MB+ / multi-GB | 32-vCPU VM | `zeek file.pcap` → `zeek load` |
 
 #### Scapy Parser (default)
@@ -240,7 +240,7 @@ For PCAPs between 50–500 MB, the dpkt parser provides identical
 output 5-10× faster using C-backed struct unpacking:
 
 ```
-eventmill (network_forensics) > load large_capture.pcap --large
+eventmill (network_forensics) > load large_capture.pcap --fast
   Using dpkt fast parser...
   ✓ 1,247,891 packets, 842 IPs, duration 8h 22m
 ```

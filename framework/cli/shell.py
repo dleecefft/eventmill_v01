@@ -642,10 +642,10 @@ class EventMillShell(cmd.Cmd):
     def do_load(self, arg: str) -> None:
         """Load an artifact file into the current session.
         
-        Usage: load <file_path_or_name> [artifact_type] [--large]
+        Usage: load <file_path_or_name> [artifact_type] [--fast]
         
         Options:
-          --large    Use dpkt (fast C-backed parser) instead of scapy.
+          --fast     Use dpkt (fast C-backed parser) instead of scapy.
                      Recommended for PCAPs >100 MB / >500K packets.
                      5-10x faster, identical report output.
         
@@ -667,13 +667,13 @@ class EventMillShell(cmd.Cmd):
         except ValueError:
             parts = arg.strip().split(maxsplit=1)
         if not parts:
-            print("  Usage: load <file_path_or_name> [artifact_type] [--large]")
+            print("  Usage: load <file_path_or_name> [artifact_type] [--fast]")
             return
         
-        # Check for --large flag
-        use_dpkt = "--large" in parts
+        # Check for --fast flag
+        use_dpkt = "--fast" in parts
         if use_dpkt:
-            parts = [p for p in parts if p != "--large"]
+            parts = [p for p in parts if p != "--fast"]
         
         file_ref = parts[0]
         file_path = Path(file_ref)
@@ -772,7 +772,7 @@ class EventMillShell(cmd.Cmd):
         shell's module see the same PcapSession singleton.
 
         When use_dpkt=True, uses the fast dpkt parser (5-10x faster for large
-        captures). Use ``load file.pcap --large`` to activate.
+        captures). Use ``load file.pcap --fast`` to activate.
         """
         try:
             from plugins.network_forensics.pcap_metadata_summary.tool import (
