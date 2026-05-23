@@ -21,13 +21,17 @@ within the Event Mill network forensics pillar.
 
 1. [Architecture Overview](#1-architecture-overview)
 2. [PCAP Processing — Ingestion & Parsing](#2-pcap-processing--ingestion--parsing)
-3. [Analysis Layer 1 — Static Summary Tools](#3-analysis-layer-1--static-summary-tools)
-4. [Analysis Layer 2 — Threat Hunt Tools](#4-analysis-layer-2--threat-hunt-tools)
-5. [Analysis Layer 3 — AI-Driven Insights](#5-analysis-layer-3--ai-driven-insights)
-6. [Condition Orange — Heightened Alert Mode](#6-condition-orange--heightened-alert-mode)
-7. [PCAP–Report Correlation (sync_pcap)](#7-pcapreport-correlation-sync_pcap)
-8. [Plugin Mapping to eventmill_v01](#8-plugin-mapping-to-eventmill_v01)
-9. [Example Investigation Workflow](#9-example-investigation-workflow)
+3. [Zeek Cloud Build — Large PCAP Processing](#3-zeek-cloud-build--large-pcap-processing)
+4. [Analysis Layer 1 — Static Summary Tools](#4-analysis-layer-1--static-summary-tools)
+5. [Analysis Layer 2 — Threat Hunt Tools](#5-analysis-layer-2--threat-hunt-tools)
+6. [Analysis Layer 3 — AI-Driven Insights](#6-analysis-layer-3--ai-driven-insights)
+7. [OT/ICS Analysis Modes](#7-otics-analysis-modes)
+8. [NetOps Infrastructure Health Modes](#8-netops-infrastructure-health-modes)
+9. [Condition Orange — Heightened Alert Mode](#9-condition-orange--heightened-alert-mode)
+10. [PCAP–Report Correlation (sync_pcap)](#10-pcapreport-correlation-sync_pcap)
+11. [Export & Artifact System](#11-export--artifact-system)
+12. [Plugin Mapping to eventmill_v01](#12-plugin-mapping-to-eventmill_v01)
+13. [Example Investigation Workflow](#13-example-investigation-workflow)
 
 ---
 
@@ -37,38 +41,57 @@ The network forensics pillar operates in three analysis layers that
 progressively deepen an investigation:
 
 ```text
-┌──────────────────────────────────────────────────────────────┐
-│                  NETWORK FORENSICS PILLAR                     │
-│                                                              │
-│  Layer 1: Static Summary          Layer 2: Threat Hunt       │
-│  ┌────────────────────────┐       ┌────────────────────────┐ │
-│  │ pcap_metadata_summary  │       │ pcap_threat_hunter     │ │
-│  │  - Protocol stats      │       │  - hunt_talkers        │ │
-│  │  - IP endpoint map     │       │  - hunt_ports          │ │
-│  │  - DNS / HTTP / TLS    │       │  - hunt_beacons (C2)   │ │
-│  │  - Conversation table  │       │  - hunt_dns (DGA)      │ │
-│  │  - IOC search          │       │  - hunt_tls            │ │
-│  │  - Timeline by IP      │       │  - hunt_lateral        │ │
-│  └────────────┬───────────┘       │  - hunt_exfil          │ │
-│               │ chains_to         │  - sync_pcap           │ │
-│               ▼                   └────────────┬───────────┘ │
-│  ┌────────────────────────┐                    │             │
-│  │ pcap_ip_search         │       Layer 3: AI-Enhanced       │
-│  │  - Filter by IP/port   │       ┌────────────▼───────────┐ │
-│  │  - Flow extraction     │       │ pcap_ai_analyzer       │ │
-│  └────────────┬───────────┘       │  - ai_pcap_summary     │ │
-│               │ chains_to         │  - ai_hunt_talkers     │ │
-│               ▼                   │  - ai_hunt_beacons     │ │
-│  ┌────────────────────────┐       │  - ai_hunt_dns         │ │
-│  │ pcap_flow_analyzer     │       │  - ai_hunt_tls         │ │
-│  │  - TCP reconstruction  │       │  - ai_hunt_lateral     │ │
-│  │  - DNS/HTTP/TLS detail │       │  - ai_hunt_exfil       │ │
-│  │  - Protocol deep-dive  │       │  - ai_sync_pcap        │ │
-│  └────────────────────────┘       └────────────────────────┘ │
-│                                                              │
-│  Cross-cutting: Condition Orange (heightened alert toggle)    │
-│  Artifact flow: pcap → json_events → text (reports)          │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                    NETWORK FORENSICS PILLAR                          │
+│                                                                      │
+│  Ingestion (3 paths — all produce identical PcapSession)             │
+│  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────────┐    │
+│  │ Scapy Parser │  │ dpkt Parser  │  │ Zeek Cloud Build        │    │
+│  │ (default)    │  │ (--large,    │  │ (E2_HIGHCPU_32,         │    │
+│  │ < 50 MB      │  │  5-10x fast) │  │  500GB, GCS → JSON logs)│    │
+│  └──────┬───────┘  └──────┬───────┘  └──────────┬──────────────┘    │
+│         └────────────┬─────┘                     │                   │
+│                      ▼                           ▼                   │
+│         ┌─────────────────────────────────────────────┐              │
+│         │          PcapSession (process-global)        │              │
+│         │  conversations, DNS, HTTP, TLS, OT, ARP,    │              │
+│         │  TCP health, ICMP, control plane, TTL        │              │
+│         └──────────────────┬──────────────────────────┘              │
+│                            │                                         │
+│  Layer 1: Static Summary   │   Layer 2: Threat Hunt                  │
+│  ┌────────────────────────┐│   ┌────────────────────────┐           │
+│  │ pcap_metadata_summary  ││   │ pcap_threat_hunter     │           │
+│  │  - Protocol stats      ││   │  - hunt_talkers        │           │
+│  │  - IP endpoint map     ││   │  - hunt_ports          │           │
+│  │  - DNS / HTTP / TLS    ││   │  - hunt_beacons (C2)   │           │
+│  │  - Conversation table  ││   │  - hunt_dns (DGA)      │           │
+│  │  - IOC search          ││   │  - hunt_tls            │           │
+│  │  - Timeline by IP      ││   │  - hunt_lateral        │           │
+│  └────────────┬───────────┘│   │  - hunt_exfil          │           │
+│               │ chains_to  │   │  - sync_pcap           │           │
+│               ▼            │   └────────────┬───────────┘           │
+│  ┌────────────────────────┐│                │                        │
+│  │ pcap_ip_search         ││   Layer 3: AI-Enhanced (14 modes)      │
+│  │  - Filter by IP/port   ││   ┌────────────▼───────────┐           │
+│  │  - Flow extraction     ││   │ pcap_ai_analyzer       │           │
+│  └────────────┬───────────┘│   │                        │           │
+│               │ chains_to  │   │  SOC:    triage_summary │           │
+│               ▼            │   │          hunt_* (6)     │           │
+│  ┌────────────────────────┐│   │          report         │           │
+│  │ pcap_flow_analyzer     ││   │                        │           │
+│  │  - TCP reconstruction  ││   │  OT/ICS: ot_triage     │           │
+│  │  - DNS/HTTP/TLS detail ││   │          ot_threat_hunt │           │
+│  │  - Protocol deep-dive  ││   │          ot_report      │           │
+│  └────────────────────────┘│   │                        │           │
+│                            │   │  NetOps: netops_triage  │           │
+│                            │   │          netops_health  │           │
+│                            │   │          netops_report  │           │
+│                            │   └────────────────────────┘           │
+│                                                                      │
+│  Cross-cutting: Condition Orange (heightened alert toggle)            │
+│  Artifact flow: pcap → json_events → text (reports) → PDF export     │
+│  LLM routing: Flash (light tier) ↔ Pro (heavy tier)                  │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 **Artifact types consumed**: `pcap`, `log_stream`, `text`
@@ -104,13 +127,63 @@ subsequent analysis tool via `get_pcap_session()`.
 | `dns_queries` | `list[dict]` | DNS query records: domain, source IP, resolved IPs, timestamps |
 | `http_requests` | `list[dict]` | HTTP method, host, path, source/destination IPs, timestamps |
 | `tls_handshakes` | `list[dict]` | TLS ClientHello: SNI, cipher suites, source/destination IPs |
+| `ot_transactions` | `list[dict]` | OT/ICS protocol transactions (Modbus, DNP3, S7comm, BACnet, etc.) |
+| `cleartext_creds` | `list[dict]` | Detected cleartext credentials (values redacted) |
+| **TCP Health** | | |
+| `tcp_syn_count` / `tcp_fin_count` | `int` | SYN and FIN packet counts |
+| `tcp_rst_count` | `int` | RST packet count |
+| `tcp_retransmissions` | `int` | Retransmitted TCP packets |
+| `tcp_zero_window_count` | `int` | Zero-window events |
+| `conv_health` | `dict` | Per-conversation RST, retransmit, zero-window counts |
+| **ICMP & Routing** | | |
+| `icmp_errors` | `list[dict]` | ICMP error messages (unreachable, TTL exceeded, redirects) |
+| `ttl_exceeded_by_dest` | `dict` | TTL exceeded messages grouped by destination (loop detection) |
+| `suspected_loop_packets` | `list[dict]` | Duplicate packets with different TTLs (loop evidence) |
+| **ARP Health** | | |
+| `arp_request_count` / `arp_reply_count` | `int` | ARP packet counts |
+| `arp_gratuitous_count` | `int` | Gratuitous ARP count |
+| `arp_ip_to_macs` | `dict` | IP → MAC mapping (detects IP conflicts) |
+| `arp_requests_by_src` | `Counter` | ARP requests per source MAC (detects ARP floods) |
+| **Control Plane** | | |
+| `stp_bpdu_count` / `stp_tcn_count` | `int` | STP BPDU and Topology Change counts |
+| `hsrp_hello_count` / `hsrp_state_changes` | `int` / `list` | HSRP events |
+| `vrrp_advert_count` / `vrrp_priority_changes` | `int` / `list` | VRRP events |
+| `ospf_total_count` / `ospf_hello_count` | `int` | OSPF packet counts |
+| `eigrp_total_count` / `eigrp_query_count` | `int` | EIGRP packet counts |
+| **IP Layer** | | |
+| `ip_fragment_count` | `int` | Fragmented IP packets |
+| `ttl_distribution` | `Counter` | TTL value distribution (OS fingerprinting) |
 
-### 2.2 Streaming Parser
+### 2.2 Three Parser Tiers
+
+EventMill provides three parsers that all produce identical
+`PcapSession` objects. Downstream analysis tools work the same
+regardless of which parser loaded the data.
+
+| Parser | When to Use | Speed | Invocation |
+|--------|-------------|-------|------------|
+| **Scapy** (streaming) | Default, < 50 MB | Baseline | `load captures/file.pcap` |
+| **dpkt** (C-backed) | 50–500 MB | 5-10× faster | `load captures/file.pcap --large` |
+| **Zeek Cloud Build** | 500 MB+ / multi-GB | 32-vCPU VM | `zeek file.pcap` → `zeek load` |
+
+#### Scapy Parser (default)
+
+#### Scapy Parser (default)
 
 The parser uses **scapy** to iterate packets in a single pass,
 extracting metadata without holding full packet payloads in memory.
 This allows analysis of large captures within the 50 MB file-size
 limit (`MAX_PCAP_SIZE_BYTES`).
+
+In addition to protocol metadata, the scapy parser extracts:
+
+- **TCP flags** (SYN/FIN/RST/zero-window) for health analysis
+- **ARP** requests/replies with MAC-to-IP mapping
+- **ICMP errors** (unreachable, TTL exceeded, redirects)
+- **IP fragmentation** and **TTL distribution**
+- **Routing loop detection** via duplicate IP IDs with different TTLs
+- **OT/ICS transactions** (Modbus function codes, DNP3, S7comm)
+- **Cleartext credentials** (FTP, Telnet, HTTP Basic — values redacted)
 
 **Key extraction logic:**
 
@@ -161,7 +234,21 @@ def is_internal(ip: str) -> bool:
     )
 ```
 
-### 2.3 Loading a PCAP
+### 2.3 dpkt Parser (fast mode)
+
+For PCAPs between 50–500 MB, the dpkt parser provides identical
+output 5-10× faster using C-backed struct unpacking:
+
+```
+eventmill (network_forensics) > load large_capture.pcap --large
+  Using dpkt fast parser...
+  ✓ 1,247,891 packets, 842 IPs, duration 8h 22m
+```
+
+The dpkt parser extracts the same metadata as scapy including
+TCP health, ARP, ICMP errors, OT transactions, and credentials.
+
+### 2.4 Loading a PCAP
 
 The `load` command is the primary way to load PCAPs. It resolves
 the file (local path, GCS URI, or pillar bucket lookup), registers
@@ -191,13 +278,136 @@ Docker/Cloud Run environments.
 
 ---
 
-## 3. Analysis Layer 1 — Static Summary Tools
+## 3. Zeek Cloud Build — Large PCAP Processing
+
+For PCAPs larger than 500 MB (common in OT/ICS environments and
+full packet captures from span ports), EventMill offloads processing
+to Google Cloud Build with a dedicated Zeek container.
+
+### 3.1 Architecture
+
+```text
+┌─────────────────┐     ┌──────────────────────┐     ┌───────────────┐
+│ CLI: zeek submit │────▶│ Cloud Build           │────▶│ GCS Bucket    │
+│ (gs:// or bare   │     │ E2_HIGHCPU_32         │     │ zeek-output/  │
+│  filename)       │     │ 500GB disk            │     │ ├─ conn.log   │
+└─────────────────┘     │ Zeek container         │     │ ├─ dns.log    │
+                        │ 30–60 min timeout      │     │ ├─ ssl.log    │
+                        └──────────────────────┘     │ ├─ http.log   │
+                                                      │ ├─ notice.log │
+                                                      │ └─ weird.log  │
+                                                      └───────┬───────┘
+                                                              │
+                        ┌──────────────────────┐              │
+                        │ CLI: zeek load        │◀─────────────┘
+                        │ parse_zeek_logs()     │
+                        │ → PcapSession         │
+                        │ (identical to scapy)  │
+                        └──────────────────────┘
+```
+
+### 3.2 CLI Commands
+
+**Submit a PCAP for Zeek processing:**
+
+```
+eventmill (network_forensics) > zeek gretna_site.pcap
+  Resolved: gs://ot-asset-inventory-eventmill-network-forensics/gretna_site.pcap
+  ✓ Submitted Cloud Build job: 12a4b5c6-...
+  Use 'zeek status' to monitor progress.
+```
+
+Bare filenames are auto-resolved from the default NF pillar bucket.
+Full `gs://` URIs are also accepted.
+
+**Submit asynchronously (don't wait):**
+
+```
+eventmill (network_forensics) > zeek massive_capture.pcap --async
+  ✓ Submitted. Build ID: 12a4b5c6-...
+  Monitor with: zeek status 12a4b5c6-...
+```
+
+**Check job status:**
+
+```
+eventmill (network_forensics) > zeek status
+  Build 12a4b5c6: WORKING (elapsed: 4m 22s)
+```
+
+**Load Zeek output into PcapSession:**
+
+```
+eventmill (network_forensics) > zeek load
+  Downloading Zeek logs from latest output...
+  Parsing: conn.log, dns.log, ssl.log, http.log, notice.log, weird.log
+  ✓ 29 log files parsed: 702 connections, 124 Modbus transactions, duration 45m
+  PCAP session ready — all analysis tools available.
+```
+
+Optionally specify a folder: `zeek load gretna_site_20260518`
+
+**List available Zeek outputs:**
+
+```
+eventmill (network_forensics) > zeek list
+  gretna_site_20260518/   29 files   2.1 MB
+  plant_b_20260510/       18 files   890 KB
+```
+
+**List submitted jobs:**
+
+```
+eventmill (network_forensics) > zeek jobs
+  12a4b5c6  gretna_site.pcap     SUCCESS   7m 12s
+  9f8e7d6c  plant_b.pcap         SUCCESS   3m 45s
+```
+
+### 3.3 Zeek Log Parsing
+
+The Zeek loader (`zeek_loader.py`) reads JSON-format Zeek logs and
+populates the same `PcapSession` object. All downstream tools
+(threat hunter, AI analyzer, flow analyzer) work identically.
+
+**Log files parsed:**
+
+| Zeek Log | PcapSession Fields Populated |
+|----------|------------------------------|
+| `conn.log` | `conversations`, `src/dst_ips`, `protocols`, `ports`, `ot_transactions` |
+| `dns.log` | `dns_queries`, `dns_responses` |
+| `ssl.log` | `tls_handshakes` (includes JA3, cipher, cert info) |
+| `http.log` | `http_requests` (includes user-agent, content-type) |
+| `notice.log` | `cleartext_creds` (Zeek password/cleartext notices) |
+| `weird.log` | `_zeek_weird` (protocol anomalies) |
+
+**Note:** Zeek logs do not contain raw packet-level data (TCP flags,
+ARP frames, ICMP raw headers), so netops health sections that rely
+on these fields (TCP health indicators, ARP health, STP/OSPF/EIGRP)
+will show "No traffic detected" when using Zeek-loaded sessions.
+Conversations, DNS, bandwidth, and port distribution analysis work
+fully.
+
+### 3.4 Cost
+
+Cloud Build charges only for actual **build time** (not queued time):
+
+| Resource | Rate |
+|----------|------|
+| E2_HIGHCPU_32 build time | ~$0.016/min |
+| GCS storage (Zeek output) | ~$0.020/GB/month |
+| Minimum charge | 1 build-minute |
+
+A typical OT PCAP (500 MB–2 GB) runs 5–15 minutes → **$0.08–$0.24**.
+
+---
+
+## 4. Analysis Layer 1 — Static Summary Tools
 
 These tools provide deterministic, zero-LLM views of the parsed PCAP
 data. They are fast, reproducible, and form the baseline for deeper
 analysis.
 
-### 3.1 pcap_summary — Protocol & Endpoint Overview
+### 4.1 pcap_summary — Protocol & Endpoint Overview
 
 Returns protocol distribution, unique IP counts, top conversations
 by bytes, and summary statistics for DNS/HTTP/TLS layers.
@@ -221,7 +431,7 @@ by bytes, and summary statistics for DNS/HTTP/TLS layers.
   TLS: 1,293 handshakes (948 unique SNIs)
 ```
 
-### 3.2 pcap_conversations — Top Talkers Table
+### 4.2 pcap_conversations — Top Talkers Table
 
 Displays the top N conversations sorted by bytes, packets, or
 duration. Each row includes directional classification (INT→EXT,
@@ -235,25 +445,25 @@ INT→INT, EXT→INT).
 3    192.168.1.22     8.8.8.8          53     UDP    INT→EXT     124.3 MB     8,201
 ```
 
-### 3.3 pcap_dns — DNS Activity Aggregation
+### 4.3 pcap_dns — DNS Activity Aggregation
 
 Groups DNS queries by domain, source IP, and resolved addresses.
 Useful for baseline validation and spotting anomalous resolution
 patterns.
 
-### 3.4 pcap_http — HTTP Request Extraction
+### 4.4 pcap_http — HTTP Request Extraction
 
 Lists all observed HTTP requests with method, host, path, and
 timestamps. Highlights unusual methods (`PROPFIND`, `CONNECT`,
 `TRACE`) that may indicate reconnaissance.
 
-### 3.5 pcap_timeline — Chronological Activity by IP
+### 4.5 pcap_timeline — Chronological Activity by IP
 
 Filters all activity for a specific IP address and presents a
 chronological timeline of connections, DNS queries, and HTTP/TLS
 events. Essential for reconstructing attacker movement.
 
-### 3.6 pcap_ioc — Indicator of Compromise Search
+### 4.6 pcap_ioc — Indicator of Compromise Search
 
 Searches the parsed PCAP data for a specific IOC (IP address, domain
 name, or port number) across all data stores — conversations, DNS
@@ -261,19 +471,19 @@ queries, HTTP requests, and TLS handshakes. Returns every match.
 
 ---
 
-## 4. Analysis Layer 2 — Threat Hunt Tools
+## 5. Analysis Layer 2 — Threat Hunt Tools
 
 These tools apply security-specific heuristics to detect threats
 that raw summaries miss. They use curated knowledge bases and
 statistical analysis — no LLM required.
 
-### 4.1 hunt_talkers — Volume-Based Anomaly Detection
+### 5.1 hunt_talkers — Volume-Based Anomaly Detection
 
 Identifies the top N hosts by data volume, connection count, or
 packet count. Classifies each as internal or external and flags
 directional patterns that may indicate data exfiltration or C2.
 
-### 4.2 hunt_ports — Port Analysis with ICS Awareness
+### 5.2 hunt_ports — Port Analysis with ICS Awareness
 
 Analyzes port usage against three knowledge bases:
 
@@ -286,7 +496,7 @@ Analyzes port usage against three knowledge bases:
 Output flags ports in each category with usage counts and associated
 hosts.
 
-### 4.3 hunt_beacons — C2 Beaconing Detection
+### 5.3 hunt_beacons — C2 Beaconing Detection
 
 Detects Command & Control beaconing patterns by analyzing
 inter-arrival times between connections from the same internal host
@@ -320,7 +530,7 @@ Output example:
     Duration: 7h 15m | Assessment: MEDIUM CONFIDENCE beacon
 ```
 
-### 4.4 hunt_dns — DNS Anomaly Analysis
+### 5.4 hunt_dns — DNS Anomaly Analysis
 
 Detects DNS-based threats using multiple heuristics:
 
@@ -345,7 +555,7 @@ def shannon_entropy(label: str) -> float:
 # Flag if entropy > 3.5 and label length > 10
 ```
 
-### 4.5 hunt_tls — TLS Fingerprinting
+### 5.5 hunt_tls — TLS Fingerprinting
 
 Analyzes TLS ClientHello messages for:
 
@@ -355,7 +565,7 @@ Analyzes TLS ClientHello messages for:
 - Cipher suite analysis and JA3 hash potential
 - Certificate chain anomalies
 
-### 4.6 hunt_lateral — Lateral Movement Detection
+### 5.6 hunt_lateral — Lateral Movement Detection
 
 Detects east-west movement within the network:
 
@@ -385,7 +595,7 @@ Detects east-west movement within the network:
   185.220.101.34 (EXT) → 10.0.1.100 (INT):502 (Modbus) — 47 pkts
 ```
 
-### 4.7 hunt_exfil — Data Exfiltration Detection
+### 5.7 hunt_exfil — Data Exfiltration Detection
 
 Identifies potential data exfiltration using:
 
@@ -415,13 +625,13 @@ Identifies potential data exfiltration using:
 
 ---
 
-## 5. Analysis Layer 3 — AI-Driven Insights
+## 6. Analysis Layer 3 — AI-Driven Insights
 
 Every Layer 2 hunt tool has an AI-enhanced counterpart that pipes
 the static output through a Gemini LLM with a role-appropriate system
 prompt. AI tools require the `GEMINI_API_KEY` environment variable.
 
-### 5.1 The AI Enhancement Pattern
+### 6.1 The AI Enhancement Pattern
 
 All AI modes follow the same internal pattern in `pcap_ai_analyzer`:
 
@@ -458,7 +668,7 @@ framework. It uses the LLM Dispatcher for tiered routing — light
 models (Flash) for small prompts, heavy models (Pro) for large ones.
 Connect with the `connect` command before running AI tools.
 
-### 5.2 Three Prompt Tiers
+### 6.2 Three Prompt Tiers
 
 Each AI mode is routed to one of three analyst prompt constants
 defined in `pcap_ai_analyzer/tool.py`:
@@ -468,8 +678,13 @@ defined in `pcap_ai_analyzer/tool.py`:
 | `TRIAGE_PROMPT` | Tier 1/2 SOC Analyst — initial triage, priority ranking, C2 beacon hunting | `triage_summary`, `hunt_talkers` |
 | `THREAT_HUNT_PROMPT` | Threat Hunter — MITRE ATT&CK mapping, hypothesis generation, evidence gathering | `hunt_beacons`, `hunt_dns`, `hunt_tls`, `hunt_lateral` |
 | `REPORTING_PROMPT` | Senior Incident Responder — executive summary, IOC extraction, shift handover | `hunt_exfil`, `report` |
+| `OT_TRIAGE_PROMPT` | OT/ICS Security Analyst — zone violations, unsafe operations, safety impact | `ot_triage`, `ot_threat_hunt` |
+| `OT_REPORTING_PROMPT` | OT Incident Responder — MITRE ATT&CK for ICS, IEC 62443, remediation | `ot_report` |
+| `NETOPS_TRIAGE_PROMPT` | Network Engineer — TCP health, DNS health, capacity anomalies | `netops_triage` |
+| `NETOPS_HEALTH_PROMPT` | Infrastructure Analyst — routing, ARP, STP, OSPF/EIGRP deep analysis | `netops_health` |
+| `NETOPS_REPORTING_PROMPT` | Ops Team Lead — health scorecard, recommendations, shift handover | `netops_report` |
 
-### 5.3 AI Mode Catalog
+### 6.3 AI Mode Catalog
 
 All modes are accessed via `pcap_ai_analyzer` with a `mode` parameter:
 
@@ -487,8 +702,14 @@ eventmill (network_forensics) > run pcap_ai_analyzer {"mode": "<mode_name>"}
 | `hunt_lateral` | threat_hunter lateral | Threat Hunt | Kill chain stage mapping, response priority |
 | `hunt_exfil` | threat_hunter exfil | Reporting | Severity assessment, IOC extraction, handover |
 | `report` | Comprehensive summary (all hunts) | Reporting | Executive summary, IOC list, shift handover |
+| `ot_triage` | OT static output | OT Triage | Zone violations, protocol anomalies, safety impact |
+| `ot_threat_hunt` | OT static output | OT Triage | Unauthorized writes, rogue devices, IEC 62443 |
+| `ot_report` | OT static output | OT Reporting | MITRE ATT&CK for ICS, remediation alignment |
+| `netops_triage` | NetOps static output | NetOps Triage | TCP health, DNS health, capacity anomalies |
+| `netops_health` | NetOps static output | NetOps Health | Routing, ARP, STP, OSPF/EIGRP deep analysis |
+| `netops_report` | NetOps static output | NetOps Reporting | Health scorecard, recommendations |
 
-### 5.4 Prompt Structure
+### 6.4 Prompt Structure
 
 Each prompt includes:
 
@@ -504,13 +725,233 @@ Each prompt includes:
 
 ---
 
-## 6. Condition Orange — Heightened Alert Mode
+## 7. OT/ICS Analysis Modes
+
+EventMill includes dedicated OT/ICS (Operational Technology /
+Industrial Control Systems) analysis modes for environments running
+Modbus, DNP3, S7comm, OPC-UA, BACnet, EtherNet/IP, or IEC-104.
+
+### 7.1 OT Protocol Parsing
+
+The PCAP parser extracts OT/ICS transactions at the application
+layer, including:
+
+| Protocol | Port | Extracted Fields |
+|----------|------|-----------------|
+| Modbus TCP | 502 | Unit ID, function code, read/write classification, exception status |
+| DNP3 | 20000 | Function code, object headers |
+| S7comm | 102 | PDU type, function code |
+| EtherNet/IP | 44818 | Command code, session handle |
+| BACnet | 47808 | Service choice |
+| OPC-UA | 4840 | Message type |
+| IEC-104 | 2404 | Type ID, cause of transmission |
+
+OT transactions are stored in `PcapSession.ot_transactions` and
+used by all three OT analysis modes.
+
+### 7.2 OT System Identity
+
+OT modes use a specialized `PCAP_OT_SYSTEM_IDENTITY` persona that
+understands:
+
+- Purdue Model zone classification (Level 0–5)
+- ICS protocol semantics (read vs. write operations)
+- Safety Instrumented Systems (SIS) impact
+- IEC 62443 zone/conduit model
+- MITRE ATT&CK for ICS framework
+
+### 7.3 OT Analysis Modes
+
+**ot_triage — Initial OT Incident Triage:**
+
+```
+eventmill (network_forensics) > run pcap_ai_analyzer {"mode": "ot_triage"}
+```
+
+Static output includes:
+- Unique OT endpoints and protocols
+- Write operations (function codes 5, 6, 15, 16 for Modbus)
+- Control commands and diagnostics
+- Zone violation detection (OT traffic crossing IT/OT boundary)
+
+The LLM then assesses: safety impact, unauthorized device detection,
+protocol anomalies, and immediate containment actions.
+
+**ot_threat_hunt — OT Threat Hypothesis Generation:**
+
+```
+eventmill (network_forensics) > run pcap_ai_analyzer {"mode": "ot_threat_hunt"}
+```
+
+Generates three OT-specific threat hypotheses with evidence
+gathering tasks, mapped to MITRE ATT&CK for ICS techniques.
+
+**ot_report — OT Shift Handover:**
+
+```
+eventmill (network_forensics) > run pcap_ai_analyzer {"mode": "ot_report"}
+```
+
+Produces an executive summary with IEC 62443 alignment,
+remediation recommendations, and safety impact assessment
+suitable for OT operations teams.
+
+### 7.4 Example: Modbus Write Detection
+
+```
+eventmill (network_forensics:gretna) > run pcap_ai_analyzer {"mode": "ot_triage"}
+
+  ════════════════════════════════════════════════════════════
+  OT / ICS PROTOCOL ANALYSIS
+  ════════════════════════════════════════════════════════════
+
+  Unique OT Endpoints:
+    10.1.5.22 ↔ 10.1.5.100 (Modbus, port 502)
+    10.1.5.22 ↔ 10.1.5.101 (Modbus, port 502)
+
+  Write Operations (Modbus):
+    FC6 (Write Single Register): 12 transactions
+    FC16 (Write Multiple Registers): 3 transactions
+    Source: 10.1.5.22 → 10.1.5.100, 10.1.5.101
+
+  Control Commands:
+    FC8 (Diagnostics): 2 transactions
+
+  🔍 AI ANALYSIS
+  [OT-specific assessment with safety impact, MITRE ICS mapping]
+```
+
+---
+
+## 8. NetOps Infrastructure Health Modes
+
+NetOps modes analyze network infrastructure health — TCP
+performance, routing stability, ARP health, and control plane
+protocols. These are designed for network engineering teams rather
+than security analysts.
+
+### 8.1 NetOps Static Analysis
+
+The `_get_netops_static_output()` method produces deterministic
+health analysis covering:
+
+| Section | What It Analyzes |
+|---------|-----------------|
+| TCP Health Indicators | SYN/FIN/RST ratios, retransmissions, zero-window events, connection completion rate |
+| Top Problem Conversations | Conversations ranked by RST + retransmit + zero-window count |
+| ICMP Error Messages | Unreachable, TTL exceeded, redirects — grouped by type |
+| Routing Loop Detection | ICMP TTL exceeded patterns, duplicate packets with different TTLs |
+| ARP Health | Request/reply ratio, gratuitous ARP, IP conflicts, ARP storms, unanswered targets |
+| Control Plane: STP | BPDUs, TCN count, root bridge stability, bridge enumeration |
+| Control Plane: HSRP | Hello count, state transitions, group/VIP mapping |
+| Control Plane: VRRP | Advertisement count, priority changes, VRID mapping |
+| Control Plane: OSPF | Hello/DBD/LSUpdate counts, area/router IDs, neighbor gap detection, LSUpdate bursts |
+| Control Plane: EIGRP | Hello/Update/Query/Reply counts, AS numbers, Stuck-In-Active detection |
+| IP Fragmentation | Fragment count and percentage (MTU mismatch detection) |
+| TTL Distribution | OS fingerprinting (Linux ~64, Windows ~128, network devices ~255), low-TTL alerts |
+| DNS Health | Unanswered queries, top DNS clients |
+| Top Bandwidth Consumers | Conversations ranked by bytes transferred |
+| Long-Lived Connections | Connections > 5 minutes with duration and volume |
+| Service Port Distribution | Known services, ICS ports, and unknown high ports |
+| Subnet Anomaly Summary | Subnets ranked by composite health score (RSTs, retransmits, ICMP errors, loops, IP conflicts) |
+
+### 8.2 NetOps Analysis Modes
+
+**netops_triage — Quick Health Assessment:**
+
+```
+eventmill (network_forensics) > run pcap_ai_analyzer {"mode": "netops_triage"}
+```
+
+Provides a rapid assessment of network health: TCP performance,
+DNS issues, and capacity anomalies. Best for initial triage of
+network complaints.
+
+**netops_health — Full Infrastructure Report:**
+
+```
+eventmill (network_forensics) > run pcap_ai_analyzer {"mode": "netops_health"}
+```
+
+Deep analysis of all infrastructure health indicators. The LLM
+correlates issues across sections (e.g., "high OSPF LSUpdate bursts
+coincide with elevated TCP retransmissions in subnet 10.1.5.0/24").
+
+**netops_report — Ops Team Handover:**
+
+```
+eventmill (network_forensics) > run pcap_ai_analyzer {"mode": "netops_report"}
+```
+
+Produces a structured handover report with health scorecard,
+prioritized recommendations, and root cause hypotheses.
+
+### 8.3 Example: Infrastructure Health Check
+
+```
+eventmill (network_forensics:gretna) > run pcap_ai_analyzer {"mode": "netops_triage"}
+
+  ════════════════════════════════════════════════════════════
+  TCP HEALTH INDICATORS
+  ════════════════════════════════════════════════════════════
+  Overall TCP Health: HEALTHY
+    Total TCP packets: 48,293
+    SYN packets: 1,204
+    FIN packets: 1,180
+    RST packets: 24 (0.05%)
+    Retransmissions: 147 (0.30%)
+    Connection completion rate (FIN/SYN): 98.0%
+
+  ════════════════════════════════════════════════════════════
+  ARP HEALTH
+  ════════════════════════════════════════════════════════════
+    Total ARP packets: 360
+    ARP Requests: 245
+    ARP Replies: 115
+    Request/Reply ratio: 2.1:1
+    No IP address conflicts detected.
+
+  ════════════════════════════════════════════════════════════
+  SUBNET ANOMALY SUMMARY (ranked by impact)
+  ════════════════════════════════════════════════════════════
+    10.1.5.0/24    Score=42  RSTs=12  Retx=30  ICMP=0  IPs=8
+    10.1.10.0/24   Score=8   RSTs=4   Retx=4   ICMP=0  IPs=3
+
+  🔍 AI ANALYSIS
+  [Network health assessment with root cause hypotheses]
+```
+
+### 8.4 Data Availability by Parser
+
+| Health Section | Scapy/dpkt | Zeek |
+|---------------|------------|------|
+| TCP Health (SYN/FIN/RST) | ✅ Full | ❌ Not available |
+| Conversation Health | ✅ Full | ❌ Not available |
+| ICMP Errors | ✅ Full | ❌ Not available |
+| Routing Loop Detection | ✅ Full | ❌ Not available |
+| ARP Health | ✅ Full | ❌ Not available |
+| STP/HSRP/VRRP | ✅ Full | ❌ Not available |
+| OSPF/EIGRP | ✅ Full | ❌ Not available |
+| IP Fragmentation / TTL | ✅ Full | ❌ Not available |
+| DNS Health | ✅ Full | ✅ Full |
+| Bandwidth Consumers | ✅ Full | ✅ Full |
+| Long-Lived Connections | ✅ Full | ✅ Full |
+| Service Port Distribution | ✅ Full | ✅ Full |
+| Subnet Anomaly Summary | ✅ Full | Partial (no RST/retransmit data) |
+
+For full netops analysis, load PCAPs with the scapy or dpkt parser.
+Zeek-loaded sessions provide conversation-level and DNS analysis but
+lack raw packet-level health metrics.
+
+---
+
+## 9. Condition Orange — Heightened Alert Mode
 
 Condition Orange is a toggle that modifies the AI analysis posture
 from evidence-based to paranoid. It is designed for active incident
 response where false negatives are more costly than false positives.
 
-### 6.1 How It Works
+### 9.1 How It Works
 
 When `condition_orange=True` is passed to any AI-enhanced tool, the
 system prompt receives this injection:
@@ -530,7 +971,7 @@ Do not be overly cautious. If there is no solid evidence of a
 threat, state so clearly.
 ```
 
-### 6.2 Behavioral Difference
+### 9.2 Behavioral Difference
 
 | Aspect | Normal Mode | Condition Orange |
 |--------|-------------|-----------------|
@@ -540,7 +981,7 @@ threat, state so clearly.
 | **Tone** | Measured, evidence-based | Urgent, assume-breach |
 | **Use case** | Routine triage, baseline | Active incident, known breach |
 
-### 6.3 CLI Usage
+### 9.3 CLI Usage
 
 Condition Orange is activated by setting `condition_orange` to `true`
 in the JSON payload:
@@ -551,12 +992,13 @@ eventmill (network_forensics) > run pcap_ai_analyzer {"mode": "hunt_beacons", "c
 eventmill (network_forensics) > run pcap_ai_analyzer {"mode": "report", "condition_orange": true}
 ```
 
-All eight AI modes accept the `condition_orange` flag:
+All fourteen AI modes accept the `condition_orange` flag:
 `triage_summary`, `hunt_talkers`, `hunt_beacons`,
 `hunt_dns`, `hunt_tls`, `hunt_lateral`, `hunt_exfil`,
-`report`.
+`report`, `ot_triage`, `ot_threat_hunt`, `ot_report`,
+`netops_triage`, `netops_health`, `netops_report`.
 
-### 6.4 Implementation in eventmill_v01
+### 9.4 Implementation in eventmill_v01
 
 In the plugin architecture, Condition Orange is passed through the
 JSON payload or the `ExecutionContext.config` dictionary:
@@ -593,13 +1035,13 @@ def execute(self, payload: dict, context: ExecutionContext) -> ToolResult:
 
 ---
 
-## 7. PCAP–Report Correlation (sync_pcap)
+## 10. PCAP–Report Correlation (sync_pcap)
 
 The `sync_pcap` tool is a three-stage correlation engine that
 bridges the gap between written incident reports (Markdown) and
 raw network evidence (PCAP data).
 
-### 7.1 Stage 1 — IOC Extraction from Markdown
+### 10.1 Stage 1 — IOC Extraction from Markdown
 
 Scans selected Markdown files (threat reports, analyst notes) and
 extracts IOCs using regex patterns:
@@ -617,7 +1059,7 @@ An optional AI-enhanced extraction mode
 IOC extraction that understands negative context (e.g., "this IP is
 NOT malicious" will be excluded).
 
-### 7.2 Stage 2 — PCAP Stream Matching
+### 10.2 Stage 2 — PCAP Stream Matching
 
 Re-streams through the loaded PCAP, matching each packet against the
 extracted IOC set:
@@ -629,7 +1071,7 @@ extracted IOC set:
 - **Temporal match**: Packet timestamp falls within ±5 minutes of
   an extracted timestamp
 
-### 7.3 Stage 3 — Correlated Output
+### 10.3 Stage 3 — Correlated Output
 
 Results can be output in two modes:
 
@@ -656,7 +1098,59 @@ IOC: suspicious-c2.example.com (Domain)
 
 ---
 
-## 8. Plugin Mapping to eventmill_v01
+## 11. Export & Artifact System
+
+All analysis output can be exported as PDF, Markdown, or JSON
+artifacts and stored locally or in GCS pillar buckets.
+
+### 11.1 Export Types
+
+| Export Type | Format | Usage |
+|-------------|--------|-------|
+| `pdf` | PDF document | `{"mode": "triage_summary", "export_type": "pdf"}` |
+| `markdown` | Markdown text | Default output format |
+| `json` | Structured JSON | Machine-readable results |
+| `mermaid` | Mermaid diagram | Attack path / flow visualizations |
+
+### 11.2 CLI Usage
+
+**Export to PDF:**
+
+```
+eventmill (network_forensics) > run pcap_ai_analyzer {"mode": "report", "export_type": "pdf"}
+  ✓ PDF exported: workspace/artifacts/sess_7b2e/art_a1b2c3d4.pdf
+```
+
+**Export to GCS:**
+
+```
+eventmill (network_forensics) > export art_a1b2c3d4
+  Uploading to gs://ot-asset-inventory-eventmill-common/exports/pcap_ai_analyzer/art_a1b2c3d4.pdf
+  ✓ Exported successfully.
+```
+
+**Export with subfolder:**
+
+```
+eventmill (network_forensics) > export art_a1b2c3d4 gretna_investigation
+  → gs://.../exports/pcap_ai_analyzer/gretna_investigation/art_a1b2c3d4.pdf
+```
+
+### 11.3 Artifact Registry
+
+Every tool run produces artifacts tracked in the session:
+
+```
+eventmill (network_forensics) > artifacts
+  art_7b2e9a4f  pcap         incident.pcap                 12.4 MB
+  art_a1b2c3d4  text         pcap_ai_analyzer_triage.md    24 KB
+  art_f8e7d6c5  json_events  pcap_threat_hunter_beacons    8 KB
+  art_3c4d5e6f  pdf_report   pcap_ai_analyzer_report.pdf   156 KB
+```
+
+---
+
+## 12. Plugin Mapping to eventmill_v01
 
 The following table maps the original `event_mill` network forensics
 functions to the planned `eventmill_v01` plugin architecture:
@@ -684,7 +1178,7 @@ functions to the planned `eventmill_v01` plugin architecture:
 | `ai_sync_pcap` | `pcap_ai_analyzer` | `network_forensics` | `true` | Implemented |
 | Firewall logs | `firewall_log_aggregator` | `network_forensics` | `false` | Planned |
 
-### 8.1 Proposed Plugin Manifest (pcap_threat_hunter)
+### 12.1 Proposed Plugin Manifest (pcap_threat_hunter)
 
 ```json
 {
@@ -721,7 +1215,7 @@ functions to the planned `eventmill_v01` plugin architecture:
 }
 ```
 
-### 8.2 Proposed Plugin Manifest (pcap_ai_analyzer)
+### 12.2 Proposed Plugin Manifest (pcap_ai_analyzer)
 
 ```json
 {
@@ -760,7 +1254,7 @@ functions to the planned `eventmill_v01` plugin architecture:
 
 ---
 
-## 9. Example Investigation Workflow
+## 13. Example Investigation Workflow
 
 ### Step 1 — Session & Pillar Setup
 
@@ -830,6 +1324,59 @@ eventmill (network_forensics) > run pcap_report_correlator {"files": ["dragos_re
 ```
 eventmill (network_forensics) > run pcap_ai_analyzer {"mode": "report", "condition_orange": true}
   [Executive summary, IOC list, immediate actions, caveats]
+```
+
+### Step 7 — Export PDF Report
+
+```
+eventmill (network_forensics) > run pcap_ai_analyzer {"mode": "report", "export_type": "pdf"}
+  ✓ PDF exported: workspace/artifacts/sess_7b2e/art_f1e2d3c4.pdf
+
+eventmill (network_forensics) > export art_f1e2d3c4
+  ✓ Uploaded to GCS.
+```
+
+---
+
+### Alternative: OT/ICS Investigation (Zeek + OT modes)
+
+For large OT PCAPs from span ports or network taps:
+
+```
+eventmill (network_forensics) > zeek gretna_site_capture.pcap
+  ✓ Submitted Cloud Build job. Use 'zeek status' to monitor.
+
+  [... wait for completion ...]
+
+eventmill (network_forensics) > zeek load
+  ✓ 29 log files parsed: 702 connections, 124 Modbus transactions
+
+eventmill (network_forensics) > run pcap_ai_analyzer {"mode": "ot_triage"}
+  [OT endpoints, write operations, zone violations, AI assessment]
+
+eventmill (network_forensics) > run pcap_ai_analyzer {"mode": "ot_threat_hunt"}
+  [Three OT threat hypotheses with MITRE ICS mapping]
+
+eventmill (network_forensics) > run pcap_ai_analyzer {"mode": "ot_report", "export_type": "pdf"}
+  [OT shift handover with IEC 62443 alignment, exported as PDF]
+```
+
+### Alternative: Network Health Check (NetOps modes)
+
+For network performance troubleshooting:
+
+```
+eventmill (network_forensics) > load span_port_capture.pcap
+  ✓ 248,000 packets, 45 IPs, duration 1h 15m
+
+eventmill (network_forensics) > run pcap_ai_analyzer {"mode": "netops_triage"}
+  [TCP health, ARP health, DNS health, subnet anomaly summary]
+
+eventmill (network_forensics) > run pcap_ai_analyzer {"mode": "netops_health"}
+  [Full infrastructure report: OSPF, STP, HSRP, routing loops, fragmentation]
+
+eventmill (network_forensics) > run pcap_ai_analyzer {"mode": "netops_report", "export_type": "pdf"}
+  [Health scorecard with prioritized recommendations]
 ```
 
 ---
