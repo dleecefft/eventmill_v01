@@ -312,7 +312,7 @@ to Google Cloud Build with a dedicated Zeek container.
 
 ```
 eventmill (network_forensics) > zeek example_site.pcap
-  Resolved: gs://ot-asset-inventory-eventmill-network-forensics/example_site.pcap
+  Resolved: gs://gcp-project-id-eventmill-network-forensics/example_site.pcap
   ✓ Submitted Cloud Build job: 12a4b5c6-...
   Use 'zeek status' to monitor progress.
 ```
@@ -1125,7 +1125,7 @@ eventmill (network_forensics) > run pcap_ai_analyzer {"mode": "report", "export_
 
 ```
 eventmill (network_forensics) > export art_a1b2c3d4
-  Uploading to gs://ot-asset-inventory-eventmill-common/exports/pcap_ai_analyzer/art_a1b2c3d4.pdf
+  Uploading to gs://gcp-project-id-eventmill-common/exports/pcap_ai_analyzer/art_a1b2c3d4.pdf
   ✓ Exported successfully.
 ```
 
