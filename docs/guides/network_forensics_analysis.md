@@ -311,8 +311,8 @@ to Google Cloud Build with a dedicated Zeek container.
 **Submit a PCAP for Zeek processing:**
 
 ```
-eventmill (network_forensics) > zeek gretna_site.pcap
-  Resolved: gs://ot-asset-inventory-eventmill-network-forensics/gretna_site.pcap
+eventmill (network_forensics) > zeek example_site.pcap
+  Resolved: gs://ot-asset-inventory-eventmill-network-forensics/example_site.pcap
   ✓ Submitted Cloud Build job: 12a4b5c6-...
   Use 'zeek status' to monitor progress.
 ```
@@ -345,13 +345,13 @@ eventmill (network_forensics) > zeek load
   PCAP session ready — all analysis tools available.
 ```
 
-Optionally specify a folder: `zeek load gretna_site_20260518`
+Optionally specify a folder: `zeek load example_site_20260518`
 
 **List available Zeek outputs:**
 
 ```
 eventmill (network_forensics) > zeek list
-  gretna_site_20260518/   29 files   2.1 MB
+  example_site_20260518/   29 files   2.1 MB
   plant_b_20260510/       18 files   890 KB
 ```
 
@@ -359,7 +359,7 @@ eventmill (network_forensics) > zeek list
 
 ```
 eventmill (network_forensics) > zeek jobs
-  12a4b5c6  gretna_site.pcap     SUCCESS   7m 12s
+  12a4b5c6  example_site.pcap     SUCCESS   7m 12s
   9f8e7d6c  plant_b.pcap         SUCCESS   3m 45s
 ```
 
@@ -799,7 +799,7 @@ suitable for OT operations teams.
 ### 7.4 Example: Modbus Write Detection
 
 ```
-eventmill (network_forensics:gretna) > run pcap_ai_analyzer {"mode": "ot_triage"}
+eventmill (network_forensics:example_site) > run pcap_ai_analyzer {"mode": "ot_triage"}
 
   ════════════════════════════════════════════════════════════
   OT / ICS PROTOCOL ANALYSIS
@@ -889,7 +889,7 @@ prioritized recommendations, and root cause hypotheses.
 ### 8.3 Example: Infrastructure Health Check
 
 ```
-eventmill (network_forensics:gretna) > run pcap_ai_analyzer {"mode": "netops_triage"}
+eventmill (network_forensics:example_site) > run pcap_ai_analyzer {"mode": "netops_triage"}
 
   ════════════════════════════════════════════════════════════
   TCP HEALTH INDICATORS
@@ -1132,8 +1132,8 @@ eventmill (network_forensics) > export art_a1b2c3d4
 **Export with subfolder:**
 
 ```
-eventmill (network_forensics) > export art_a1b2c3d4 gretna_investigation
-  → gs://.../exports/pcap_ai_analyzer/gretna_investigation/art_a1b2c3d4.pdf
+eventmill (network_forensics) > export art_a1b2c3d4 site_investigation
+  → gs://.../exports/pcap_ai_analyzer/site_investigation/art_a1b2c3d4.pdf
 ```
 
 ### 11.3 Artifact Registry
@@ -1343,7 +1343,7 @@ eventmill (network_forensics) > export art_f1e2d3c4
 For large OT PCAPs from span ports or network taps:
 
 ```
-eventmill (network_forensics) > zeek gretna_site_capture.pcap
+eventmill (network_forensics) > zeek example_site_capture.pcap
   ✓ Submitted Cloud Build job. Use 'zeek status' to monitor.
 
   [... wait for completion ...]
