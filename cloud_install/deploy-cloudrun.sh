@@ -38,6 +38,23 @@ gcloud services enable run.googleapis.com --project="${PROJECT_ID}" --quiet
 gcloud services enable cloudbuild.googleapis.com --project="${PROJECT_ID}" --quiet
 
 # ---------------------------------------------------------------------------
+# Step 1b: Grant Event Mill SA permission to act as default compute SA
+#          Required for Zeek Cloud Build job submission
+# ---------------------------------------------------------------------------
+echo ""
+echo "🔧 Granting Event Mill SA permission to act as default compute SA (Zeek Cloud Build)..."
+SA_NAME="eventmill-runner"
+SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+PROJECT_NUMBER=$(gcloud projects describe "${PROJECT_ID}" --format="value(projectNumber)")
+DEFAULT_COMPUTE_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+gcloud iam service-accounts add-iam-policy-binding "${DEFAULT_COMPUTE_SA}" \
+    --project="${PROJECT_ID}" \
+    --member="serviceAccount:${SA_EMAIL}" \
+    --role="roles/iam.serviceAccountUser" \
+    --quiet > /dev/null 2>&1 || true
+echo "   OK: roles/iam.serviceAccountUser on default compute SA for ${SA_NAME}"
+
+# ---------------------------------------------------------------------------
 # Step 2: Build the container image
 # ---------------------------------------------------------------------------
 echo ""

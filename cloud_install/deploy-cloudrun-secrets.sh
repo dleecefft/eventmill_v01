@@ -98,6 +98,20 @@ grant_secret_access "${SECRET_TTYD_USER}"
 grant_secret_access "${SECRET_TTYD_CRED}"
 
 # ---------------------------------------------------------------------------
+# Step 2b: Grant Event Mill SA permission to act as default compute SA
+#          Required for Zeek Cloud Build job submission
+# ---------------------------------------------------------------------------
+echo ""
+echo "🔧 Granting Event Mill SA permission to act as default compute SA (Zeek Cloud Build)..."
+DEFAULT_COMPUTE_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+gcloud iam service-accounts add-iam-policy-binding "${DEFAULT_COMPUTE_SA}" \
+    --project="${PROJECT_ID}" \
+    --member="serviceAccount:${SA_EMAIL}" \
+    --role="roles/iam.serviceAccountUser" \
+    --quiet > /dev/null 2>&1 || true
+echo "   OK: roles/iam.serviceAccountUser on default compute SA for ${SA_NAME}"
+
+# ---------------------------------------------------------------------------
 # Step 3: Build the container image
 # ---------------------------------------------------------------------------
 echo ""
