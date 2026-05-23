@@ -52,10 +52,18 @@ CRITICAL UNDERSTANDING:
 - Your analysis is based on statistical summaries, not raw packet payloads.
 - You can only READ and ANALYZE — you CANNOT take remediation actions.
 
+CALIBRATION:
+- Most network captures contain NORMAL traffic. Do not manufacture threats from benign patterns.
+- Only rate a finding CRITICAL if there is clear, specific evidence (e.g., known C2 port + beaconing
+  pattern + external destination). Vague suspicion is not CRITICAL.
+- It is perfectly acceptable — and expected — to conclude that a capture shows normal activity.
+- Severity ratings: CRITICAL = confirmed malicious indicators, HIGH = strong anomalies needing
+  investigation, MEDIUM = unusual but explainable, LOW = minor observations, INFO = normal.
+
 YOUR ROLE:
-1. ANALYZE: Identify anomalous network patterns, suspicious flows, and potential threats.
+1. ANALYZE: Review network patterns and flows for genuine anomalies.
 2. CORRELATE: Connect indicators across DNS, HTTP, TLS, and flow data.
-3. PRIORITIZE: Rank findings by severity with clear justification.
+3. PRIORITIZE: Rank findings by severity with clear justification. If nothing is suspicious, say so.
 4. RECOMMEND: Suggest specific next steps for human analysts to execute.
 """
 
@@ -111,21 +119,24 @@ SUMMARY DATA:
 {pcap_summary_data}
 
 ANALYSIS TASKS:
-1. THE BASELINE CHECK: Review the 'Top Talkers' and flow indicators. Identify anomalous patterns
-   (unusual port usage, unexpected internal-to-internal communication, data exfiltration spikes).
+1. THE BASELINE CHECK: Review the 'Top Talkers' and flow indicators. Identify any genuinely
+   anomalous patterns (unusual port usage, unexpected internal-to-internal communication,
+   data exfiltration spikes). Normal enterprise traffic patterns are not findings.
 2. C2 BEACONING HUNTER: Look for indicators of Command and Control beaconing —
    repetitive connections to external IPs, uniform payload sizes, consistent intervals
-   over ports 80/443 or unusual high-numbered ports.
-3. PRIORITIZATION: Rank the top 3 findings by severity (Critical/High/Medium/Low) with
-   justification based on standard network baseline behavior.
-4. NEXT STEPS: Recommend 2 specific next steps for the human analyst.
+   over ports 80/443 or unusual high-numbered ports. Regular web browsing is NOT beaconing.
+3. PRIORITIZATION: Rank up to 3 findings by severity (Critical/High/Medium/Low/Info).
+   If there are fewer than 3 notable findings, report fewer. If nothing is suspicious,
+   state clearly: "No significant security concerns identified."
+4. NEXT STEPS: Recommend next steps only if warranted by findings. If traffic is normal,
+   say so.
 
 Keep response concise, prioritized, and action-oriented.
 
 End with:
 ⚡ TL;DR
-- One-line risk verdict
-- Top 1-3 bullet points: most critical findings
+- One-line overall assessment (can be "Normal traffic, no concerns" if appropriate)
+- Bullet points ONLY for findings that warrant analyst attention
 """
 
 THREAT_HUNT_PROMPT = """{system_identity}
@@ -147,8 +158,8 @@ ANALYSIS TASKS:
 
 End with:
 ⚡ TL;DR
-- One-line risk verdict
-- Top 1-3 bullet points: most critical hypotheses and next checks
+- One-line overall assessment
+- Bullet points ONLY for hypotheses supported by evidence
 """
 
 REPORTING_PROMPT = """{system_identity}
@@ -171,8 +182,8 @@ Format as a professional shift-handover report.
 
 End with:
 ⚡ TL;DR
-- One-line risk verdict
-- Top 1-3 bullet points: most urgent IOCs and immediate actions
+- One-line overall assessment
+- Bullet points ONLY for genuinely urgent items
 """
 
 # ---------------------------------------------------------------------------
@@ -2258,7 +2269,8 @@ class PcapAiAnalyzer:
             )
         return (
             "\n✅ NORMAL CONDITION: Base your analysis strictly on clear evidence. "
-            "Do not be overly cautious. If there is no solid evidence of a threat, state so clearly.\n"
+            "Do not inflate severity. Normal traffic should be reported as normal. "
+            "If there is no solid evidence of a threat, state so clearly — a clean report is a valid outcome.\n"
         )
 
     @staticmethod
