@@ -2,10 +2,10 @@
 # Usage: .\deploy.ps1
 
 param(
-    [string]$Project = "apm0008778-prd-eltetl-80",
-    [string]$Region = "northamerica-northeast2",
-    [string]$Service = "threatbrief-fusion",
-    [string]$BuildConfig = "build-threatbrief-fusion.yaml"
+    [string]$Project = "your-project-id",
+    [string]$Region = "us-central1",
+    [string]$Service = "event-mill",
+    [string]$BuildConfig = "build-event-mill.yaml"
 )
 
 $ErrorActionPreference = "Stop"
