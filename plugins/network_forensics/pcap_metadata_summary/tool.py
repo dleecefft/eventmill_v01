@@ -909,7 +909,9 @@ def _extract_ot_transaction_dpkt(
 
     entry: Dict[str, Any] = {
         "protocol": ot_proto, "port": ot_port,
-        "src": src_ip, "dst": dst_ip, "ts": ts,
+        "src_ip": src_ip, "dst_ip": dst_ip,
+        "src_port": sport, "dst_port": dport,
+        "ts": ts,
     }
 
     raw = payload
@@ -1058,8 +1060,10 @@ def _extract_ot_transaction(
     entry: Dict[str, Any] = {
         "protocol": ot_proto,
         "port": ot_port,
-        "src": src_ip,
-        "dst": dst_ip,
+        "src_ip": src_ip,
+        "dst_ip": dst_ip,
+        "src_port": sport,
+        "dst_port": dport,
         "ts": ts,
     }
 
