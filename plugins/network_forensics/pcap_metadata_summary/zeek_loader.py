@@ -564,8 +564,7 @@ def _parse_modbus_log(path: Path, session) -> None:
         if track_addr and track_addr != "-":
             ot["register_address"] = track_addr
 
-        if len(session.ot_transactions) < 50000:
-            session.ot_transactions.append(ot)
+        session.ot_transactions.append(ot)
 
     logger.info("Parsed Modbus log: %s", path.name)
 
@@ -592,8 +591,7 @@ def _parse_modbus_detailed_log(path: Path, session) -> None:
         ot["is_diagnostic"] = False
         ot["is_exception"] = False
 
-        if len(session.ot_transactions) < 50000:
-            session.ot_transactions.append(ot)
+        session.ot_transactions.append(ot)
 
 
 def _parse_dnp3_log(path: Path, session) -> None:
@@ -641,8 +639,7 @@ def _parse_dnp3_log(path: Path, session) -> None:
         if obj_type and obj_type != "-":
             ot["object_type"] = obj_type
 
-        if len(session.ot_transactions) < 50000:
-            session.ot_transactions.append(ot)
+        session.ot_transactions.append(ot)
 
     logger.info("Parsed DNP3 log: %s", path.name)
 
@@ -685,8 +682,7 @@ def _parse_bacnet_log(path: Path, session) -> None:
         if prop_id and prop_id != "-":
             ot["property"] = prop_id
 
-        if len(session.ot_transactions) < 50000:
-            session.ot_transactions.append(ot)
+        session.ot_transactions.append(ot)
 
     logger.info("Parsed BACnet log: %s", path.name)
 
@@ -731,8 +727,7 @@ def _parse_s7comm_log(path: Path, session) -> None:
         if sub_func and sub_func != "-":
             ot["sub_function"] = sub_func
 
-        if len(session.ot_transactions) < 50000:
-            session.ot_transactions.append(ot)
+        session.ot_transactions.append(ot)
 
     logger.info("Parsed S7comm log: %s", path.name)
 
@@ -757,8 +752,7 @@ def _parse_enip_log(path: Path, session) -> None:
         ot["is_write"] = False
         ot["is_control"] = False
 
-        if len(session.ot_transactions) < 50000:
-            session.ot_transactions.append(ot)
+        session.ot_transactions.append(ot)
 
     logger.info("Parsed ENIP log: %s", path.name)
 
@@ -795,8 +789,7 @@ def _parse_cip_log(path: Path, session) -> None:
             c in str(service).lower() for c in ("reset", "stop", "start", "change")
         )
 
-        if len(session.ot_transactions) < 50000:
-            session.ot_transactions.append(ot)
+        session.ot_transactions.append(ot)
 
     logger.info("Parsed CIP log: %s", path.name)
 
@@ -828,8 +821,7 @@ def _parse_opcua_log(path: Path, session) -> None:
             c in str(service).lower() for c in ("call", "transfer", "close")
         )
 
-        if len(session.ot_transactions) < 50000:
-            session.ot_transactions.append(ot)
+        session.ot_transactions.append(ot)
 
     logger.info("Parsed OPC-UA log: %s", path.name)
 
