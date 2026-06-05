@@ -149,7 +149,7 @@ class ZeekCloudBuildClient:
                         f'mkdir -p /workspace/pcap /workspace/zeek-output && '
                         f'gsutil -o GSUtil:parallel_composite_upload_threshold=150M '
                         f'cp "{pcap_uri}" /workspace/pcap/capture.pcap && '
-                        f'echo "Downloaded $(ls -lh /workspace/pcap/capture.pcap | awk \'{{print $5}}\')"',
+                        f'echo "Downloaded $$(ls -lh /workspace/pcap/capture.pcap | awk \'{{print $$5}}\')"',
                     ],
                 ),
                 # Step 2: Install icsnpp OT packages AND run Zeek in ONE container
@@ -174,19 +174,19 @@ class ZeekCloudBuildClient:
                         'https://github.com/cisagov/icsnpp-s7comm '
                         'https://github.com/cisagov/icsnpp-enip '
                         'https://github.com/cisagov/icsnpp-opcua-binary; do '
-                        'echo "Installing $(basename $PKG)..." && '
-                        'zkg install --force --skiptest "$PKG" 2>&1 || true; '
+                        'echo "Installing $$(basename $$PKG)..." && '
+                        'zkg install --force --skiptest "$$PKG" 2>&1 || true; '
                         'done && '
-                        'echo "OT/ICS packages installed: $(zkg list | wc -l) packages" && '
+                        'echo "OT/ICS packages installed: $$(zkg list | wc -l) packages" && '
                         '# Phase 2: Run Zeek analysis\n'
                         'cd /workspace/zeek-output && '
                         'zeek -r /workspace/pcap/capture.pcap '
                         'LogAscii::use_json=T '
                         'local '
                         '"Site::local_nets += { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }" && '
-                        'echo "Zeek complete: $(ls *.log 2>/dev/null | wc -l) log files" && '
+                        'echo "Zeek complete: $$(ls *.log 2>/dev/null | wc -l) log files" && '
                         'for OT_LOG in modbus.log dnp3.log bacnet.log s7comm.log enip.log cip.log opcua_binary.log; do '
-                        '[ -f "$OT_LOG" ] && echo "OT: $OT_LOG $(wc -l < $OT_LOG) entries"; '
+                        '[ -f "$$OT_LOG" ] && echo "OT: $$OT_LOG $$(wc -l < $$OT_LOG) entries"; '
                         'done || true',
                     ],
                     wait_for=["download-pcap"],
@@ -199,7 +199,7 @@ class ZeekCloudBuildClient:
                     args=[
                         "-c",
                         f'for f in /workspace/zeek-output/*.log; do '
-                        f'  [ -f "$f" ] && gsutil cp "$f" "{output_prefix}/$(basename $f)"; '
+                        f'  [ -f "$$f" ] && gsutil cp "$$f" "{output_prefix}/$$(basename $$f)"; '
                         f'done && echo "Upload complete to {output_prefix}/"',
                     ],
                     wait_for=["run-zeek"],
