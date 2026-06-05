@@ -397,9 +397,12 @@ class EventMillShell(cmd.Cmd):
         """Set or show the active investigation pillar.
         
         Usage: pillar [pillar_name]
-        
+
         Available pillars: log_analysis, network_forensics,
         threat_modeling, cloud_investigation, risk_assessment
+
+        When a pillar is active, lists its tools with descriptions
+        and available --flag options.  Use 'help <tool>' for details.
         """
         if not self.session_manager.get_current_session():
             print("  No active session. Use 'new' to create one.")
@@ -417,10 +420,19 @@ class EventMillShell(cmd.Cmd):
                 if tools:
                     print(f"  Available tools ({len(tools)}):")
                     for tool in tools:
+                        desc = tool.manifest.description_short or ""
                         print(
                             f"    - {tool.manifest.display_name} "
                             f"({tool.tool_name})"
                         )
+                        if desc:
+                            print(f"      {desc}")
+                        flags = self._TOOL_FLAG_VALUES.get(tool.tool_name, {})
+                        if flags:
+                            opts = []
+                            for flag, vals in flags.items():
+                                opts.append(f"--{flag} [{', '.join(vals)}]")
+                            print(f"      Options: {';  '.join(opts)}")
             else:
                 print("  No pillar selected. Available pillars:")
                 for p in sorted(Pillar.ALL):
@@ -1303,6 +1315,9 @@ class EventMillShell(cmd.Cmd):
         """List available tools.
         
         Usage: tools [pillar]
+
+        Shows each tool's description and key options.
+        Use 'help <tool_name>' for full details on a specific tool.
         """
         pillar = arg.strip() if arg else None
         
@@ -1323,14 +1338,22 @@ class EventMillShell(cmd.Cmd):
             desc = m.description_short[:80] if m.description_short else "—"
             invoke = f"run {m.tool_name}"
             print(f"  {m.display_name:30s} {invoke:30s} {m.pillar:20s} {m.stability:12s} {desc}")
+            # Show primary option flag for quick reference
+            flags = self._TOOL_FLAG_VALUES.get(m.tool_name, {})
+            if flags:
+                primary = next(iter(flags))
+                vals = flags[primary]
+                print(f"  {' ':30s} {'':30s} {'':20s} {'':12s} --{primary}: {', '.join(vals)}")
     
     def do_help(self, arg: str) -> None:
         """Show help for a command or tool.
 
         Usage: help [command_or_tool_name]
 
-        For tool-specific usage, pass the tool name:
-          help threat_report_analyzer
+        For tool-specific usage with available --flags and values:
+          help pcap_ai_analyzer
+          help pcap_metadata_summary
+          help firewall_log_aggregator
         """
         if arg:
             plugin = self.plugin_loader.get(arg.strip())
@@ -1348,15 +1371,39 @@ class EventMillShell(cmd.Cmd):
         print(f"  {'─' * 60}")
         print(f"  {m.display_name}  ({m.tool_name})")
         print(f"  Pillar: {m.pillar}   Stability: {m.stability}")
-        print(f"  Invoke: run {m.tool_name} {{\"action\": \"...\"}}") 
+        if m.description_short:
+            print(f"  {m.description_short}")
         print(f"  {'─' * 60}")
+
+        # Show available options with valid values
+        flags = self._TOOL_FLAG_VALUES.get(m.tool_name, {})
+        if flags:
+            print()
+            print("  Available options:")
+            for flag, vals in flags.items():
+                print(f"    --{flag:25s} {', '.join(vals)}")
+
+        # Show usage examples
         print()
+        if flags:
+            first_flag = next(iter(flags))
+            first_val = flags[first_flag][0]
+            print(f"  Usage:")
+            print(f"    run {m.tool_name} --{first_flag} {first_val}")
+            if len(flags) > 1:
+                parts = [f"--{f} {vs[0]}" for f, vs in list(flags.items())[:3]]
+                print(f"    run {m.tool_name} {' '.join(parts)}")
+        else:
+            print(f"  Usage:")
+            print(f"    run {m.tool_name} --key value")
+        print()
+        print("  Tip: Use <Tab> after 'run {0} --' for option completion.".format(m.tool_name))
 
         if readme_path.exists():
+            print()
             rendered = self._render_markdown_plain(readme_path.read_text(encoding="utf-8"))
             print(rendered)
         else:
-            print(f"  {m.description_short}")
             print()
             print("  No README.md available for this tool.")
         print()
@@ -1561,9 +1608,16 @@ class EventMillShell(cmd.Cmd):
         Usage: run <tool_name> [--key value ...] | [json_payload]
 
         Examples:
-          run log_investigator --severity orange --file_path auth.log
+          run pcap_ai_analyzer --mode triage_summary
+          run pcap_metadata_summary --mode summary --sort_by bytes
+          run pcap_threat_hunter --hunt beacons
+          run firewall_log_aggregator --mode load --log_format fortinet_syslog
+          run log_investigator --mode workflow --workflow_type security_events
           run log_investigator {"severity": "orange", "file_path": "auth.log"}
           run log_investigator --verbose          (boolean flag, sets value to True)
+
+        Tip: Press <Tab> to auto-complete tool names, --flags, and values.
+             Type 'help <tool_name>' for detailed options per tool.
         """
         if not self.session_manager.get_current_session():
             print("  No active session. Use 'new' to create one.")
