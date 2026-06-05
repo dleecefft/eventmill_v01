@@ -719,6 +719,8 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
     Produces an identical PcapSession to ``parse_pcap_file`` but runs
     5-10x faster on large captures (>100 MB / >500K packets).
     """
+    import warnings
+
     if not DPKT_AVAILABLE:
         raise RuntimeError("dpkt is required for --fast mode. Install with: pip install dpkt")
 
@@ -734,6 +736,9 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
 
     _seen_ip_ids_dpkt: Dict[Tuple[str, str, int, int], int] = {}
     _seen_tcp_seqs_dpkt: Dict[Tuple[str, str, int, int, int], int] = {}  # retransmission detection
+
+    # Suppress dpkt's internal deprecation warning about IP.off
+    warnings.filterwarnings("ignore", message="IP.off is deprecated", category=UserWarning)
 
     with open(file_path, "rb") as f:
         try:
