@@ -329,6 +329,43 @@ def _parse_conn_log(path: Path, session) -> None:
                 "description": f"Zeek-detected {service} connection",
             })
 
+        # -----------------------------------------------------------
+        # Control plane protocol detection from conn.log
+        # Zeek sees OSPF/EIGRP/VRRP/HSRP as connections; we can count
+        # them even though Zeek doesn't deeply parse them.
+        # -----------------------------------------------------------
+        proto_lower = proto.lower()
+
+        # HSRP: UDP port 1985 or 2029
+        if proto_lower == "udp" and dst_port in (1985, 2029):
+            session.hsrp_hello_count += 1
+            session.hsrp_events.append({
+                "src": src_ip, "group": 0, "state": "Unknown",
+                "priority": 0, "vip": dst_ip, "ts": ts,
+            })
+
+        # VRRP: IP protocol 112 — Zeek may log as proto="vrrp" or service="vrrp"
+        if proto_lower == "vrrp" or (service and service.lower() == "vrrp"):
+            session.vrrp_advert_count += 1
+            session.vrrp_events.append({
+                "src": src_ip, "vrid": 0,
+                "priority": 0, "ts": ts,
+            })
+
+        # OSPF: IP protocol 89 — Zeek may log as proto="ospf"
+        if proto_lower == "ospf" or (service and service.lower() == "ospf"):
+            session.ospf_total_count += 1
+            session.ospf_hello_count += 1  # best approximation
+            session.ospf_router_ids.add(src_ip)
+            neighbor_key = (src_ip, dst_ip)
+            if ts:
+                session.ospf_neighbor_hellos[neighbor_key].append(ts)
+
+        # EIGRP: IP protocol 88 — Zeek may log as proto="eigrp"
+        if proto_lower == "eigrp" or (service and service.lower() == "eigrp"):
+            session.eigrp_total_count += 1
+            session.eigrp_hello_count += 1  # best approximation
+
 
 def _parse_dns_log(path: Path, session) -> None:
     """Parse dns.log — DNS queries and responses."""
