@@ -152,13 +152,16 @@ class ZeekCloudBuildClient:
                         f'echo "Downloaded $(ls -lh /workspace/pcap/capture.pcap | awk \'{{print $5}}\')"',
                     ],
                 ),
-                # Step 2: Install icsnpp OT/ICS protocol analyzers
+                # Step 2: Install icsnpp OT packages AND run Zeek in ONE container
+                # (packages install into Zeek's runtime dirs which don't persist
+                #  across Cloud Build steps — must be a single step)
                 cloudbuild_v1.BuildStep(
                     name="zeek/zeek:latest",
-                    id="install-ot-packages",
+                    id="run-zeek",
                     entrypoint="bash",
                     args=[
                         "-c",
+                        '# Phase 1: Install icsnpp OT/ICS protocol analyzers\n'
                         'apt-get update -qq && '
                         'apt-get install -y -qq --no-install-recommends '
                         'cmake make g++ libpcap-dev flex bison > /dev/null 2>&1 && '
@@ -171,29 +174,24 @@ class ZeekCloudBuildClient:
                         'https://github.com/cisagov/icsnpp-s7comm '
                         'https://github.com/cisagov/icsnpp-enip '
                         'https://github.com/cisagov/icsnpp-opcua-binary; do '
-                        'zkg install --force --skiptest "$$PKG" 2>&1 || true; '
+                        'echo "Installing $(basename $PKG)..." && '
+                        'zkg install --force --skiptest "$PKG" 2>&1 || true; '
                         'done && '
-                        'echo "OT/ICS packages installed: $$(zkg list | wc -l) packages"',
-                    ],
-                    wait_for=["download-pcap"],
-                ),
-                # Step 3: Run Zeek (with OT protocol analyzers)
-                cloudbuild_v1.BuildStep(
-                    name="zeek/zeek:latest",
-                    id="run-zeek",
-                    entrypoint="bash",
-                    args=[
-                        "-c",
+                        'echo "OT/ICS packages installed: $(zkg list | wc -l) packages" && '
+                        '# Phase 2: Run Zeek analysis\n'
                         'cd /workspace/zeek-output && '
                         'zeek -r /workspace/pcap/capture.pcap '
                         'LogAscii::use_json=T '
                         'local '
                         '"Site::local_nets += { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }" && '
-                        'echo "Zeek complete: $(ls *.log 2>/dev/null | wc -l) log files"',
+                        'echo "Zeek complete: $(ls *.log 2>/dev/null | wc -l) log files" && '
+                        'for OT_LOG in modbus.log dnp3.log bacnet.log s7comm.log enip.log cip.log opcua_binary.log; do '
+                        '[ -f "$OT_LOG" ] && echo "OT: $OT_LOG $(wc -l < $OT_LOG) entries"; '
+                        'done || true',
                     ],
-                    wait_for=["install-ot-packages"],
+                    wait_for=["download-pcap"],
                 ),
-                # Step 4: Upload results
+                # Step 3: Upload results
                 cloudbuild_v1.BuildStep(
                     name="gcr.io/google.com/cloudsdktool/cloud-sdk",
                     id="upload-results",
