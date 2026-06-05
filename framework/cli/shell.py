@@ -709,6 +709,12 @@ class EventMillShell(cmd.Cmd):
         file_ref = parts[0]
         file_path = Path(file_ref)
         
+        # If it looks like a folder, suggest --merge
+        if file_ref.endswith("/") or (file_path.is_dir() and not file_path.is_file()):
+            print(f"  '{file_ref}' is a folder. Use --merge to load all PCAPs in it:")
+            print(f"    load {file_ref} --merge [--fast]")
+            return
+        
         # Try local file first
         if file_path.exists():
             artifact_type = parts[1] if len(parts) > 1 else self._infer_artifact_type(file_path)
@@ -889,17 +895,19 @@ class EventMillShell(cmd.Cmd):
 
         # Determine target path
         if parts:
-            target = Path(parts[0])
+            target_str = parts[0].rstrip("/")
+            target = Path(target_str)
         else:
             # No path — try workspace location from storage resolver
             session = self.session_manager.get_current_session()
-            if self.storage_resolver and session and session.workspace_folder:
-                # Resolve workspace folder from bucket
-                print(f"  --merge with no path: searching workspace '{session.workspace_folder}' in bucket...")
-                pcap_files = self._merge_resolve_bucket_folder(session, use_dpkt, parse_fn)
-                if pcap_files is not None:
+            if self.storage_resolver and session and session.active_pillar:
+                ws = session.workspace_folder or ""
+                print(f"  --merge: searching '{ws or 'bucket root'}' for PCAPs...")
+                result = self._merge_resolve_bucket_folder(session, use_dpkt, parse_fn)
+                if result is not None:
                     return
             # Fallback: current working directory
+            target_str = "."
             target = Path(".")
 
         # Single file merge — merge into existing session
@@ -964,8 +972,8 @@ class EventMillShell(cmd.Cmd):
         session = self.session_manager.get_current_session()
         if self.storage_resolver and session and session.active_pillar:
             # Treat as a bucket folder path
-            print(f"  Resolving '{target}' from bucket...")
-            self._merge_resolve_bucket_folder(session, use_dpkt, parse_fn, str(target))
+            print(f"  Resolving '{target_str}' from bucket...")
+            self._merge_resolve_bucket_folder(session, use_dpkt, parse_fn, target_str)
             return
 
         print(f"  Path not found: {target}")
@@ -985,15 +993,16 @@ class EventMillShell(cmd.Cmd):
         PCAP_EXTENSIONS = {".pcap", ".pcapng", ".cap"}
 
         try:
-            folder = prefix or session.workspace_folder or ""
-            files = self.storage_resolver.list_files(
+            # Use prefix as workspace_folder override, or fall back to session's
+            folder = prefix.rstrip("/") if prefix else session.workspace_folder
+            files = self.storage_resolver.list_workspace(
                 pillar=session.active_pillar,
-                prefix=folder,
+                workspace_folder=folder,
+                include_common=False,
             )
             pcap_files = [
                 f for f in files
                 if any(f["filename"].lower().endswith(ext) for ext in PCAP_EXTENSIONS)
-                and "/" not in f["filename"].split(folder + "/", 1)[-1].lstrip("/").rstrip("/")
             ]
         except Exception as e:
             print(f"  Bucket listing failed: {e}")
@@ -1015,18 +1024,17 @@ class EventMillShell(cmd.Cmd):
             fname = f_info["filename"]
             print(f"  [{i}/{len(pcap_files)}] Downloading & parsing {fname}...")
             try:
-                resolved = self.storage_resolver.resolve(
-                    filename=fname,
-                    pillar=session.active_pillar,
-                    workspace_folder=session.workspace_folder,
+                from framework.cloud.resolver import ResolvedPath
+                resolved = ResolvedPath(
+                    bucket=f_info["bucket"],
+                    object_path=f_info["object_path"],
+                    source=f_info["source"],
+                    workspace_folder=folder,
                 )
-                if not resolved:
-                    print(f"    ✗ Could not resolve {fname}")
-                    continue
 
                 local_dest = (
                     self.workspace_path / "artifacts"
-                    / session.session_id / fname.rsplit("/", 1)[-1]
+                    / session.session_id / fname
                 )
                 local_dest.parent.mkdir(parents=True, exist_ok=True)
                 self.storage_resolver.download(resolved, local_dest)
