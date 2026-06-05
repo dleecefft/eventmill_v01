@@ -249,18 +249,30 @@ def _parse_conn_log(path: Path, session) -> None:
         if src_port:
             session.src_ports[src_port] += 1
 
-        # Protocol distribution
-        session.protocols[proto_upper] += 1
-        if service:
-            session.protocols[service.upper()] += 1
-
-        # Build conversation key (matches scapy/dpkt parser format)
-        conv_key = (src_ip, dst_ip, dst_port, proto_upper)
-
+        # Connection byte/packet counts
         orig_bytes = int(entry.get("orig_bytes") or entry.get("orig_ip_bytes") or 0)
         resp_bytes = int(entry.get("resp_bytes") or entry.get("resp_ip_bytes") or 0)
         orig_pkts = int(entry.get("orig_pkts", 0))
         resp_pkts = int(entry.get("resp_pkts", 0))
+        total_pkts = orig_pkts + resp_pkts
+
+        # Protocol distribution — count by packets (not connections) to
+        # match scapy/dpkt behaviour where protocols += 1 per packet.
+        if total_pkts > 0:
+            session.protocols[proto_upper] += total_pkts
+            if service:
+                session.protocols[service.upper()] += total_pkts
+        else:
+            # Fallback: count at least 1 so the protocol appears
+            session.protocols[proto_upper] += 1
+            if service:
+                session.protocols[service.upper()] += 1
+
+        # Accumulate total transferred bytes for file_size estimate
+        session.file_size += orig_bytes + resp_bytes
+
+        # Build conversation key (matches scapy/dpkt parser format)
+        conv_key = (src_ip, dst_ip, dst_port, proto_upper)
 
         conv = session.conversations[conv_key]
         conv["packets"] += orig_pkts + resp_pkts
