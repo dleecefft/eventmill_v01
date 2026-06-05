@@ -1430,13 +1430,130 @@ class EventMillShell(cmd.Cmd):
 
         return "\n".join(out)
 
+    # -------------------------------------------------------------------
+    # Tab completion data for tool --flag value arguments
+    # -------------------------------------------------------------------
+
+    _TOOL_FLAG_VALUES: dict[str, dict[str, list[str]]] = {
+        "pcap_ai_analyzer": {
+            "mode": [
+                "triage_summary", "hunt_talkers", "hunt_beacons", "hunt_dns",
+                "hunt_tls", "hunt_lateral", "hunt_exfil", "report",
+                "ot_triage", "ot_threat_hunt", "ot_report",
+                "netops_triage", "netops_health", "netops_report",
+            ],
+            "export_type": ["pdf"],
+            "condition_orange": ["true", "false"],
+        },
+        "pcap_metadata_summary": {
+            "mode": ["load", "summary", "conversations", "dns", "http", "tls", "timeline", "ioc"],
+            "sort_by": ["bytes", "packets", "duration"],
+        },
+        "pcap_threat_hunter": {
+            "hunt": ["talkers", "ports", "beacons", "dns", "tls", "lateral", "exfil"],
+        },
+        "pcap_report_correlator": {
+            "mode": ["extract", "correlate", "full"],
+            "use_ai_extraction": ["true", "false"],
+        },
+        "pcap_ip_search": {
+            "mode": ["ioc", "timeline"],
+        },
+        "pcap_flow_analyzer": {
+            "mode": ["bidirectional", "long_connections", "protocol_breakdown"],
+        },
+        "firewall_log_aggregator": {
+            "mode": ["load", "summary", "top_talkers", "deny_hotspots", "port_scan"],
+            "log_format": ["auto", "iptables", "fortinet_syslog", "paloalto_csv",
+                           "pfsense", "windows_fw", "generic_csv"],
+        },
+        "log_investigator": {
+            "mode": ["investigate", "workflow"],
+            "workflow_type": ["top_talkers", "investigate_ip", "security_events", "attack_patterns"],
+            "full_log": ["true", "false"],
+        },
+        "log_navigator": {
+            "action": ["list", "read", "metadata"],
+        },
+        "log_pattern_analyzer": {
+            "mode": ["grok", "regex", "discover"],
+            "ai_analysis": ["true", "false"],
+            "full_log": ["true", "false"],
+        },
+        "log_searcher": {
+            "mode": ["text", "regex"],
+            "invert": ["true", "false"],
+        },
+        "threat_intel_ingester": {
+            "ioc_types": ["ip", "domain", "hash_md5", "hash_sha1", "hash_sha256",
+                          "url", "email", "cve", "mitre_technique"],
+            "confidence_threshold": ["low", "medium", "high"],
+        },
+    }
+
     def complete_run(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
-        # Complete tool names (first argument only)
         parts = line.split()
+        # Complete tool name (first argument)
         if len(parts) <= 1 or (len(parts) == 2 and not line.endswith(" ")):
             all_tools = [p.tool_name for p in self.plugin_loader.list_all()]
             return [t for t in sorted(all_tools) if t.startswith(text)]
+
+        tool_name = parts[1]
+        flag_values = self._TOOL_FLAG_VALUES.get(tool_name, {})
+
+        # Determine if we're completing a flag name or a flag value
+        prev = parts[-1] if not line.endswith(" ") else ""
+        prev_prev = parts[-2] if len(parts) >= 2 else ""
+
+        # If previous token is a --flag, complete its values
+        if line.endswith(" ") and len(parts) >= 3 and parts[-1].startswith("--"):
+            flag = parts[-1][2:]
+            if flag in flag_values:
+                return [v for v in flag_values[flag] if v.startswith(text)]
+        elif not line.endswith(" ") and len(parts) >= 4 and prev_prev.startswith("--"):
+            flag = prev_prev[2:]
+            if flag in flag_values:
+                return [v for v in flag_values[flag] if v.startswith(text)]
+
+        # Complete --flag names
+        if line.endswith(" ") or text.startswith("--"):
+            available_flags = [f"--{f}" for f in flag_values.keys()]
+            # Don't suggest flags already used
+            used = {p for p in parts if p.startswith("--")}
+            available_flags = [f for f in available_flags if f not in used]
+            return [f for f in available_flags if f.startswith(text)]
+
         return []
+
+    def complete_load(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        parts = line.split()
+        # After filename, suggest --fast and artifact types
+        if len(parts) >= 2 and line.endswith(" "):
+            used = set(parts)
+            opts = []
+            if "--fast" not in used:
+                opts.append("--fast")
+            artifact_types = ["pcap", "json_events", "log_stream", "risk_model",
+                              "cloud_audit_log", "pdf_report", "html_report",
+                              "docx_report", "image", "text"]
+            opts.extend(t for t in artifact_types if t not in used)
+            return [o for o in opts if o.startswith(text)]
+        if not line.endswith(" ") and text.startswith("--"):
+            return [f for f in ["--fast"] if f.startswith(text)]
+        return []
+
+    def complete_export(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        parts = line.split()
+        # Complete artifact IDs (first argument)
+        if len(parts) <= 1 or (len(parts) == 2 and not line.endswith(" ")):
+            session = self.session_manager.get_current_session() if self.session_manager else None
+            if session and hasattr(session, 'artifacts'):
+                art_ids = [a.artifact_id for a in session.artifacts]
+                return [a for a in art_ids if a.startswith(text)]
+        return []
+
+    def complete_workspace(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        return [c for c in ["clear"] if c.startswith(text)]
 
     def do_run(self, arg: str) -> None:
         """Run a tool on the current session.
