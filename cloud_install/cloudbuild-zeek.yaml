@@ -14,9 +14,10 @@
 #
 # The pipeline:
 #   1. Downloads PCAP from GCS
-#   2. Runs Zeek with local policy (conn, dns, ssl, http, files, notice, weird)
-#   3. Converts Zeek TSV logs to JSON (for EventMill json_events compatibility)
-#   4. Uploads JSON logs back to GCS output prefix
+#   2. Installs icsnpp OT/ICS protocol analyzer packages (Modbus, DNP3, BACnet, etc.)
+#   3. Runs Zeek with local policy + OT analyzers
+#   4. Converts Zeek TSV logs to JSON (for EventMill json_events compatibility)
+#   5. Uploads JSON logs back to GCS output prefix
 # =============================================================================
 
 steps:
@@ -34,17 +35,60 @@ steps:
         ls -lh /workspace/pcap/capture.pcap
         echo "Download complete."
 
-  # Step 2: Run Zeek analysis
+  # Step 2: Install icsnpp OT/ICS protocol analyzers
+  - name: 'zeek/zeek:latest'
+    id: 'install-ot-packages'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "Installing build dependencies for icsnpp packages..."
+        apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+          cmake make g++ libpcap-dev flex bison > /dev/null 2>&1
+        echo "Build dependencies installed."
+
+        echo "Configuring zkg..."
+        zkg autoconfig --force
+        zkg refresh
+
+        echo "Installing icsnpp OT/ICS protocol analyzer packages..."
+        FAILED=""
+        for PKG in \
+          https://github.com/cisagov/icsnpp-modbus \
+          https://github.com/cisagov/icsnpp-dnp3 \
+          https://github.com/cisagov/icsnpp-bacnet \
+          https://github.com/cisagov/icsnpp-s7comm \
+          https://github.com/cisagov/icsnpp-enip \
+          https://github.com/cisagov/icsnpp-opcua-binary; do
+          PKG_NAME=$$(basename "$$PKG")
+          echo "  Installing $${PKG_NAME}..."
+          if zkg install --force --skiptest "$$PKG" 2>&1; then
+            echo "    ✓ $${PKG_NAME} installed"
+          else
+            echo "    ✗ $${PKG_NAME} failed (non-fatal, continuing)"
+            FAILED="$${FAILED} $${PKG_NAME}"
+          fi
+        done
+
+        echo ""
+        echo "Installed OT/ICS packages:"
+        zkg list
+        if [ -n "$$FAILED" ]; then
+          echo "Warning: failed to install:$${FAILED}"
+        fi
+    waitFor: ['download-pcap']
+
+  # Step 3: Run Zeek analysis (with OT protocol analyzers)
   - name: 'zeek/zeek:latest'
     id: 'run-zeek'
     entrypoint: 'bash'
     args:
       - '-c'
       - |
-        echo "Running Zeek analysis..."
+        echo "Running Zeek analysis (with OT/ICS protocol support)..."
         cd /workspace/zeek-output
 
-        # Run Zeek with local policy scripts
+        # Run Zeek with local policy scripts + installed OT packages
         # LogAscii::use_json=T outputs JSON instead of TSV
         zeek -r /workspace/pcap/capture.pcap \
           LogAscii::use_json=T \
@@ -69,7 +113,15 @@ steps:
           NOTICE_COUNT=$(wc -l < notice.log)
           echo "Notices generated: ${NOTICE_COUNT}"
         fi
-    waitFor: ['download-pcap']
+
+        # OT/ICS protocol log summary
+        for OT_LOG in modbus.log dnp3.log bacnet.log s7comm.log enip.log cip.log opcua_binary.log; do
+          if [ -f "${OT_LOG}" ]; then
+            OT_COUNT=$(wc -l < "${OT_LOG}")
+            echo "OT/ICS ${OT_LOG}: ${OT_COUNT} entries"
+          fi
+        done
+    waitFor: ['install-ot-packages']
 
   # Step 3: Upload Zeek JSON logs to GCS
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'

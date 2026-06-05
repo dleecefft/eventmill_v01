@@ -152,7 +152,32 @@ class ZeekCloudBuildClient:
                         f'echo "Downloaded $(ls -lh /workspace/pcap/capture.pcap | awk \'{{print $5}}\')"',
                     ],
                 ),
-                # Step 2: Run Zeek
+                # Step 2: Install icsnpp OT/ICS protocol analyzers
+                cloudbuild_v1.BuildStep(
+                    name="zeek/zeek:latest",
+                    id="install-ot-packages",
+                    entrypoint="bash",
+                    args=[
+                        "-c",
+                        'apt-get update -qq && '
+                        'apt-get install -y -qq --no-install-recommends '
+                        'cmake make g++ libpcap-dev flex bison > /dev/null 2>&1 && '
+                        'zkg autoconfig --force && '
+                        'zkg refresh && '
+                        'for PKG in '
+                        'https://github.com/cisagov/icsnpp-modbus '
+                        'https://github.com/cisagov/icsnpp-dnp3 '
+                        'https://github.com/cisagov/icsnpp-bacnet '
+                        'https://github.com/cisagov/icsnpp-s7comm '
+                        'https://github.com/cisagov/icsnpp-enip '
+                        'https://github.com/cisagov/icsnpp-opcua-binary; do '
+                        'zkg install --force --skiptest "$$PKG" 2>&1 || true; '
+                        'done && '
+                        'echo "OT/ICS packages installed: $$(zkg list | wc -l) packages"',
+                    ],
+                    wait_for=["download-pcap"],
+                ),
+                # Step 3: Run Zeek (with OT protocol analyzers)
                 cloudbuild_v1.BuildStep(
                     name="zeek/zeek:latest",
                     id="run-zeek",
@@ -166,9 +191,9 @@ class ZeekCloudBuildClient:
                         '"Site::local_nets += { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }" && '
                         'echo "Zeek complete: $(ls *.log 2>/dev/null | wc -l) log files"',
                     ],
-                    wait_for=["download-pcap"],
+                    wait_for=["install-ot-packages"],
                 ),
-                # Step 3: Upload results
+                # Step 4: Upload results
                 cloudbuild_v1.BuildStep(
                     name="gcr.io/google.com/cloudsdktool/cloud-sdk",
                     id="upload-results",

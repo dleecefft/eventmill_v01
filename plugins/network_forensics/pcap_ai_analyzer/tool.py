@@ -2332,8 +2332,8 @@ class PcapAiAnalyzer:
                 lines.append(f"  {proto:<18} {cnt:>6,} transactions")
 
             # Unique OT endpoints
-            ot_sources = set(t["src_ip"] for t in ot)
-            ot_dests = set(t["dst_ip"] for t in ot)
+            ot_sources = set(t["src"] for t in ot)
+            ot_dests = set(t["dst"] for t in ot)
             ot_endpoints = ot_sources | ot_dests
             int_ot = [ip for ip in ot_endpoints if is_internal(ip)]
             ext_ot = [ip for ip in ot_endpoints if not is_internal(ip)]
@@ -2349,9 +2349,9 @@ class PcapAiAnalyzer:
                 lines.append("-" * 60)
                 write_by_src = defaultdict(list)
                 for w in writes:
-                    write_by_src[w["src_ip"]].append(w)
+                    write_by_src[w["src"]].append(w)
                 for src, ws in sorted(write_by_src.items(), key=lambda x: len(x[1]), reverse=True)[:15]:
-                    dsts = sorted(set(w["dst_ip"] for w in ws))
+                    dsts = sorted(set(w["dst"] for w in ws))
                     protos = sorted(set(w["protocol"] for w in ws))
                     func_names = sorted(set(w.get("function_name", "?") for w in ws))
                     lines.append(
@@ -2368,7 +2368,7 @@ class PcapAiAnalyzer:
                 for c in controls[:20]:
                     func = c.get("function_name") or c.get("function", "?")
                     lines.append(
-                        f"  {c['src_ip']} → {c['dst_ip']}:{c['dst_port']} ({c['protocol']}) "
+                        f"  {c['src']} → {c['dst']}:{c.get('port', '?')} ({c['protocol']}) "
                         f"— {func}"
                     )
 
@@ -2392,7 +2392,7 @@ class PcapAiAnalyzer:
                 for d in diags[:10]:
                     func = d.get("function_name", "?")
                     lines.append(
-                        f"  {d['src_ip']} → {d['dst_ip']}:{d['dst_port']} ({d['protocol']}) — {func}"
+                        f"  {d['src']} → {d['dst']}:{d.get('port', '?')} ({d['protocol']}) — {func}"
                     )
 
             # Per-protocol function code distribution (Modbus detail)

@@ -1,0 +1,56 @@
+{
+  "tool_name": "asset_inventory_lookup",
+  "version": "1.0.0",
+  "pillar": "log_analysis",
+  "display_name": "Asset Inventory Lookup",
+  "description_short": "Look up IP addresses from threat intel reports against a BigQuery asset inventory table to identify affected internal assets.",
+  "description_llm": "Use this tool AFTER threat_intel_ingester has produced a json_events artifact containing extracted IOCs. This tool takes the IP addresses from that output and queries a BigQuery asset inventory table to determine which internal assets (servers, workstations, network devices, etc.) correspond to those IPs. The result tells the analyst which specific organizational assets are potentially affected by the threats described in the report. This is an enrichment step — it adds organizational context to raw threat intelligence. Only use this when the analyst has a BigQuery inventory table configured and wants to correlate report IPs against known internal assets.",
+  "author": "Event Mill Contributors",
+  "owner_team": "log_analysis_core",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/dleecefft/event_mill",
+  "repository": "https://github.com/dleecefft/event_mill",
+  "entry_point": "tool.py",
+  "class_name": "AssetInventoryLookup",
+  "artifacts_consumed": ["json_events"],
+  "artifacts_produced": ["json_events"],
+  "capabilities": [
+    "artifact:json_events",
+    "operation:enrich",
+    "operation:lookup",
+    "entity:ip",
+    "entity:asset",
+    "domain:asset_inventory",
+    "domain:threat_intel",
+    "external:bigquery",
+    "output:json"
+  ],
+  "input_schema": "schemas/input.schema.json",
+  "output_schema": "schemas/output.schema.json",
+  "timeout_class": "medium",
+  "cost_hint": "moderate",
+  "model_tier": "light",
+  "safe_for_auto_invoke": false,
+  "requires_auth": true,
+  "requires_llm": true,
+  "external_connectivity": true,
+  "minimum_framework_version": "0.2.0",
+  "python_version": "3.11",
+  "dependencies": [
+    "google-cloud-bigquery>=3.20.0"
+  ],
+  "reference_data_overrides": [],
+  "stability": "experimental",
+  "tags": [
+    "asset_inventory", "bigquery", "ip_lookup", "enrichment",
+    "threat_intel", "cmdb", "asset_identification"
+  ],
+  "result_summary_fields": [
+    "total_ips_queried",
+    "matched_assets",
+    "unmatched_ips",
+    "asset_types"
+  ],
+  "chains_to": ["context_enriched_analyzer"],
+  "chains_from": ["threat_intel_ingester"]
+}

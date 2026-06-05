@@ -4,7 +4,11 @@ Zeek Log Parser — Converts Zeek JSON logs into PcapSession
 Reads Zeek's JSON-format log files (conn.log, dns.log, ssl.log,
 http.log, files.log, notice.log, weird.log) and populates a
 PcapSession object identical to what the scapy/dpkt parsers produce.
-
+OT/ICS protocol support:
+  Parses dedicated Zeek OT analyzer logs produced by the icsnpp
+  package family — modbus.log, dnp3.log, bacnet.log, s7comm.log,
+  enip.log / cip.log, opcua_binary.log.  Falls back to service-field
+  detection in conn.log when dedicated logs are absent.
 This allows all downstream tools (pcap_threat_hunter, pcap_ai_analyzer,
 pcap_ip_search, pcap_flow_analyzer, pcap_report_correlator) to work
 on Zeek output with zero changes.
@@ -32,6 +36,46 @@ _OT_SERVICES = {
     "modbus", "dnp3", "bacnet", "enip", "cip", "s7comm",
     "opcua", "iec104", "goose", "mms",
 }
+
+# Modbus function code names (matches scapy/dpkt parser)
+_MODBUS_FUNC_NAMES: Dict[int, str] = {
+    1: "Read Coils", 2: "Read Discrete Inputs",
+    3: "Read Holding Registers", 4: "Read Input Registers",
+    5: "Write Single Coil", 6: "Write Single Register",
+    8: "Diagnostics", 15: "Write Multiple Coils",
+    16: "Write Multiple Registers", 22: "Mask Write Register",
+    23: "Read/Write Multiple Registers", 43: "Read Device ID",
+}
+_MODBUS_WRITE_FUNCS = {5, 6, 15, 16, 22, 23}
+_MODBUS_DIAG_FUNCS = {8, 43}
+
+# DNP3 function code names
+_DNP3_FUNC_NAMES: Dict[int, str] = {
+    0: "Confirm", 1: "Read", 2: "Write",
+    3: "Select", 4: "Operate", 5: "Direct-Operate",
+    13: "Cold-Restart", 14: "Warm-Restart",
+    18: "Stop-Application", 19: "Start-Application",
+    129: "Response", 130: "Unsolicited-Response",
+}
+_DNP3_WRITE_FUNCS = {2, 3, 4, 5}
+_DNP3_CONTROL_FUNCS = {5, 13, 14, 18, 19}
+
+# S7comm PDU type names
+_S7_PDU_NAMES: Dict[int, str] = {1: "Job", 2: "Ack", 3: "Ack-Data", 7: "Userdata"}
+_S7_FUNC_NAMES: Dict[int, str] = {
+    4: "Read", 5: "Write", 0x28: "PLC-Stop",
+    0x29: "PLC-Start", 0x1A: "Upload", 0x1B: "Download",
+}
+
+# Dedicated OT log files produced by icsnpp packages
+_OT_LOG_FILES = (
+    "modbus.log", "modbus_detailed.log",
+    "dnp3.log", "dnp3_objects.log",
+    "bacnet.log",
+    "s7comm.log", "s7comm_plus.log", "s7comm_read_szl.log",
+    "enip.log", "cip.log", "cip_identity.log",
+    "opcua_binary.log",
+)
 
 
 def parse_zeek_logs(log_dir: str | Path) -> "PcapSession":
@@ -76,15 +120,41 @@ def parse_zeek_logs(log_dir: str | Path) -> "PcapSession":
     if weird_path.exists():
         _parse_weird_log(weird_path, session)
 
+    # --- OT/ICS dedicated protocol logs (icsnpp packages) ---
+    _ot_log_parsers: Dict[str, Any] = {
+        "modbus.log": _parse_modbus_log,
+        "modbus_detailed.log": _parse_modbus_detailed_log,
+        "dnp3.log": _parse_dnp3_log,
+        "bacnet.log": _parse_bacnet_log,
+        "s7comm.log": _parse_s7comm_log,
+        "s7comm_plus.log": _parse_s7comm_log,
+        "enip.log": _parse_enip_log,
+        "cip.log": _parse_cip_log,
+        "cip_identity.log": _parse_cip_log,
+        "opcua_binary.log": _parse_opcua_log,
+    }
+    ot_files_parsed: List[str] = []
+    for log_name, parser_fn in _ot_log_parsers.items():
+        ot_path = log_dir / log_name
+        if ot_path.exists():
+            parser_fn(ot_path, session)
+            ot_files_parsed.append(log_name)
+
+    if ot_files_parsed:
+        logger.info("Zeek OT/ICS logs parsed: %s", ", ".join(ot_files_parsed))
+
     # Estimate packet count from connection metadata
     if session.packet_count == 0:
         # Sum orig_pkts + resp_pkts from conversations if we tracked them
         for conv_stats in session.conversations.values():
             session.packet_count += conv_stats.get("packets", 0)
 
+    _ALL_KNOWN_LOGS = {
+        "conn.log", "dns.log", "ssl.log", "http.log", "notice.log", "weird.log",
+    } | set(_OT_LOG_FILES)
     files_parsed = [
         f.name for f in log_dir.glob("*.log")
-        if f.name in ("conn.log", "dns.log", "ssl.log", "http.log", "notice.log", "weird.log")
+        if f.name in _ALL_KNOWN_LOGS
     ]
     logger.info(
         "Zeek logs parsed: %d files, %d conversations, %d IPs, duration %s",
@@ -223,11 +293,10 @@ def _parse_conn_log(path: Path, session) -> None:
         if service and service.lower() in _OT_SERVICES:
             session.ot_transactions.append({
                 "protocol": service.upper(),
-                "src_ip": src_ip,
-                "dst_ip": dst_ip,
-                "src_port": src_port,
-                "dst_port": dst_port,
-                "timestamp": ts,
+                "port": dst_port,
+                "src": src_ip,
+                "dst": dst_ip,
+                "ts": ts,
                 "function_code": None,
                 "description": f"Zeek-detected {service} connection",
             })
@@ -363,3 +432,353 @@ def _parse_weird_log(path: Path, session) -> None:
     session._zeek_weird = weirdness  # type: ignore[attr-defined]
     if weirdness:
         logger.info("Parsed %d weird entries from Zeek", len(weirdness))
+
+
+# ---------------------------------------------------------------------------
+# OT / ICS dedicated protocol log parsers (icsnpp Zeek packages)
+# ---------------------------------------------------------------------------
+# Output format matches the ot_transactions entries produced by scapy/dpkt
+# parsers so all downstream tools (pcap_threat_hunter, pcap_ai_analyzer)
+# work identically.
+# ---------------------------------------------------------------------------
+
+def _ot_entry_base(entry: dict, protocol: str, port: int) -> Dict[str, Any]:
+    """Build the base OT transaction dict matching scapy/dpkt format."""
+    return {
+        "protocol": protocol,
+        "port": port,
+        "src": entry.get("id.orig_h", ""),
+        "dst": entry.get("id.resp_h", ""),
+        "ts": _ts_to_epoch(entry.get("ts")),
+    }
+
+
+def _parse_modbus_log(path: Path, session) -> None:
+    """Parse modbus.log — icsnpp-modbus Zeek package output.
+
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    func, exception, track_address, request_len, response_len, unit_id, ...
+    """
+    for entry in _read_zeek_json(path):
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+
+        ot = _ot_entry_base(entry, "Modbus", 502)
+
+        # Function code — icsnpp stores as string name or integer
+        func_raw = entry.get("func", entry.get("function_code", ""))
+        func_code: Optional[int] = None
+        func_name: str = str(func_raw)
+
+        if isinstance(func_raw, (int, float)):
+            func_code = int(func_raw)
+            func_name = _MODBUS_FUNC_NAMES.get(func_code, f"FC-{func_code}")
+        elif isinstance(func_raw, str) and func_raw.strip():
+            # icsnpp often stores the function name as a string
+            func_name = func_raw
+            # Try to reverse-map to a code for is_write/is_diagnostic
+            for code, name in _MODBUS_FUNC_NAMES.items():
+                if name.lower() == func_raw.lower().replace("_", " "):
+                    func_code = code
+                    break
+
+        ot["function_code"] = func_code
+        ot["function_name"] = func_name
+        ot["unit_id"] = _safe_int(entry.get("unit_id"))
+
+        # Exception detection
+        exception_raw = entry.get("exception", "")
+        ot["is_exception"] = bool(exception_raw and exception_raw != "-")
+        if ot["is_exception"]:
+            ot["exception_code"] = exception_raw
+
+        ot["is_write"] = func_code in _MODBUS_WRITE_FUNCS if func_code else False
+        ot["is_diagnostic"] = func_code in _MODBUS_DIAG_FUNCS if func_code else False
+
+        # Register address tracking (icsnpp-modbus provides this)
+        track_addr = entry.get("track_address")
+        if track_addr and track_addr != "-":
+            ot["register_address"] = track_addr
+
+        if len(session.ot_transactions) < 50000:
+            session.ot_transactions.append(ot)
+
+    logger.info("Parsed Modbus log: %s", path.name)
+
+
+def _parse_modbus_detailed_log(path: Path, session) -> None:
+    """Parse modbus_detailed.log — register-level detail from icsnpp-modbus.
+
+    Provides per-register read/write values. We merge notable entries
+    into ot_transactions with register detail.
+    """
+    for entry in _read_zeek_json(path):
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+
+        ot = _ot_entry_base(entry, "Modbus", 502)
+        ot["function_code"] = _safe_int(entry.get("func", entry.get("function_code")))
+        ot["function_name"] = str(entry.get("func", "detailed"))
+
+        # Register-level detail
+        ot["register_type"] = entry.get("register_type", "")
+        ot["register_addr"] = _safe_int(entry.get("register_addr"))
+        ot["register_value"] = entry.get("register_value")
+        ot["is_write"] = ot["function_code"] in _MODBUS_WRITE_FUNCS if ot["function_code"] else False
+        ot["is_diagnostic"] = False
+        ot["is_exception"] = False
+
+        if len(session.ot_transactions) < 50000:
+            session.ot_transactions.append(ot)
+
+
+def _parse_dnp3_log(path: Path, session) -> None:
+    """Parse dnp3.log — icsnpp-dnp3 Zeek package output.
+
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    fc_request, fc_reply, iin, obj_type, ...
+    """
+    for entry in _read_zeek_json(path):
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+
+        ot = _ot_entry_base(entry, "DNP3", 20000)
+
+        # Function code — icsnpp-dnp3 logs fc_request / fc_reply as strings
+        fc_req = entry.get("fc_request", "")
+        fc_rep = entry.get("fc_reply", "")
+        func_str = fc_req or fc_rep or entry.get("function_code", "")
+
+        func_code: Optional[int] = None
+        func_name: str = str(func_str) if func_str else "Unknown"
+
+        if isinstance(func_str, (int, float)):
+            func_code = int(func_str)
+            func_name = _DNP3_FUNC_NAMES.get(func_code, f"FC-{func_code}")
+        elif isinstance(func_str, str) and func_str.strip():
+            func_name = func_str
+            for code, name in _DNP3_FUNC_NAMES.items():
+                if name.lower() == func_str.lower().replace("_", " ").replace("-", " "):
+                    func_code = code
+                    break
+
+        ot["function_code"] = func_code
+        ot["function_name"] = func_name
+        ot["is_write"] = func_code in _DNP3_WRITE_FUNCS if func_code else False
+        ot["is_control"] = func_code in _DNP3_CONTROL_FUNCS if func_code else False
+
+        # IIN (Internal Indications) — important for DNP3 health
+        iin = entry.get("iin")
+        if iin and iin != "-":
+            ot["iin"] = iin
+
+        # Object type / count
+        obj_type = entry.get("obj_type", entry.get("object_type"))
+        if obj_type and obj_type != "-":
+            ot["object_type"] = obj_type
+
+        if len(session.ot_transactions) < 50000:
+            session.ot_transactions.append(ot)
+
+    logger.info("Parsed DNP3 log: %s", path.name)
+
+
+def _parse_bacnet_log(path: Path, session) -> None:
+    """Parse bacnet.log — icsnpp-bacnet Zeek package output.
+
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    bvlc_function, pdu_type, pdu_service, ...
+    """
+    for entry in _read_zeek_json(path):
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+
+        ot = _ot_entry_base(entry, "BACnet", 47808)
+
+        bvlc_func = entry.get("bvlc_function", "")
+        pdu_type = entry.get("pdu_type", "")
+        pdu_service = entry.get("pdu_service", "")
+
+        func_name = pdu_service or pdu_type or bvlc_func or "Unknown"
+        ot["function_name"] = func_name
+        ot["function_code"] = None  # BACnet doesn't use numeric codes like Modbus
+        ot["pdu_type"] = pdu_type
+        ot["bvlc_function"] = bvlc_func
+        ot["is_write"] = any(
+            w in func_name.lower()
+            for w in ("write", "create", "delete", "reinitialize")
+        )
+        ot["is_control"] = any(
+            c in func_name.lower()
+            for c in ("reinitialize", "device-communication-control", "restart")
+        )
+
+        # Object / property info
+        obj_type = entry.get("object_type")
+        if obj_type and obj_type != "-":
+            ot["object_type"] = obj_type
+        prop_id = entry.get("property_identifier", entry.get("property"))
+        if prop_id and prop_id != "-":
+            ot["property"] = prop_id
+
+        if len(session.ot_transactions) < 50000:
+            session.ot_transactions.append(ot)
+
+    logger.info("Parsed BACnet log: %s", path.name)
+
+
+def _parse_s7comm_log(path: Path, session) -> None:
+    """Parse s7comm.log / s7comm_plus.log — icsnpp-s7comm Zeek package output.
+
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    rosctr, pdu_type, func_code, ...
+    """
+    for entry in _read_zeek_json(path):
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+
+        ot = _ot_entry_base(entry, "S7comm", 102)
+
+        # PDU type / ROSCTR
+        rosctr = entry.get("rosctr", entry.get("pdu_type"))
+        pdu_type_int = _safe_int(rosctr)
+        if pdu_type_int is not None:
+            ot["pdu_type"] = _S7_PDU_NAMES.get(pdu_type_int, f"0x{pdu_type_int:02x}")
+        else:
+            ot["pdu_type"] = str(rosctr) if rosctr else "Unknown"
+
+        # Function code
+        func_raw = entry.get("func_code", entry.get("function_code", entry.get("parameter_code")))
+        func_code = _safe_int(func_raw)
+        if func_code is not None:
+            ot["function"] = _S7_FUNC_NAMES.get(func_code, f"0x{func_code:02x}")
+            ot["function_code"] = func_code
+            ot["is_write"] = func_code in (5, 0x1B)
+            ot["is_control"] = func_code in (0x28, 0x29)
+        else:
+            func_str = str(func_raw) if func_raw else ""
+            ot["function"] = func_str
+            ot["function_code"] = None
+            ot["is_write"] = "write" in func_str.lower() or "download" in func_str.lower()
+            ot["is_control"] = "stop" in func_str.lower() or "start" in func_str.lower()
+
+        # Sub-function / item details
+        sub_func = entry.get("sub_func_code", entry.get("item_area"))
+        if sub_func and sub_func != "-":
+            ot["sub_function"] = sub_func
+
+        if len(session.ot_transactions) < 50000:
+            session.ot_transactions.append(ot)
+
+    logger.info("Parsed S7comm log: %s", path.name)
+
+
+def _parse_enip_log(path: Path, session) -> None:
+    """Parse enip.log — icsnpp-enip Zeek package output.
+
+    EtherNet/IP encapsulation layer.
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    command, length, session_handle, ...
+    """
+    for entry in _read_zeek_json(path):
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+
+        ot = _ot_entry_base(entry, "EtherNet/IP-CIP", 44818)
+
+        command = entry.get("command", entry.get("enip_command", ""))
+        ot["function_name"] = str(command) if command else "Unknown"
+        ot["function_code"] = _safe_int(entry.get("command_code"))
+        ot["session_handle"] = entry.get("session_handle")
+        ot["is_write"] = False
+        ot["is_control"] = False
+
+        if len(session.ot_transactions) < 50000:
+            session.ot_transactions.append(ot)
+
+    logger.info("Parsed ENIP log: %s", path.name)
+
+
+def _parse_cip_log(path: Path, session) -> None:
+    """Parse cip.log / cip_identity.log — icsnpp-enip Zeek package.
+
+    CIP (Common Industrial Protocol) layer inside EtherNet/IP.
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    service, cip_class_id, cip_instance_id, ...
+    """
+    for entry in _read_zeek_json(path):
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+
+        ot = _ot_entry_base(entry, "EtherNet/IP-CIP", 44818)
+
+        service = entry.get("service", "")
+        service_code = _safe_int(entry.get("service_code"))
+        ot["function_name"] = str(service) if service else "Unknown"
+        ot["function_code"] = service_code
+
+        class_id = entry.get("cip_class_id", entry.get("class_id"))
+        instance_id = entry.get("cip_instance_id", entry.get("instance_id"))
+        if class_id and class_id != "-":
+            ot["class_id"] = class_id
+        if instance_id and instance_id != "-":
+            ot["instance_id"] = instance_id
+
+        ot["is_write"] = any(
+            w in str(service).lower() for w in ("set", "write", "reset", "create", "delete")
+        )
+        ot["is_control"] = any(
+            c in str(service).lower() for c in ("reset", "stop", "start", "change")
+        )
+
+        if len(session.ot_transactions) < 50000:
+            session.ot_transactions.append(ot)
+
+    logger.info("Parsed CIP log: %s", path.name)
+
+
+def _parse_opcua_log(path: Path, session) -> None:
+    """Parse opcua_binary.log — icsnpp-opcua-binary Zeek package.
+
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    msg_type, msg_size, ...
+    """
+    for entry in _read_zeek_json(path):
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+
+        ot = _ot_entry_base(entry, "OPC-UA", 4840)
+
+        msg_type = entry.get("msg_type", entry.get("opcua_msg_type", ""))
+        ot["function_name"] = str(msg_type) if msg_type else "Unknown"
+        ot["function_code"] = None  # OPC-UA uses message types, not numeric FCs
+
+        service = entry.get("service", entry.get("opcua_service", ""))
+        if service and service != "-":
+            ot["function_name"] = str(service)
+
+        ot["is_write"] = any(
+            w in str(service).lower() for w in ("write", "create", "delete", "call")
+        )
+        ot["is_control"] = any(
+            c in str(service).lower() for c in ("call", "transfer", "close")
+        )
+
+        if len(session.ot_transactions) < 50000:
+            session.ot_transactions.append(ot)
+
+    logger.info("Parsed OPC-UA log: %s", path.name)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _safe_int(val) -> Optional[int]:
+    """Convert a value to int, returning None on failure."""
+    if val is None or val == "-" or val == "":
+        return None
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return None
