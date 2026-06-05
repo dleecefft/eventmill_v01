@@ -35,13 +35,16 @@ steps:
         ls -lh /workspace/pcap/capture.pcap
         echo "Download complete."
 
-  # Step 2: Install icsnpp OT/ICS protocol analyzers
+  # Step 2: Install OT packages AND run Zeek in the SAME container
+  # (icsnpp packages are installed into the Zeek runtime dirs which
+  #  do not persist across Cloud Build steps — must be one step)
   - name: 'zeek/zeek:latest'
-    id: 'install-ot-packages'
+    id: 'run-zeek'
     entrypoint: 'bash'
     args:
       - '-c'
       - |
+        # --- Phase 1: Install icsnpp OT/ICS protocol analyzers ---
         echo "Installing build dependencies for icsnpp packages..."
         apt-get update -qq && apt-get install -y -qq --no-install-recommends \
           cmake make g++ libpcap-dev flex bison > /dev/null 2>&1
@@ -76,15 +79,9 @@ steps:
         if [ -n "$$FAILED" ]; then
           echo "Warning: failed to install:$${FAILED}"
         fi
-    waitFor: ['download-pcap']
 
-  # Step 3: Run Zeek analysis (with OT protocol analyzers)
-  - name: 'zeek/zeek:latest'
-    id: 'run-zeek'
-    entrypoint: 'bash'
-    args:
-      - '-c'
-      - |
+        # --- Phase 2: Run Zeek analysis ---
+        echo ""
         echo "Running Zeek analysis (with OT/ICS protocol support)..."
         cd /workspace/zeek-output
 
@@ -121,7 +118,7 @@ steps:
             echo "OT/ICS ${OT_LOG}: ${OT_COUNT} entries"
           fi
         done
-    waitFor: ['install-ot-packages']
+    waitFor: ['download-pcap']
 
   # Step 3: Upload Zeek JSON logs to GCS
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
