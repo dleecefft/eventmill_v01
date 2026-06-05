@@ -273,9 +273,8 @@ def _parse_conn_log(path: Path, session) -> None:
             if conv["last_seen"] is None or ts > conv["last_seen"]:
                 conv["last_seen"] = ts
 
-            # Timestamps for beacon detection (capped to avoid memory blow-up)
-            if len(conv["timestamps"]) < 2000:
-                conv["timestamps"].append(ts)
+            # Timestamps for beacon detection
+            conv["timestamps"].append(ts)
 
         duration = entry.get("duration")
         if duration is not None:

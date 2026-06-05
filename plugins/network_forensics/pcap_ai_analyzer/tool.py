@@ -2425,12 +2425,8 @@ class PcapAiAnalyzer:
         # --- Cleartext Credentials ---
         creds = session.cleartext_creds
         if creds:
-            total = getattr(session, 'cleartext_creds_total', len(creds))
             lines.append(f"\n{'=' * 60}")
-            if total > len(creds):
-                lines.append(f"⚠️  CLEARTEXT CREDENTIALS DETECTED: {total} total ({len(creds)} shown, capped at 500)")
-            else:
-                lines.append(f"⚠️  CLEARTEXT CREDENTIALS DETECTED: {len(creds)} instance(s)")
+            lines.append(f"⚠️  CLEARTEXT CREDENTIALS DETECTED: {len(creds)} instance(s)")
             lines.append(f"{'=' * 60}")
             cred_by_proto = defaultdict(list)
             for c in creds:
@@ -3258,11 +3254,7 @@ class PcapAiAnalyzer:
         if session.ot_transactions:
             lines.append(f"OT/ICS: {len(session.ot_transactions):,} transactions")
         if not netops and session.cleartext_creds:
-            total = getattr(session, 'cleartext_creds_total', len(session.cleartext_creds))
-            if total > len(session.cleartext_creds):
-                lines.append(f"⚠️  Cleartext credentials: {total} total ({len(session.cleartext_creds)} shown)")
-            else:
-                lines.append(f"⚠️  Cleartext credentials: {len(session.cleartext_creds)} detection(s)")
+            lines.append(f"⚠️  Cleartext credentials: {len(session.cleartext_creds)} detection(s)")
 
         return "\n".join(lines)
 

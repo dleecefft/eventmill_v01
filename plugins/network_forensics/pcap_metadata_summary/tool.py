@@ -21,8 +21,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("eventmill.plugins.pcap_metadata_summary")
 
-MAX_PCAP_SIZE_BYTES = 50 * 1024 * 1024  # 50 MB
-
 # RFC 1918 private ranges
 PRIVATE_NETWORKS = [
     ipaddress.ip_network("10.0.0.0/8"),
@@ -489,8 +487,7 @@ def parse_pcap_file(file_path: str) -> PcapSession:
                 conv["first_seen"] = ts
             if conv["last_seen"] is None or ts > conv["last_seen"]:
                 conv["last_seen"] = ts
-            if len(conv["timestamps"]) < 2000:
-                conv["timestamps"].append(ts)
+            conv["timestamps"].append(ts)
 
             # DNS extraction
             if pkt.haslayer(DNS):
@@ -904,8 +901,7 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
                 conv["first_seen"] = ts
             if conv["last_seen"] is None or ts > conv["last_seen"]:
                 conv["last_seen"] = ts
-            if len(conv["timestamps"]) < 2000:
-                conv["timestamps"].append(ts)
+            conv["timestamps"].append(ts)
 
             # DNS extraction
             if dport == 53 or sport == 53:
@@ -1246,8 +1242,7 @@ def _extract_ot_transaction_dpkt(
         except Exception:
             pass
 
-    if len(session.ot_transactions) < 50000:
-        session.ot_transactions.append(entry)
+    session.ot_transactions.append(entry)
 
 
 def _extract_cleartext_creds_dpkt(
@@ -1265,21 +1260,19 @@ def _extract_cleartext_creds_dpkt(
             continue
         if pattern is None:
             session.cleartext_creds_total += 1
-            if len(session.cleartext_creds) < 500:
-                session.cleartext_creds.append({
-                    "protocol": proto_name, "description": description,
-                    "src": src_ip, "dst": dst_ip,
-                    "port": dport if (ports and dport in ports) else sport,
-                    "ts": ts,
-                })
+            session.cleartext_creds.append({
+                "protocol": proto_name, "description": description,
+                "src": src_ip, "dst": dst_ip,
+                "port": dport if (ports and dport in ports) else sport,
+                "ts": ts,
+            })
             return
         if pattern.search(payload):
             session.cleartext_creds_total += 1
-            if len(session.cleartext_creds) < 500:
-                session.cleartext_creds.append({
-                    "protocol": proto_name, "description": description,
-                    "src": src_ip, "dst": dst_ip, "port": dport, "ts": ts,
-                })
+            session.cleartext_creds.append({
+                "protocol": proto_name, "description": description,
+                "src": src_ip, "dst": dst_ip, "port": dport, "ts": ts,
+            })
             return
 
 
@@ -1415,9 +1408,7 @@ def _extract_ot_transaction(
         except Exception:
             pass
 
-    # Cap stored OT transactions at 50,000 to limit memory
-    if len(session.ot_transactions) < 50000:
-        session.ot_transactions.append(entry)
+    session.ot_transactions.append(entry)
 
 
 # ---------------------------------------------------------------------------
@@ -1471,20 +1462,6 @@ def _extract_cleartext_creds(
         return
 
     if len(raw_payload) < 4:
-        return
-
-    # Cap stored detections at 500
-    if len(session.cleartext_creds) >= 500:
-        # Keep counting total even past the cap
-        for proto_name, ports, pattern, description in _CRED_PATTERNS:
-            if ports is not None and dport not in ports and sport not in ports:
-                continue
-            if pattern is None:
-                session.cleartext_creds_total += 1
-                return
-            if pattern.search(raw_payload):
-                session.cleartext_creds_total += 1
-                return
         return
 
     sport = 0
@@ -1557,9 +1534,6 @@ def _download_from_gcs(file_path: str, context: Any) -> Optional[str]:
             if not blob.exists():
                 continue
             blob.reload()
-            if blob.size and blob.size > MAX_PCAP_SIZE_BYTES:
-                logger.warning("File %s too large (%s)", filename, _format_bytes(blob.size))
-                return None
             tmp = tempfile.NamedTemporaryFile(suffix=".pcap", delete=False)
             blob.download_to_filename(tmp.name)
             tmp.close()
@@ -1683,10 +1657,6 @@ class PcapMetadataSummary:
         if not resolved:
             return ToolResult(ok=False, error_code="FILE_NOT_FOUND", message=f"File not found: {file_path}")
 
-        fsize = os.path.getsize(resolved)
-        if fsize > MAX_PCAP_SIZE_BYTES:
-            return ToolResult(ok=False, error_code="FILE_TOO_LARGE", message=f"File ({_format_bytes(fsize)}) exceeds 50 MB limit")
-
         # Clean up previous temp
         old = get_pcap_session()
         if old and getattr(old, "_temp_path", None):
@@ -1729,11 +1699,7 @@ class PcapMetadataSummary:
                 lines.append(f"    {p:<16} {c:>6,} transactions")
         if s.cleartext_creds:
             lines.append(f"")
-            total = s.cleartext_creds_total or len(s.cleartext_creds)
-            if total > len(s.cleartext_creds):
-                lines.append(f"  ⚠️  Cleartext credentials detected: {total} total ({len(s.cleartext_creds)} shown)")
-            else:
-                lines.append(f"  ⚠️  Cleartext credentials detected: {len(s.cleartext_creds)}")
+            lines.append(f"  ⚠️  Cleartext credentials detected: {len(s.cleartext_creds)}")
 
         return ToolResult(ok=True, result={"text": "\n".join(lines)})
 
@@ -1780,11 +1746,7 @@ class PcapMetadataSummary:
                 lines.append(f"    ⚠️  Exception responses: {len(exceptions):,}")
         if s.cleartext_creds:
             lines.append("")
-            total = s.cleartext_creds_total or len(s.cleartext_creds)
-            if total > len(s.cleartext_creds):
-                lines.append(f"  ⚠️  CLEARTEXT CREDENTIALS: {total} total detection(s) ({len(s.cleartext_creds)} shown, capped at 500)")
-            else:
-                lines.append(f"  ⚠️  CLEARTEXT CREDENTIALS: {len(s.cleartext_creds)} detection(s)")
+            lines.append(f"  ⚠️  CLEARTEXT CREDENTIALS: {len(s.cleartext_creds)} detection(s)")
             cred_protos = Counter(c["protocol"] for c in s.cleartext_creds)
             for p, c in cred_protos.most_common():
                 lines.append(f"    {p:<20} {c:>4} occurrence(s)")
