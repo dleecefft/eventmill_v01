@@ -654,12 +654,18 @@ class EventMillShell(cmd.Cmd):
     def do_load(self, arg: str) -> None:
         """Load an artifact file into the current session.
         
-        Usage: load <file_path_or_name> [artifact_type] [--fast]
+        Usage: load <file_path_or_name> [artifact_type] [--fast] [--merge]
+               load <folder_path> --merge [--fast]
+               load --merge [--fast]
         
         Options:
           --fast     Use dpkt (fast C-backed parser) instead of scapy.
                      Recommended for PCAPs >100 MB / >500K packets.
                      5-10x faster, identical report output.
+          --merge    Cumulative load — merge multiple PCAPs into one session.
+                     With a folder path: loads all *.pcap/*.pcapng in that folder.
+                     With a file: merges into the already-loaded session.
+                     Without a path: loads all PCAPs from current workspace location.
         
         Resolution order:
           1. Local file path (if exists on disk)
@@ -669,6 +675,13 @@ class EventMillShell(cmd.Cmd):
         
         Supported types: pcap, json_events, log_stream, risk_model,
         cloud_audit_log, pdf_report, html_report, image, text
+        
+        Examples:
+          load capture.pcap
+          load capture.pcap --fast
+          load /path/to/folder/ --merge --fast
+          load --merge --fast
+          load another.pcap --merge
         """
         if not self.session_manager.get_current_session():
             print("  No active session. Use 'new' to create one.")
@@ -678,14 +691,20 @@ class EventMillShell(cmd.Cmd):
             parts = shlex.split(arg.strip())
         except ValueError:
             parts = arg.strip().split(maxsplit=1)
-        if not parts:
-            print("  Usage: load <file_path_or_name> [artifact_type] [--fast]")
+        
+        # Check for --fast and --merge flags
+        use_dpkt = "--fast" in parts
+        merge_mode = "--merge" in parts
+        parts = [p for p in parts if p not in ("--fast", "--merge")]
+        
+        # --merge with folder path or no path (workspace home)
+        if merge_mode:
+            self._load_merge(parts, use_dpkt=use_dpkt)
             return
         
-        # Check for --fast flag
-        use_dpkt = "--fast" in parts
-        if use_dpkt:
-            parts = [p for p in parts if p != "--fast"]
+        if not parts:
+            print("  Usage: load <file_path_or_name> [artifact_type] [--fast] [--merge]")
+            return
         
         file_ref = parts[0]
         file_path = Path(file_ref)
@@ -833,6 +852,225 @@ class EventMillShell(cmd.Cmd):
             print("  Note: pcap_metadata_summary plugin not available; manual 'run' with mode=load required.")
         except Exception as e:
             print(f"  Warning: auto-parse failed ({e}); use 'run pcap_metadata_summary {{\"mode\": \"load\", \"file_path\": \"{file_path.name}\"}}' manually.")
+
+    def _load_merge(self, parts: list[str], use_dpkt: bool = False) -> None:
+        """Load and merge multiple PCAPs into a single cumulative session.
+
+        Handles three cases:
+          1. Folder path   — load all *.pcap/*.pcapng in that folder (no subdirs)
+          2. Single file   — merge into the already-loaded session
+          3. No path       — use current workspace/bucket location
+        """
+        try:
+            from plugins.network_forensics.pcap_metadata_summary.tool import (
+                PcapSession,
+                parse_pcap_file,
+                get_pcap_session,
+                set_pcap_session,
+                _format_bytes,
+                _format_duration,
+                is_internal,
+            )
+            if use_dpkt:
+                from plugins.network_forensics.pcap_metadata_summary.tool import (
+                    parse_pcap_file_dpkt,
+                    DPKT_AVAILABLE,
+                )
+                if not DPKT_AVAILABLE:
+                    print("  Warning: dpkt not installed, falling back to scapy.")
+                    use_dpkt = False
+        except ImportError:
+            print("  Error: pcap_metadata_summary plugin not available.")
+            return
+
+        PCAP_EXTENSIONS = {".pcap", ".pcapng", ".cap"}
+        parser_name = "dpkt (fast mode)" if use_dpkt else "scapy"
+        parse_fn = parse_pcap_file_dpkt if use_dpkt else parse_pcap_file
+
+        # Determine target path
+        if parts:
+            target = Path(parts[0])
+        else:
+            # No path — try workspace location from storage resolver
+            session = self.session_manager.get_current_session()
+            if self.storage_resolver and session and session.workspace_folder:
+                # Resolve workspace folder from bucket
+                print(f"  --merge with no path: searching workspace '{session.workspace_folder}' in bucket...")
+                pcap_files = self._merge_resolve_bucket_folder(session, use_dpkt, parse_fn)
+                if pcap_files is not None:
+                    return
+            # Fallback: current working directory
+            target = Path(".")
+
+        # Single file merge — merge into existing session
+        if target.is_file():
+            if target.suffix.lower() not in PCAP_EXTENSIONS:
+                print(f"  Not a PCAP file: {target.name}")
+                return
+            existing = get_pcap_session()
+            if not existing:
+                print(f"  No existing session to merge into. Loading as new...")
+                self._auto_parse_pcap(target, use_dpkt=use_dpkt)
+                return
+            print(f"  Merging {target.name} with {parser_name}...")
+            new_session = parse_fn(str(target))
+            existing.merge_into(new_session)
+            print(
+                f"  ✓ Merged {new_session.packet_count:,} packets from {target.name}"
+            )
+            self._print_merge_summary(existing)
+            return
+
+        # Folder merge — find all PCAPs in folder (no subdirs)
+        if target.is_dir():
+            pcap_files = sorted(
+                f for f in target.iterdir()
+                if f.is_file() and f.suffix.lower() in PCAP_EXTENSIONS
+            )
+            if not pcap_files:
+                print(f"  No PCAP files found in: {target}")
+                return
+
+            print(f"  Found {len(pcap_files)} PCAP file(s) in {target}")
+            print(f"  Parser: {parser_name}")
+            print()
+
+            cumulative = get_pcap_session()
+            loaded = 0
+
+            for i, pcap_file in enumerate(pcap_files, 1):
+                print(f"  [{i}/{len(pcap_files)}] Parsing {pcap_file.name}...")
+                try:
+                    new_session = parse_fn(str(pcap_file))
+                    if cumulative is None:
+                        cumulative = new_session
+                    else:
+                        cumulative.merge_into(new_session)
+                    loaded += 1
+                    print(f"    ✓ {new_session.packet_count:,} packets")
+                except Exception as e:
+                    print(f"    ✗ Failed: {e}")
+
+            if cumulative and loaded > 0:
+                set_pcap_session(cumulative)
+                print()
+                print(f"  Merge complete — {loaded} file(s) loaded")
+                self._print_merge_summary(cumulative)
+            else:
+                print("  No files were successfully parsed.")
+            return
+
+        # Not a local file or dir — try bucket resolution
+        session = self.session_manager.get_current_session()
+        if self.storage_resolver and session and session.active_pillar:
+            # Treat as a bucket folder path
+            print(f"  Resolving '{target}' from bucket...")
+            self._merge_resolve_bucket_folder(session, use_dpkt, parse_fn, str(target))
+            return
+
+        print(f"  Path not found: {target}")
+
+    def _merge_resolve_bucket_folder(
+        self, session, use_dpkt: bool, parse_fn, prefix: str | None = None
+    ):
+        """Resolve and merge PCAPs from a GCS bucket folder.
+
+        Returns None if bucket resolution is not available, so the caller
+        can fall back to local directory logic.
+        """
+        from plugins.network_forensics.pcap_metadata_summary.tool import (
+            get_pcap_session,
+            set_pcap_session,
+        )
+        PCAP_EXTENSIONS = {".pcap", ".pcapng", ".cap"}
+
+        try:
+            folder = prefix or session.workspace_folder or ""
+            files = self.storage_resolver.list_files(
+                pillar=session.active_pillar,
+                prefix=folder,
+            )
+            pcap_files = [
+                f for f in files
+                if any(f["filename"].lower().endswith(ext) for ext in PCAP_EXTENSIONS)
+                and "/" not in f["filename"].split(folder + "/", 1)[-1].lstrip("/").rstrip("/")
+            ]
+        except Exception as e:
+            print(f"  Bucket listing failed: {e}")
+            return None
+
+        if not pcap_files:
+            print(f"  No PCAP files found in bucket folder.")
+            return None
+
+        parser_name = "dpkt (fast mode)" if use_dpkt else "scapy"
+        print(f"  Found {len(pcap_files)} PCAP file(s) in bucket")
+        print(f"  Parser: {parser_name}")
+        print()
+
+        cumulative = get_pcap_session()
+        loaded = 0
+
+        for i, f_info in enumerate(pcap_files, 1):
+            fname = f_info["filename"]
+            print(f"  [{i}/{len(pcap_files)}] Downloading & parsing {fname}...")
+            try:
+                resolved = self.storage_resolver.resolve(
+                    filename=fname,
+                    pillar=session.active_pillar,
+                    workspace_folder=session.workspace_folder,
+                )
+                if not resolved:
+                    print(f"    ✗ Could not resolve {fname}")
+                    continue
+
+                local_dest = (
+                    self.workspace_path / "artifacts"
+                    / session.session_id / fname.rsplit("/", 1)[-1]
+                )
+                local_dest.parent.mkdir(parents=True, exist_ok=True)
+                self.storage_resolver.download(resolved, local_dest)
+
+                new_session = parse_fn(str(local_dest))
+                if cumulative is None:
+                    cumulative = new_session
+                else:
+                    cumulative.merge_into(new_session)
+                loaded += 1
+                print(f"    ✓ {new_session.packet_count:,} packets")
+            except Exception as e:
+                print(f"    ✗ Failed: {e}")
+
+        if cumulative and loaded > 0:
+            set_pcap_session(cumulative)
+            print()
+            print(f"  Merge complete — {loaded} file(s) loaded")
+            self._print_merge_summary(cumulative)
+        else:
+            print("  No files were successfully parsed.")
+        return True
+
+    def _print_merge_summary(self, session) -> None:
+        """Print a summary of the cumulative merged session."""
+        from plugins.network_forensics.pcap_metadata_summary.tool import (
+            _format_duration,
+            is_internal,
+        )
+        internal = sum(1 for ip in session.unique_ips if is_internal(ip))
+        external = len(session.unique_ips) - internal
+        print(
+            f"  Cumulative: {session.packet_count:,} packets, "
+            f"{len(session.unique_ips)} IPs ({internal} internal, {external} external), "
+            f"duration {_format_duration(session.duration_seconds)}"
+        )
+        if session.ot_transactions:
+            from collections import Counter as _Counter
+            ot_protos = _Counter(t["protocol"] for t in session.ot_transactions)
+            ot_summary = ", ".join(f"{p}:{c}" for p, c in ot_protos.most_common(5))
+            print(f"  ✓ OT/ICS protocols: {ot_summary}")
+        if session.cleartext_creds:
+            print(f"  ⚠️  Cleartext credentials detected: {len(session.cleartext_creds)}")
+        print(f"  PCAP ready — use 'run pcap_ai_analyzer --mode triage_summary' or any pcap tool.")
 
     # -------------------------------------------------------------------
     # Zeek Commands — Large PCAP Processing via Cloud Build
@@ -1574,19 +1812,21 @@ class EventMillShell(cmd.Cmd):
 
     def complete_load(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
         parts = line.split()
-        # After filename, suggest --fast and artifact types
+        # After filename, suggest --fast, --merge, and artifact types
         if len(parts) >= 2 and line.endswith(" "):
             used = set(parts)
             opts = []
             if "--fast" not in used:
                 opts.append("--fast")
+            if "--merge" not in used:
+                opts.append("--merge")
             artifact_types = ["pcap", "json_events", "log_stream", "risk_model",
                               "cloud_audit_log", "pdf_report", "html_report",
                               "docx_report", "image", "text"]
             opts.extend(t for t in artifact_types if t not in used)
             return [o for o in opts if o.startswith(text)]
         if not line.endswith(" ") and text.startswith("--"):
-            return [f for f in ["--fast"] if f.startswith(text)]
+            return [f for f in ["--fast", "--merge"] if f.startswith(text)]
         return []
 
     def complete_export(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:

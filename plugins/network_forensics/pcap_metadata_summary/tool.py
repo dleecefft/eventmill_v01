@@ -216,6 +216,135 @@ class PcapSession:
             return f"{secs / 60:.1f}min"
         return f"{secs / 3600:.1f}hrs"
 
+    def merge_into(self, other: "PcapSession") -> None:
+        """Merge *other* session data into this session (cumulative load)."""
+        # Filename / metadata
+        if other.filename:
+            if self.filename:
+                self.filename += f", {other.filename}"
+            else:
+                self.filename = other.filename
+        if other.file_path:
+            if self.file_path:
+                self.file_path += f", {other.file_path}"
+            else:
+                self.file_path = other.file_path
+        self.file_size += other.file_size
+        self.packet_count += other.packet_count
+
+        # Time range — take the widest window
+        if other.start_time is not None:
+            if self.start_time is None or other.start_time < self.start_time:
+                self.start_time = other.start_time
+        if other.end_time is not None:
+            if self.end_time is None or other.end_time > self.end_time:
+                self.end_time = other.end_time
+
+        # Conversations — merge per-flow stats
+        for key, oconv in other.conversations.items():
+            sconv = self.conversations[key]
+            sconv["packets"] += oconv["packets"]
+            sconv["bytes_out"] += oconv["bytes_out"]
+            sconv["bytes_in"] += oconv["bytes_in"]
+            sconv["timestamps"].extend(oconv["timestamps"])
+            if oconv["first_seen"] is not None:
+                if sconv["first_seen"] is None or oconv["first_seen"] < sconv["first_seen"]:
+                    sconv["first_seen"] = oconv["first_seen"]
+            if oconv["last_seen"] is not None:
+                if sconv["last_seen"] is None or oconv["last_seen"] > sconv["last_seen"]:
+                    sconv["last_seen"] = oconv["last_seen"]
+
+        # Counters — add
+        self.dst_ports += other.dst_ports
+        self.src_ports += other.src_ports
+        self.port_proto.update(other.port_proto)
+        self.protocols += other.protocols
+        self.src_ips += other.src_ips
+        self.dst_ips += other.dst_ips
+
+        # Lists — extend
+        self.dns_queries.extend(other.dns_queries)
+        self.dns_responses.extend(other.dns_responses)
+        self.http_requests.extend(other.http_requests)
+        self.tls_handshakes.extend(other.tls_handshakes)
+        self.ot_transactions.extend(other.ot_transactions)
+        self.cleartext_creds.extend(other.cleartext_creds)
+        self.cleartext_creds_total += other.cleartext_creds_total
+
+        # TCP health
+        self.tcp_retransmissions += other.tcp_retransmissions
+        self.tcp_rst_count += other.tcp_rst_count
+        self.tcp_syn_count += other.tcp_syn_count
+        self.tcp_fin_count += other.tcp_fin_count
+        self.tcp_zero_window_count += other.tcp_zero_window_count
+
+        for key, ohealth in other.conv_health.items():
+            shealth = self.conv_health[key]
+            shealth["rst"] += ohealth["rst"]
+            shealth["retransmit"] += ohealth["retransmit"]
+            shealth["zero_window"] += ohealth["zero_window"]
+
+        # ICMP
+        self.icmp_errors.extend(other.icmp_errors)
+        for dest, entries in other.ttl_exceeded_by_dest.items():
+            self.ttl_exceeded_by_dest[dest].extend(entries)
+        self.suspected_loop_packets.extend(other.suspected_loop_packets)
+
+        # ARP
+        self.arp_request_count += other.arp_request_count
+        self.arp_reply_count += other.arp_reply_count
+        self.arp_gratuitous_count += other.arp_gratuitous_count
+        self._arp_timestamps.extend(other._arp_timestamps)
+        self.arp_requests_by_src += other.arp_requests_by_src
+        for ip, macs in other.arp_ip_to_macs.items():
+            self.arp_ip_to_macs[ip].update(macs)
+        self._arp_request_targets += other._arp_request_targets
+        self._arp_reply_targets += other._arp_reply_targets
+
+        # STP
+        self.stp_bpdu_count += other.stp_bpdu_count
+        self.stp_tcn_count += other.stp_tcn_count
+        self.stp_tc_flag_count += other.stp_tc_flag_count
+        for bridge, entries in other.stp_root_bridges.items():
+            self.stp_root_bridges[bridge].extend(entries)
+        self._stp_timestamps.extend(other._stp_timestamps)
+        self.stp_bridges += other.stp_bridges
+
+        # HSRP
+        self.hsrp_hello_count += other.hsrp_hello_count
+        self.hsrp_events.extend(other.hsrp_events)
+        self.hsrp_state_changes.extend(other.hsrp_state_changes)
+
+        # VRRP
+        self.vrrp_advert_count += other.vrrp_advert_count
+        self.vrrp_events.extend(other.vrrp_events)
+        self.vrrp_priority_changes.extend(other.vrrp_priority_changes)
+
+        # OSPF
+        self.ospf_total_count += other.ospf_total_count
+        self.ospf_hello_count += other.ospf_hello_count
+        self.ospf_dbd_count += other.ospf_dbd_count
+        self.ospf_lsrequest_count += other.ospf_lsrequest_count
+        self.ospf_lsupdate_count += other.ospf_lsupdate_count
+        self.ospf_lsack_count += other.ospf_lsack_count
+        self.ospf_areas.update(other.ospf_areas)
+        self.ospf_router_ids.update(other.ospf_router_ids)
+        for pair, ts_list in other.ospf_neighbor_hellos.items():
+            self.ospf_neighbor_hellos[pair].extend(ts_list)
+        self._ospf_lsupdate_timestamps.extend(other._ospf_lsupdate_timestamps)
+
+        # EIGRP
+        self.eigrp_total_count += other.eigrp_total_count
+        self.eigrp_hello_count += other.eigrp_hello_count
+        self.eigrp_update_count += other.eigrp_update_count
+        self.eigrp_query_count += other.eigrp_query_count
+        self.eigrp_reply_count += other.eigrp_reply_count
+        self.eigrp_as_numbers.update(other.eigrp_as_numbers)
+
+        # IP fragmentation & TTL
+        self.ip_fragment_count += other.ip_fragment_count
+        self.ttl_distribution += other.ttl_distribution
+
 
 # ---------------------------------------------------------------------------
 # Process-global session storage — survives module reimport / loader aliasing
