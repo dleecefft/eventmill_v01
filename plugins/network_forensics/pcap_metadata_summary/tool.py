@@ -333,6 +333,7 @@ def parse_pcap_file(file_path: str) -> PcapSession:
     session.file_size = os.path.getsize(file_path)
 
     _seen_ip_ids: Dict[Tuple[str, str, int, int], int] = {}  # (src, dst, proto, ip_id) -> ttl
+    _seen_tcp_seqs: Dict[Tuple[str, str, int, int, int], int] = {}  # (src, dst, sport, dport, seq) -> payload_len
 
     with PcapReader(file_path) as reader:
         for pkt in reader:
@@ -421,6 +422,18 @@ def parse_pcap_file(file_path: str) -> PcapSession:
                     session.tcp_rst_count += 1
                 if pkt[TCP].window == 0:
                     session.tcp_zero_window_count += 1
+                # Retransmission detection: same (src, dst, sport, dport, seq)
+                # with payload seen before (exclude SYN/FIN-only retransmits)
+                seq = pkt[TCP].seq
+                payload_len = len(pkt[TCP].payload)
+                if payload_len > 0 and not (tcp_flags & 0x02):  # skip SYN
+                    retx_key = (src_ip, dst_ip, sport, dport, seq)
+                    if retx_key in _seen_tcp_seqs:
+                        session.tcp_retransmissions += 1
+                        conv_key_retx = (src_ip, dst_ip, dport, proto)
+                        session.conv_health[conv_key_retx]["retransmit"] += 1
+                    else:
+                        _seen_tcp_seqs[retx_key] = payload_len
             elif pkt.haslayer(UDP):
                 proto = "UDP"
                 sport = pkt[UDP].sport
@@ -600,6 +613,7 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
         return socket.inet_ntoa(packed)
 
     _seen_ip_ids_dpkt: Dict[Tuple[str, str, int, int], int] = {}
+    _seen_tcp_seqs_dpkt: Dict[Tuple[str, str, int, int, int], int] = {}  # retransmission detection
 
     with open(file_path, "rb") as f:
         try:
@@ -697,6 +711,17 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
                     session.tcp_rst_count += 1
                 if tcp_obj.win == 0:
                     session.tcp_zero_window_count += 1
+                # Retransmission detection: same (src, dst, sport, dport, seq)
+                # with payload seen before (exclude SYN-only)
+                payload_len = len(tcp_data)
+                if payload_len > 0 and not (tcp_obj.flags & dpkt.tcp.TH_SYN):
+                    retx_key = (src_ip, dst_ip, sport, dport, tcp_obj.seq)
+                    if retx_key in _seen_tcp_seqs_dpkt:
+                        session.tcp_retransmissions += 1
+                        conv_key_retx = (src_ip, dst_ip, dport, proto)
+                        session.conv_health[conv_key_retx]["retransmit"] += 1
+                    else:
+                        _seen_tcp_seqs_dpkt[retx_key] = payload_len
             elif isinstance(ip.data, dpkt.udp.UDP):
                 proto = "UDP"
                 udp_obj = ip.data

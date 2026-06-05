@@ -289,6 +289,34 @@ def _parse_conn_log(path: Path, session) -> None:
         if conn_state:
             conv["conn_state"] = conn_state
 
+        # -----------------------------------------------------------
+        # TCP health from conn.log fields (retransmit, RST, etc.)
+        # -----------------------------------------------------------
+        if proto == "tcp":
+            # Retransmission detection from Zeek's history field:
+            #   'T' = originator retransmitted, 't' = responder retransmitted
+            history = entry.get("history", "")
+            retx_count = history.count("T") + history.count("t")
+            if retx_count > 0:
+                session.tcp_retransmissions += retx_count
+                session.conv_health[conv_key]["retransmit"] += retx_count
+
+            # RST detection from conn_state:
+            #   RSTO = originator sent RST, RSTR = responder sent RST
+            #   Also check history for 'R'/'r'
+            rst_count = history.count("R") + history.count("r")
+            if rst_count > 0:
+                session.tcp_rst_count += rst_count
+                session.conv_health[conv_key]["rst"] += rst_count
+
+            # SYN / FIN counting from history
+            if "S" in history or "s" in history:
+                session.tcp_syn_count += 1
+            if "F" in history or "f" in history:
+                session.tcp_fin_count += 1
+
+            # Zero-window: Zeek doesn't track this directly, skip
+
         # Detect OT/ICS services
         if service and service.lower() in _OT_SERVICES:
             session.ot_transactions.append({
