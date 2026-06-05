@@ -119,6 +119,7 @@ class PcapSession:
 
         # Cleartext credential detections (values are redacted)
         self.cleartext_creds: List[Dict] = []
+        self.cleartext_creds_total: int = 0
 
         # Unique IPs
         self.src_ips: Counter = Counter()
@@ -1258,25 +1259,27 @@ def _extract_cleartext_creds_dpkt(
     """Detect cleartext credentials from raw payload bytes (dpkt version)."""
     if not payload or len(payload) < 4:
         return
-    if len(session.cleartext_creds) >= 500:
-        return
 
     for proto_name, ports, pattern, description in _CRED_PATTERNS:
         if ports is not None and dport not in ports and sport not in ports:
             continue
         if pattern is None:
-            session.cleartext_creds.append({
-                "protocol": proto_name, "description": description,
-                "src": src_ip, "dst": dst_ip,
-                "port": dport if (ports and dport in ports) else sport,
-                "ts": ts,
-            })
+            session.cleartext_creds_total += 1
+            if len(session.cleartext_creds) < 500:
+                session.cleartext_creds.append({
+                    "protocol": proto_name, "description": description,
+                    "src": src_ip, "dst": dst_ip,
+                    "port": dport if (ports and dport in ports) else sport,
+                    "ts": ts,
+                })
             return
         if pattern.search(payload):
-            session.cleartext_creds.append({
-                "protocol": proto_name, "description": description,
-                "src": src_ip, "dst": dst_ip, "port": dport, "ts": ts,
-            })
+            session.cleartext_creds_total += 1
+            if len(session.cleartext_creds) < 500:
+                session.cleartext_creds.append({
+                    "protocol": proto_name, "description": description,
+                    "src": src_ip, "dst": dst_ip, "port": dport, "ts": ts,
+                })
             return
 
 
@@ -1472,6 +1475,16 @@ def _extract_cleartext_creds(
 
     # Cap stored detections at 500
     if len(session.cleartext_creds) >= 500:
+        # Keep counting total even past the cap
+        for proto_name, ports, pattern, description in _CRED_PATTERNS:
+            if ports is not None and dport not in ports and sport not in ports:
+                continue
+            if pattern is None:
+                session.cleartext_creds_total += 1
+                return
+            if pattern.search(raw_payload):
+                session.cleartext_creds_total += 1
+                return
         return
 
     sport = 0
@@ -1486,6 +1499,7 @@ def _extract_cleartext_creds(
             continue
         # For SNMP and VNC, any traffic on the port is flagged (no pattern needed)
         if pattern is None:
+            session.cleartext_creds_total += 1
             session.cleartext_creds.append({
                 "protocol": proto_name,
                 "description": description,
@@ -1496,6 +1510,7 @@ def _extract_cleartext_creds(
             })
             return
         if pattern.search(raw_payload):
+            session.cleartext_creds_total += 1
             session.cleartext_creds.append({
                 "protocol": proto_name,
                 "description": description,
@@ -1714,7 +1729,11 @@ class PcapMetadataSummary:
                 lines.append(f"    {p:<16} {c:>6,} transactions")
         if s.cleartext_creds:
             lines.append(f"")
-            lines.append(f"  ⚠️  Cleartext credentials detected: {len(s.cleartext_creds)}")
+            total = s.cleartext_creds_total or len(s.cleartext_creds)
+            if total > len(s.cleartext_creds):
+                lines.append(f"  ⚠️  Cleartext credentials detected: {total} total ({len(s.cleartext_creds)} shown)")
+            else:
+                lines.append(f"  ⚠️  Cleartext credentials detected: {len(s.cleartext_creds)}")
 
         return ToolResult(ok=True, result={"text": "\n".join(lines)})
 
@@ -1761,7 +1780,11 @@ class PcapMetadataSummary:
                 lines.append(f"    ⚠️  Exception responses: {len(exceptions):,}")
         if s.cleartext_creds:
             lines.append("")
-            lines.append(f"  ⚠️  CLEARTEXT CREDENTIALS: {len(s.cleartext_creds)} detection(s)")
+            total = s.cleartext_creds_total or len(s.cleartext_creds)
+            if total > len(s.cleartext_creds):
+                lines.append(f"  ⚠️  CLEARTEXT CREDENTIALS: {total} total detection(s) ({len(s.cleartext_creds)} shown, capped at 500)")
+            else:
+                lines.append(f"  ⚠️  CLEARTEXT CREDENTIALS: {len(s.cleartext_creds)} detection(s)")
             cred_protos = Counter(c["protocol"] for c in s.cleartext_creds)
             for p, c in cred_protos.most_common():
                 lines.append(f"    {p:<20} {c:>4} occurrence(s)")
