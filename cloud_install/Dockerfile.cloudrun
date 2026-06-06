@@ -57,6 +57,10 @@ COPY --chown=eventmill:eventmill framework/ ./framework/
 COPY --chown=eventmill:eventmill plugins/ ./plugins/
 COPY --chown=eventmill:eventmill pyproject.toml README.md ./
 
+# Copy entrypoint script (signal-logging wrapper)
+COPY --chown=eventmill:eventmill cloud_install/entrypoint.sh ./entrypoint.sh
+RUN chmod +x ./entrypoint.sh
+
 # Create workspace directory
 # Note: GCS access uses workload identity (no credentials file needed)
 RUN mkdir -p /app/workspace/sessions /app/workspace/artifacts /app/workspace/logs \
@@ -93,6 +97,6 @@ EXPOSE 8080
 # CMD ["sh", "-c", "exec ttyd -W -p ${PORT} --ping-interval 30 -t fontSize=16 python -m framework.cli.shell"]
 #
 # For basic auth (set TTYD_USERNAME and TTYD_PASSWORD as secrets):
-# 'exec' replaces sh with ttyd as PID 1 so it receives signals directly
-# and handles them gracefully instead of sh dying on SIGHUP.
-CMD ["sh", "-c", "exec ttyd -W -p ${PORT} -c ${TTYD_USERNAME}:${TTYD_PASSWORD} --ping-interval 30 -t fontSize=16 python -m framework.cli.shell"]
+# entrypoint.sh logs all signals + memory/cpu limits on startup,
+# then runs ttyd and forwards signals so we can diagnose kills.
+CMD ["/app/entrypoint.sh"]
