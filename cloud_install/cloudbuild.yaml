@@ -58,7 +58,7 @@ steps:
       - '5'
       - '--session-affinity'
       - '--min-instances'
-      - '0'
+      - '1'
       - '--max-instances'
       - '3'
       - '--service-account'
