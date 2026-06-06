@@ -180,7 +180,7 @@ class ZeekCloudBuildClient:
                         'echo "OT/ICS packages installed: $$(zkg list | wc -l) packages" && '
                         '# Phase 2: Run Zeek analysis\n'
                         'cd /workspace/zeek-output && '
-                        'zeek -r /workspace/pcap/capture.pcap '
+                        'zeek -C -r /workspace/pcap/capture.pcap '
                         'LogAscii::use_json=T '
                         'local '
                         '"Site::local_nets += { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }" && '

@@ -87,7 +87,7 @@ steps:
 
         # Run Zeek with local policy scripts + installed OT packages
         # LogAscii::use_json=T outputs JSON instead of TSV
-        zeek -r /workspace/pcap/capture.pcap \
+        zeek -C -r /workspace/pcap/capture.pcap \
           LogAscii::use_json=T \
           local \
           "Site::local_nets += { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }"
