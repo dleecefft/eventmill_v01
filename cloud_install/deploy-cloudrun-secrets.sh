@@ -151,6 +151,11 @@ gcloud run deploy "${SERVICE_NAME}" \
     --timeout=3600 \
     --concurrency=5 \
     --session-affinity \
+    --liveness-probe-type=tcp \
+    --liveness-probe-port=8080 \
+    --liveness-probe-initial-delay=10 \
+    --liveness-probe-period=30 \
+    --liveness-probe-failure-threshold=3 \
     --service-account="${SA_EMAIL}" \
     --set-secrets="GEMINI_FLASH_API_KEY=${SECRET_GEMINI_FLASH}:latest,GEMINI_PRO_API_KEY=${SECRET_GEMINI_PRO}:latest,TTYD_USERNAME=${SECRET_TTYD_USER}:latest,TTYD_PASSWORD=${SECRET_TTYD_CRED}:latest" \
     --set-env-vars="GOOGLE_CLOUD_PROJECT=${PROJECT_ID},EVENTMILL_BUCKET_PREFIX=${BUCKET_PREFIX},GCS_LOG_BUCKET=${GCS_LOG_BUCKET},EVENTMILL_LOG_LEVEL=${EVENTMILL_LOG_LEVEL:-INFO}" \

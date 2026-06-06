@@ -84,6 +84,11 @@ gcloud run deploy "${SERVICE_NAME}" \
     --timeout=3600 \
     --concurrency=5 \
     --session-affinity \
+    --liveness-probe-type=tcp \
+    --liveness-probe-port=8080 \
+    --liveness-probe-initial-delay=10 \
+    --liveness-probe-period=30 \
+    --liveness-probe-failure-threshold=3 \
     --set-env-vars="GOOGLE_CLOUD_PROJECT=${PROJECT_ID}" \
     --set-env-vars="GEMINI_FLASH_API_KEY=${GEMINI_FLASH_API_KEY:-}" \
     --set-env-vars="GEMINI_PRO_API_KEY=${GEMINI_PRO_API_KEY:-}" \
