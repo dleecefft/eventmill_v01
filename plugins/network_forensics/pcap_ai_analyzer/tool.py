@@ -357,15 +357,20 @@ ARP HEALTH ANALYSIS:
 CONTROL PLANE & TOPOLOGY ANALYSIS:
 - STP (Spanning Tree Protocol):
   - BPDUs are normal L2 control frames; their RATE matters, not mere presence.
+  - PVST+ (Per-VLAN Spanning Tree Plus): Cisco switches run a separate STP instance
+    per VLAN. Each VLAN has its own root bridge ID = (priority + VLAN ID) : MAC.
+    Multiple root bridge IDs with the SAME MAC but different priorities are NOT root
+    instability — they are per-VLAN STP instances (normal PVST+ behavior).
+    True root instability requires different MACs competing within the SAME VLAN.
+  - If the display says "stable, PVST+" it means one switch is root for all VLANs.
+  - Root Change Events are now PVST+-aware: only flagged when the root MAC changes
+    within a single VLAN, not when switching between VLAN instances.
   - TCN (Topology Change Notification) BPDUs signal that the L2 topology changed —
     a port went up/down, a device joined/left. Occasional TCNs are normal; sustained
     floods (>10/min) indicate port flapping, cable issues, or misconfiguration.
   - TC flag set in Config BPDUs triggers MAC table aging acceleration across bridges.
     Many TC flags = many topology changes = network instability.
   - TCA (Topology Change Acknowledgment) = root bridge acknowledging TCN receipt.
-  - Multiple root bridges seen means root bridge election occurred during the capture.
-    This is a CRITICAL event that causes seconds-long traffic blackout.
-  - Root Change Events provide the exact timeline of root elections with timestamps.
   - BPDU rate >5/s on a single bridge is elevated; standard STP sends every 2s.
   - RSTP Proposal/Agreement counts show port negotiation — high counts = flapping.
   - Port Roles (Root/Designated/Alternate/Backup) reveal the topology structure.
@@ -451,7 +456,10 @@ ANALYSIS TASKS:
    - Gratuitous ARP anomalies — correlate with VRRP/HSRP failover events
    - Unanswered ARP requests — dead hosts or wrong-subnet devices
 6. CONTROL PLANE CHECK: Review STP, HSRP/VRRP, OSPF, and EIGRP sections:
-   - STP: Are there TCN storms or root bridge changes? Flag root instability as CRITICAL.
+   - STP: Check if root is "stable, PVST+" (normal per-VLAN instances) vs actual
+     root changes (different MACs competing within same VLAN). Only flag root
+     instability if Root Change Events are present — those are already PVST+-aware.
+     TCN storms with zero root changes = port flapping, not root instability.
    - HSRP/VRRP: Any state transitions or priority changes? Each = a gateway failover.
    - OSPF: Any neighbor hello gaps exceeding dead interval? Any LSUpdate bursts?
    - EIGRP: Any queries (routes going ACTIVE)? High query count = convergence event.
@@ -526,8 +534,11 @@ ANALYSIS TASKS:
    - Long-lived connections that may indicate stuck sessions.
    - Protocol distribution anomalies (unexpected protocol ratios).
 6. CONTROL PLANE DEEP DIVE: If STP/HSRP/VRRP/OSPF/EIGRP data is present:
-   - STP: Correlate TCN count with ARP storms — both together confirm L2 loop.
-     If root bridge changed, estimate reconvergence time from BPDU timestamps.
+   - STP: The root bridge display is PVST+-aware. "Stable, PVST+" means one
+     switch is root for all VLANs (normal). Only Root Change Events represent
+     actual root instability (different MACs competing within same VLAN).
+     Correlate TCN count with ARP storms — both together confirm L2 loop.
+     If root bridge changed within a VLAN, estimate reconvergence time.
      Check if multiple bridges are contending for root (priority war).
    - HSRP/VRRP: Map state transitions to a timeline. Rapid oscillation (>3
      transitions/minute) indicates peer reachability issues (WAN flap, interface
@@ -2813,24 +2824,75 @@ class PcapAiAnalyzer:
                     lines.append(f"  Port States: {', '.join(state_parts)}")
 
                 root_bridges = list(session.stp_root_bridges.keys())
+                # PVST+ detection: group root bridges by VLAN
+                # If all root bridge IDs share the same MAC but differ only in
+                # the System ID Extension (lower 12 bits), this is PVST+ — one
+                # switch is root for multiple VLANs, NOT root instability.
+                root_macs = set()
+                root_by_vlan: dict = {}  # vlan_id -> set of root_keys
+                for rb in root_bridges:
+                    parts = rb.split(':', 1)
+                    if len(parts) == 2:
+                        try:
+                            prio = int(parts[0])
+                            mac = parts[1]
+                            root_macs.add(mac)
+                            vlan = prio & 0x0FFF
+                            root_by_vlan.setdefault(vlan, set()).add(rb)
+                        except ValueError:
+                            root_macs.add(rb)
+
+                is_pvst = len(root_macs) == 1 and len(root_bridges) > 1
+
                 if len(root_bridges) == 1:
                     lines.append(f"  Root Bridge: {root_bridges[0]} (stable)")
-                elif len(root_bridges) > 1:
-                    lines.append(f"  🔴 ROOT BRIDGE CHANGES DETECTED: "
-                                 f"{len(root_bridges)} different root bridges seen!")
+                elif is_pvst:
+                    mac = next(iter(root_macs))
+                    lines.append(f"  Root Bridge: {mac} (stable, PVST+ — same root for "
+                                 f"{len(root_bridges)} VLAN instances)")
                     for rb in root_bridges:
                         count = len(session.stp_root_bridges[rb])
-                        lines.append(f"    {rb}: {count:,} BPDUs")
-                    lines.append(f"    ⚠️  Root bridge instability indicates "
-                                 f"STP reconvergence — check for priority misconfiguration")
+                        try:
+                            vlan = int(rb.split(':')[0]) & 0x0FFF
+                            lines.append(f"    VLAN {vlan}: {rb} ({count:,} BPDUs)")
+                        except ValueError:
+                            lines.append(f"    {rb}: {count:,} BPDUs")
+                elif len(root_bridges) > 1:
+                    # True root instability — different MACs competing
+                    # Check per-VLAN: only flag VLANs with >1 root MAC
+                    vlan_unstable = {v: roots for v, roots in root_by_vlan.items()
+                                     if len(set(r.split(':', 1)[1] for r in roots)) > 1}
+                    if vlan_unstable:
+                        lines.append(f"  🔴 ROOT BRIDGE CHANGES DETECTED in "
+                                     f"{len(vlan_unstable)} VLAN(s)!")
+                        for vlan in sorted(vlan_unstable):
+                            lines.append(f"    VLAN {vlan}: {len(vlan_unstable[vlan])} "
+                                         f"different roots competing")
+                            for rb in sorted(vlan_unstable[vlan]):
+                                count = len(session.stp_root_bridges[rb])
+                                lines.append(f"      {rb}: {count:,} BPDUs")
+                        lines.append(f"    ⚠️  Root bridge instability — "
+                                     f"check for priority misconfiguration")
+                    else:
+                        lines.append(f"  Root Bridges: {len(root_bridges)} "
+                                     f"(PVST+ — per-VLAN instances, stable)")
+                        for rb in root_bridges:
+                            count = len(session.stp_root_bridges[rb])
+                            lines.append(f"    {rb}: {count:,} BPDUs")
 
-                # Root change timeline
+                # Root change timeline (only real changes — same VLAN, different MAC)
                 if session.stp_root_changes:
                     lines.append(f"  🔴 ROOT CHANGE EVENTS ({len(session.stp_root_changes)}):")
-                    for ts, old_root, new_root in session.stp_root_changes[:20]:
+                    for entry in session.stp_root_changes[:20]:
                         from datetime import datetime, timezone
-                        dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%H:%M:%S.%f')[:-3]
-                        lines.append(f"    {dt}: {old_root} → {new_root}")
+                        if len(entry) == 4:
+                            ts, vlan, old_root, new_root = entry
+                            dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%H:%M:%S.%f')[:-3]
+                            lines.append(f"    {dt} VLAN {vlan}: {old_root} → {new_root}")
+                        else:
+                            ts, old_root, new_root = entry
+                            dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%H:%M:%S.%f')[:-3]
+                            lines.append(f"    {dt}: {old_root} → {new_root}")
 
                 if session.stp_tcn_count > 10:
                     lines.append(f"  ⚠️  HIGH TCN COUNT: {session.stp_tcn_count} topology "

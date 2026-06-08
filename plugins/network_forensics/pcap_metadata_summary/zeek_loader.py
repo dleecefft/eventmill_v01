@@ -532,7 +532,7 @@ def _parse_stp_log(path: Path, session) -> None:
     Populates all STP fields in PcapSession: counts, flags, root/bridge
     tracking, port roles/states, timers, VLANs, root changes, and src MACs.
     """
-    last_root = ''
+    last_root_per_vlan: Dict[int, str] = {}
     count = 0
     for entry in _read_zeek_json(path):
         count += 1
@@ -585,16 +585,18 @@ def _parse_stp_log(path: Path, session) -> None:
         elif not forwarding and not learning:
             session.stp_port_states["Blocking/Discarding"] += 1
 
-        # Root bridge tracking
+        # Root bridge tracking (PVST+-aware: per-VLAN)
         root_prio = entry.get("root_priority")
         root_mac = entry.get("root_mac", "")
         if root_prio is not None and root_mac:
             root_key = f"{root_prio}:{root_mac}"
             session.stp_root_bridges[root_key].append(ts)
-            # Detect root bridge changes
-            if last_root and root_key != last_root:
-                session.stp_root_changes.append((ts, last_root, root_key))
-            last_root = root_key
+            # Detect root bridge changes within same VLAN
+            root_vlan = root_prio & 0x0FFF
+            prev_root = last_root_per_vlan.get(root_vlan)
+            if prev_root and root_key != prev_root:
+                session.stp_root_changes.append((ts, root_vlan, prev_root, root_key))
+            last_root_per_vlan[root_vlan] = root_key
 
         # Bridge tracking + path cost
         bridge_prio = entry.get("bridge_priority")
@@ -628,7 +630,7 @@ def _parse_stp_log(path: Path, session) -> None:
             session.stp_timers["fwd_delay"][fwd_delay] += 1
 
     if count:
-        session._stp_last_root = last_root
+        session._stp_last_root_per_vlan = last_root_per_vlan
         logger.info("Parsed %d STP BPDUs from Zeek stp.log", count)
 
 

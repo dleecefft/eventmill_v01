@@ -169,8 +169,8 @@ class PcapSession:
         self.stp_agreement_count: int = 0                    # RSTP agreement flag count
         self.stp_tc_events: List[float] = []                 # timestamps when TC flag set
         self.stp_tcn_events: List[float] = []                # timestamps when TCN BPDU sent
-        self.stp_root_changes: List[tuple] = []              # (timestamp, old_root, new_root)
-        self._stp_last_root: str = ''                        # track current root for change detection
+        self.stp_root_changes: List[tuple] = []              # (timestamp, vlan, old_root, new_root)
+        self._stp_last_root_per_vlan: Dict[int, str] = {}    # PVST+: track root per VLAN
         self.stp_path_costs: Dict[str, List] = defaultdict(list)   # bridge_key -> [(ts, cost)]
         self.stp_port_ids: Counter = Counter()               # port_id_hex -> count
         self.stp_vlans: Counter = Counter()                  # VLAN ID -> count (from System ID Extension)
@@ -564,16 +564,18 @@ def parse_pcap_file(file_path: str) -> PcapSession:
                     if vlan_id > 0:
                         session.stp_vlans[vlan_id] += 1
 
-                    # Root bridge tracking
+                    # Root bridge tracking (PVST+-aware: per-VLAN)
                     root_mac = getattr(stp, 'rootmac', '') or ''
                     root_id = getattr(stp, 'rootid', 0) or 0
                     root_key = f"{root_id}:{root_mac}"
                     if root_key:
                         session.stp_root_bridges[root_key].append(ts)
-                    # Detect root bridge changes
-                    if session._stp_last_root and root_key != session._stp_last_root:
-                        session.stp_root_changes.append((ts, session._stp_last_root, root_key))
-                    session._stp_last_root = root_key
+                    # Detect root bridge changes within same VLAN
+                    root_vlan = root_id & 0x0FFF
+                    prev_root = session._stp_last_root_per_vlan.get(root_vlan)
+                    if prev_root and root_key != prev_root:
+                        session.stp_root_changes.append((ts, root_vlan, prev_root, root_key))
+                    session._stp_last_root_per_vlan[root_vlan] = root_key
 
                     # Root path cost
                     path_cost = getattr(stp, 'pathcost', None)
@@ -1074,10 +1076,12 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
                                 root_mac = ':'.join(f'{b:02x}' for b in stp_data[7:13])
                                 root_key = f"{root_prio}:{root_mac}"
                                 session.stp_root_bridges[root_key].append(ts)
-                                # Detect root bridge changes
-                                if session._stp_last_root and root_key != session._stp_last_root:
-                                    session.stp_root_changes.append((ts, session._stp_last_root, root_key))
-                                session._stp_last_root = root_key
+                                # Detect root bridge changes (PVST+-aware: per-VLAN)
+                                root_vlan = root_prio & 0x0FFF
+                                prev_root = session._stp_last_root_per_vlan.get(root_vlan)
+                                if prev_root and root_key != prev_root:
+                                    session.stp_root_changes.append((ts, root_vlan, prev_root, root_key))
+                                session._stp_last_root_per_vlan[root_vlan] = root_key
 
                                 # Root path cost: 4 bytes at offset 13-16
                                 path_cost = int.from_bytes(stp_data[13:17], 'big')
