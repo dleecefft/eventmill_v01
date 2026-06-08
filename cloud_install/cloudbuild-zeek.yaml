@@ -80,6 +80,18 @@ steps:
           echo "Warning: failed to install:$${FAILED}"
         fi
 
+        # --- Phase 1b: Install zeek-stp (STP/RSTP/MSTP BPDU analyzer) ---
+        echo "Installing zeek-stp..."
+        cd /tmp
+        git clone --depth 1 --filter=blob:none --sparse \
+          https://github.com/dleecefft/eventmill_v01.git zeek-stp-src 2>/dev/null
+        cd zeek-stp-src && git sparse-checkout set cloud_install/zeek-stp
+        if zkg install --force --skiptest ./cloud_install/zeek-stp 2>&1; then
+          echo "  ✓ zeek-stp installed"
+        else
+          echo "  ✗ zeek-stp install failed (non-fatal)"
+        fi
+
         # --- Phase 2: Run Zeek analysis ---
         echo ""
         echo "Running Zeek analysis (with OT/ICS protocol support)..."
@@ -112,7 +124,7 @@ steps:
         fi
 
         # OT/ICS protocol log summary
-        for OT_LOG in modbus.log dnp3.log bacnet.log s7comm.log enip.log cip.log opcua_binary.log; do
+        for OT_LOG in modbus.log dnp3.log bacnet.log s7comm.log enip.log cip.log opcua_binary.log stp.log; do
           if [ -f "${OT_LOG}" ]; then
             OT_COUNT=$(wc -l < "${OT_LOG}")
             echo "OT/ICS ${OT_LOG}: ${OT_COUNT} entries"

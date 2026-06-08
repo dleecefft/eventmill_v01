@@ -13,11 +13,11 @@ This allows all downstream tools (pcap_threat_hunter, pcap_ai_analyzer,
 pcap_ip_search, pcap_flow_analyzer, pcap_report_correlator) to work
 on Zeek output with zero changes.
 
-Note: STP (Spanning Tree Protocol) is Layer 2 — Zeek operates at
-Layer 3+ and cannot see STP BPDUs.  STP fields in PcapSession
-(stp_bpdu_count, stp_tcn_count, stp_root_bridges, etc.) will always
-be zero when loaded from Zeek logs.  Use Scapy or dpkt parsers for
-STP analysis.
+Note: STP (Spanning Tree Protocol) is Layer 2 — standard Zeek cannot
+see STP BPDUs.  However, the zeek-stp packet analyzer plugin
+(cloud_install/zeek-stp/) adds a custom LLC-level analyzer that
+produces stp.log with full BPDU field extraction.  When stp.log is
+present, _parse_stp_log() populates all STP fields in PcapSession.
 """
 
 from __future__ import annotations
@@ -126,6 +126,11 @@ def parse_zeek_logs(log_dir: str | Path) -> "PcapSession":
     if weird_path.exists():
         _parse_weird_log(weird_path, session)
 
+    # --- STP/RSTP/MSTP BPDU log (zeek-stp plugin) ---
+    stp_path = log_dir / "stp.log"
+    if stp_path.exists():
+        _parse_stp_log(stp_path, session)
+
     # --- OT/ICS dedicated protocol logs (icsnpp packages) ---
     _ot_log_parsers: Dict[str, Any] = {
         "modbus.log": _parse_modbus_log,
@@ -157,6 +162,7 @@ def parse_zeek_logs(log_dir: str | Path) -> "PcapSession":
 
     _ALL_KNOWN_LOGS = {
         "conn.log", "dns.log", "ssl.log", "http.log", "notice.log", "weird.log",
+        "stp.log",
     } | set(_OT_LOG_FILES)
     files_parsed = [
         f.name for f in log_dir.glob("*.log")
@@ -514,6 +520,116 @@ def _parse_weird_log(path: Path, session) -> None:
     session._zeek_weird = weirdness  # type: ignore[attr-defined]
     if weirdness:
         logger.info("Parsed %d weird entries from Zeek", len(weirdness))
+
+
+# ---------------------------------------------------------------------------
+# STP / BPDU log parser (zeek-stp plugin)
+# ---------------------------------------------------------------------------
+
+def _parse_stp_log(path: Path, session) -> None:
+    """Parse stp.log — STP/RSTP/MSTP BPDU data from zeek-stp plugin.
+
+    Populates all STP fields in PcapSession: counts, flags, root/bridge
+    tracking, port roles/states, timers, VLANs, root changes, and src MACs.
+    """
+    last_root = ''
+    count = 0
+    for entry in _read_zeek_json(path):
+        count += 1
+        session.stp_bpdu_count += 1
+
+        ts = _ts_to_epoch(entry.get("ts")) or 0.0
+        session._stp_timestamps.append(ts)
+        _update_time_range(session, ts)
+
+        # Source MAC of the switch sending this BPDU
+        src_mac = entry.get("src_mac", "")
+        if src_mac:
+            session.stp_src_macs[src_mac] += 1
+
+        # Protocol version
+        version = entry.get("version")
+        if version is not None:
+            version_name = {0: "STP", 2: "RSTP", 3: "MSTP"}.get(version, f"v{version}")
+            session.stp_version_counts[version_name] += 1
+
+        # BPDU type
+        bpdu_type = entry.get("bpdu_type", "")
+        if bpdu_type == "TCN":
+            session.stp_tcn_count += 1
+            session.stp_tcn_events.append(ts)
+
+        # Flags (pre-decoded by Zeek script)
+        if entry.get("tc", False):
+            session.stp_tc_flag_count += 1
+            session.stp_tc_events.append(ts)
+        if entry.get("tca", False):
+            session.stp_tca_count += 1
+        if entry.get("proposal", False):
+            session.stp_proposal_count += 1
+        if entry.get("agreement", False):
+            session.stp_agreement_count += 1
+
+        # Port role
+        port_role = entry.get("port_role", "Unknown")
+        if port_role:
+            session.stp_port_roles[port_role] += 1
+
+        # Port state from learning/forwarding flags
+        learning = entry.get("learning", False)
+        forwarding = entry.get("forwarding", False)
+        if forwarding and learning:
+            session.stp_port_states["Forwarding"] += 1
+        elif learning:
+            session.stp_port_states["Learning"] += 1
+        elif not forwarding and not learning:
+            session.stp_port_states["Blocking/Discarding"] += 1
+
+        # Root bridge tracking
+        root_prio = entry.get("root_priority")
+        root_mac = entry.get("root_mac", "")
+        if root_prio is not None and root_mac:
+            root_key = f"{root_prio}:{root_mac}"
+            session.stp_root_bridges[root_key].append(ts)
+            # Detect root bridge changes
+            if last_root and root_key != last_root:
+                session.stp_root_changes.append((ts, last_root, root_key))
+            last_root = root_key
+
+        # Bridge tracking + path cost
+        bridge_prio = entry.get("bridge_priority")
+        bridge_mac = entry.get("bridge_mac", "")
+        if bridge_prio is not None and bridge_mac:
+            bridge_key = f"{bridge_prio}:{bridge_mac}"
+            session.stp_bridges[bridge_key] += 1
+            path_cost = entry.get("root_path_cost")
+            if path_cost is not None:
+                session.stp_path_costs[bridge_key].append((ts, path_cost))
+
+        # VLAN from System ID Extension (lower 12 bits of bridge priority)
+        sys_id_ext = entry.get("bridge_sys_id_ext")
+        if sys_id_ext and sys_id_ext > 0:
+            session.stp_vlans[sys_id_ext] += 1
+
+        # Port ID
+        port_id = entry.get("port_id")
+        if port_id is not None:
+            session.stp_port_ids[f"0x{port_id:04x}"] += 1
+
+        # Timers
+        hello = entry.get("hello_time")
+        if hello is not None:
+            session.stp_timers["hello"][hello] += 1
+        max_age = entry.get("max_age")
+        if max_age is not None:
+            session.stp_timers["max_age"][max_age] += 1
+        fwd_delay = entry.get("forward_delay")
+        if fwd_delay is not None:
+            session.stp_timers["fwd_delay"][fwd_delay] += 1
+
+    if count:
+        session._stp_last_root = last_root
+        logger.info("Parsed %d STP BPDUs from Zeek stp.log", count)
 
 
 # ---------------------------------------------------------------------------

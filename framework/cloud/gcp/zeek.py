@@ -178,6 +178,13 @@ class ZeekCloudBuildClient:
                         'zkg install --force --skiptest "$$PKG" 2>&1 || true; '
                         'done && '
                         'echo "OT/ICS packages installed: $$(zkg list | wc -l) packages" && '
+                        '# Phase 1b: Install zeek-stp (STP/RSTP/MSTP BPDU analyzer)\n'
+                        'cd /tmp && '
+                        'git clone --depth 1 --filter=blob:none --sparse '
+                        'https://github.com/dleecefft/eventmill_v01.git zeek-stp-src 2>/dev/null && '
+                        'cd zeek-stp-src && git sparse-checkout set cloud_install/zeek-stp && '
+                        'zkg install --force --skiptest ./cloud_install/zeek-stp 2>&1 && '
+                        'echo "zeek-stp installed" || echo "zeek-stp install failed (non-fatal)" && '
                         '# Phase 2: Run Zeek analysis\n'
                         'cd /workspace/zeek-output && '
                         'zeek -C -r /workspace/pcap/capture.pcap '
@@ -185,7 +192,7 @@ class ZeekCloudBuildClient:
                         'local '
                         '"Site::local_nets += { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }" && '
                         'echo "Zeek complete: $$(ls *.log 2>/dev/null | wc -l) log files" && '
-                        'for OT_LOG in modbus.log dnp3.log bacnet.log s7comm.log enip.log cip.log opcua_binary.log; do '
+                        'for OT_LOG in modbus.log dnp3.log bacnet.log s7comm.log enip.log cip.log opcua_binary.log stp.log; do '
                         '[ -f "$$OT_LOG" ] && echo "OT: $$OT_LOG $$(wc -l < $$OT_LOG) entries"; '
                         'done || true',
                     ],
