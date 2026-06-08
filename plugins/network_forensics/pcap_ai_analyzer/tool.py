@@ -319,7 +319,12 @@ YOUR ROLE:
 
 KEY NETWORK OPS PRINCIPLES:
 - TCP retransmissions indicate packet loss or network congestion.
-- TCP RST floods suggest connection issues, firewall resets, or application failures.
+- TCP RST directionality matters: If the CLIENT is sending RSTs (RSTs from the
+  ephemeral-port side), do not assume the server is offline. This indicates
+  client-side application aborts — the app is timing out or receiving out-of-
+  sequence data and closing the connection. If the SERVER sends RSTs (from the
+  well-known port side), the service is rejecting connections (port closed,
+  service down, or connection limit reached).
 - TCP zero-window events indicate receiver buffer exhaustion (application or host overload).
 - ICMP Destination Unreachable messages indicate routing problems or blocked services.
 - ICMP Time Exceeded (TTL) indicates routing loops or misconfigured hop counts.
@@ -344,6 +349,9 @@ ROUTING LOOP DETECTION:
 
 ARP HEALTH ANALYSIS:
 - ARP is Layer 2 — it operates below IP and reveals switch/VLAN-level health.
+- DHCP exception: Source IP 0.0.0.0 in ARP is normal DHCP initialization (DHCP
+  DISCOVER/Request before an IP is assigned). Ignore 0.0.0.0 when evaluating
+  IP address conflicts or ARP anomalies — multiple MACs using 0.0.0.0 is expected.
 - ARP storms (>100 ARP/s sustained) typically indicate a Layer 2 loop (spanning-tree
   failure) or broadcast storm. This is a CRITICAL finding.
 - IP address conflicts (same IP, multiple MACs) cause intermittent connectivity loss
@@ -363,15 +371,36 @@ CONTROL PLANE & TOPOLOGY ANALYSIS:
     instability — they are per-VLAN STP instances (normal PVST+ behavior).
     True root instability requires different MACs competing within the SAME VLAN.
   - If the display says "stable, PVST+" it means one switch is root for all VLANs.
-  - Root Change Events are now PVST+-aware: only flagged when the root MAC changes
+  - Root Change Events are PVST+-aware: only flagged when the root MAC changes
     within a single VLAN, not when switching between VLAN instances.
-  - TCN (Topology Change Notification) BPDUs signal that the L2 topology changed —
-    a port went up/down, a device joined/left. Occasional TCNs are normal; sustained
-    floods (>10/min) indicate port flapping, cable issues, or misconfiguration.
-  - TC flag set in Config BPDUs triggers MAC table aging acceleration across bridges.
+  - RSTP vs Legacy STP: In RSTP (802.1w) and MSTP (802.1s), topology changes
+    are signaled via the TC flag (bit 0) in standard Rapid BPDUs (Type 0x02),
+    NOT via dedicated TCN BPDUs (Type 0x80). Look at TC flag count, not just TCN
+    count, to assess topology change activity in modern networks.
+  - MSTP awareness: If MSTP is running (version=3), the CIST (Common Internal
+    Spanning Tree) root is shared, with per-MSTI (instance) parameters.
+    Different MSTI parameters do NOT mean the switch is flapping.
+  - BPDU STARVATION is the most critical STP failure mode. If a port was
+    receiving BPDUs every 2s (hello) and suddenly stops receiving for >max_age
+    (default 20s), the port ages out STP info and transitions to Forwarding.
+    This causes a BRIDGING LOOP. The display flags gaps exceeding max_age with
+    exact timestamps and affected source MACs. Treat any BPDU starvation as
+    CRITICAL — investigate the upstream switch (CPU spike, link failure,
+    unidirectional fiber, software hang).
+  - MAC MISMATCH: If the Ethernet source MAC differs from the BPDU bridge MAC
+    (beyond last-octet port offsets), this indicates potential BPDU spoofing
+    (e.g. Yersinia), a misconfigured transparent bridge, or packet crafting.
+    Flag as a SECURITY concern.
+  - TCN BPDUs signal L2 topology changed — port up/down, device joined/left.
+    Occasional TCNs are normal; floods (>10/min) = port flapping or cable issues.
+  - TC flag in Config BPDUs triggers MAC table aging acceleration across bridges.
     Many TC flags = many topology changes = network instability.
   - TCA (Topology Change Acknowledgment) = root bridge acknowledging TCN receipt.
-  - BPDU rate >5/s on a single bridge is elevated; standard STP sends every 2s.
+  - BPDU rate context: Use the per-port-per-VLAN rate, NOT the aggregate rate,
+    when evaluating STP storms. In PVST+, each port sends 1 BPDU per VLAN per
+    hello interval (2s). An aggregate 11.5 BPDU/s across 23 ports × 5 VLANs =
+    0.1 BPDU/s per port/VLAN, which is perfectly normal. Only flag STP storms
+    if the per-port-per-VLAN rate exceeds 1.0 BPDU/s.
   - RSTP Proposal/Agreement counts show port negotiation — high counts = flapping.
   - Port Roles (Root/Designated/Alternate/Backup) reveal the topology structure.
   - Port States (Forwarding/Learning/Blocking) — many Blocking = redundant paths,
@@ -382,6 +411,9 @@ CONTROL PLANE & TOPOLOGY ANALYSIS:
   - Non-standard timer values (hello ≠ 2s, max_age ≠ 20s, fwd_delay ≠ 15s)
     indicate custom tuning — may be intentional or misconfiguration.
   - TC event bursts (clusters of TC flags within seconds) = active instability.
+  - When STP instability IS detected, identify: (1) TRIGGER — which MAC/port
+    initiated the change, (2) BLAST RADIUS — isolated to one VLAN or all,
+    (3) NEXT STEP — specific switch/port to investigate.
 - HSRP (Hot Standby Router Protocol):
   - HSRP state transitions (Standby→Active or Active→Standby) represent gateway
     failover events. Each transition causes brief traffic disruption for hosts
@@ -2741,7 +2773,8 @@ class PcapAiAnalyzer:
                     lines.append(f"    {mac}: {count:,} requests ({pct_of_arp:.1f}%){marker}")
 
             conflicts = {ip: macs for ip, macs in session.arp_ip_to_macs.items()
-                         if len(macs) > 1}
+                         if len(macs) > 1
+                         and ip not in ('0.0.0.0', '255.255.255.255')}
             if conflicts:
                 lines.append(f"\n  🔴 IP ADDRESS CONFLICTS: {len(conflicts)} IP(s) "
                              f"claimed by multiple MACs")
@@ -2926,9 +2959,21 @@ class PcapAiAnalyzer:
                     stp_duration = max(session._stp_timestamps) - min(session._stp_timestamps)
                     if stp_duration > 0:
                         stp_rate = total_stp / stp_duration
-                        lines.append(f"  STP rate: {stp_rate:.1f} BPDU/s")
-                        if stp_rate > 5:
-                            lines.append(f"  ⚠️  Elevated BPDU rate — possible STP storm")
+                        lines.append(f"  STP rate: {stp_rate:.1f} BPDU/s (aggregate)")
+                        # Per-port-per-VLAN rate: in PVST+, each port sends 1 BPDU
+                        # per VLAN per hello interval. Normal = ports × VLANs / 2s.
+                        num_vlans = max(len(session.stp_vlans), 1)
+                        num_ports = max(len(session.stp_src_macs), 1)
+                        expected_rate = num_ports * num_vlans * 0.5  # 1 per 2s hello
+                        per_port_vlan_rate = stp_rate / (num_ports * num_vlans)
+                        lines.append(f"  Per-port-per-VLAN rate: {per_port_vlan_rate:.2f} BPDU/s "
+                                     f"({num_ports} ports × {num_vlans} VLANs)")
+                        if per_port_vlan_rate > 1.0:
+                            lines.append(f"  ⚠️  Elevated per-port BPDU rate (>{per_port_vlan_rate:.1f}/s) "
+                                         f"— possible STP storm")
+                        elif stp_rate > expected_rate * 2:
+                            lines.append(f"  ⚠️  Aggregate rate exceeds 2x expected ({expected_rate:.1f}/s) "
+                                         f"— investigate")
 
                 if session.stp_bridges:
                     lines.append(f"  Bridges seen: {len(session.stp_bridges)}")
@@ -2966,6 +3011,29 @@ class PcapAiAnalyzer:
                     lines.append(f"  Port IDs ({len(session.stp_port_ids)} unique):")
                     for pid, count in session.stp_port_ids.most_common(10):
                         lines.append(f"    {pid}: {count:,}")
+
+                # BPDU starvation detection (gaps > max_age)
+                if session.stp_bpdu_gaps:
+                    lines.append(f"  🔴 BPDU STARVATION DETECTED: {len(session.stp_bpdu_gaps)} gap(s) "
+                                 f"exceeding max_age!")
+                    lines.append(f"    A BPDU stream that stops for >max_age causes the port to "
+                                 f"transition to Forwarding — potential bridging loop!")
+                    for src_mac, gap_start, gap_secs in session.stp_bpdu_gaps[:15]:
+                        from datetime import datetime, timezone
+                        dt = datetime.fromtimestamp(gap_start, tz=timezone.utc).strftime('%H:%M:%S')
+                        lines.append(f"    {dt}: {src_mac} — {gap_secs}s silence "
+                                     f"(>{int(gap_secs // 20)}x max_age)")
+
+                # MAC mismatch (spoofing / misconfiguration)
+                if session.stp_mac_mismatches:
+                    lines.append(f"  🔴 BPDU MAC MISMATCH: {len(session.stp_mac_mismatches)} "
+                                 f"packet(s) where Ethernet source ≠ BPDU bridge MAC!")
+                    lines.append(f"    This may indicate BPDU spoofing (e.g. Yersinia), a "
+                                 f"misconfigured transparent bridge, or packet crafting.")
+                    for ts, eth_mac, bpdu_mac in session.stp_mac_mismatches[:10]:
+                        from datetime import datetime, timezone
+                        dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%H:%M:%S.%f')[:-3]
+                        lines.append(f"    {dt}: Ethernet src={eth_mac}  BPDU bridge={bpdu_mac}")
 
             # --- HSRP ---
             if session.hsrp_hello_count > 0:
@@ -3289,7 +3357,7 @@ class PcapAiAnalyzer:
                 subnet_scores[_to_subnet(ip)]["ips_seen"].add(ip)
 
         for ip, macs in session.arp_ip_to_macs.items():
-            if len(macs) > 1 and is_internal(ip):
+            if len(macs) > 1 and is_internal(ip) and ip not in ('0.0.0.0', '255.255.255.255'):
                 subnet_scores[_to_subnet(ip)]["ip_conflicts"] += 1
                 subnet_scores[_to_subnet(ip)]["ips_seen"].add(ip)
 

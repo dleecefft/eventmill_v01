@@ -178,6 +178,9 @@ class PcapSession:
             'hello': Counter(), 'max_age': Counter(), 'fwd_delay': Counter()
         }
         self.stp_src_macs: Counter = Counter()               # source MAC -> count (which switches send BPDUs)
+        self._stp_per_port_ts: Dict[str, List[float]] = defaultdict(list)  # src_mac -> [timestamps] for gap detection
+        self.stp_bpdu_gaps: List[tuple] = []                 # (src_mac, gap_start_ts, gap_seconds) gaps > max_age
+        self.stp_mac_mismatches: List[tuple] = []            # (ts, eth_src_mac, bpdu_bridge_mac) spoofing indicator
 
         # Control plane — HSRP
         self.hsrp_hello_count: int = 0
@@ -544,8 +547,11 @@ def parse_pcap_file(file_path: str) -> PcapSession:
                     session._stp_timestamps.append(ts)
 
                     # Source MAC of the switch sending this BPDU
+                    eth_src = ''
                     if hasattr(pkt, 'src'):
-                        session.stp_src_macs[pkt.src] += 1
+                        eth_src = pkt.src
+                        session.stp_src_macs[eth_src] += 1
+                        session._stp_per_port_ts[eth_src].append(ts)
 
                     # STP version: 0=STP, 2=RSTP, 3=MSTP
                     version = getattr(stp, 'version', 0) or 0
@@ -558,6 +564,15 @@ def parse_pcap_file(file_path: str) -> PcapSession:
                     bridge_key = f"{bridge_id}:{bridge_mac}"
                     if bridge_key:
                         session.stp_bridges[bridge_key] += 1
+
+                    # MAC mismatch detection (spoofing indicator)
+                    if eth_src and bridge_mac and eth_src.lower() != bridge_mac.lower():
+                        # Different base MACs (ignore port offset in last octet)
+                        eth_base = eth_src.lower().rsplit(':', 1)[0]
+                        bpdu_base = bridge_mac.lower().rsplit(':', 1)[0]
+                        if eth_base != bpdu_base:
+                            if len(session.stp_mac_mismatches) < 50:
+                                session.stp_mac_mismatches.append((ts, eth_src, bridge_mac))
 
                     # VLAN from System ID Extension (lower 12 bits of bridge priority)
                     vlan_id = bridge_id & 0x0FFF
@@ -925,12 +940,33 @@ def parse_pcap_file(file_path: str) -> PcapSession:
                 except Exception:
                     pass
 
+    # --- Post-process: detect BPDU starvation (gaps > max_age per source port) ---
+    _compute_stp_bpdu_gaps(session)
+
     return session
 
 
-# ---------------------------------------------------------------------------
-# dpkt-based fast parser (--fast mode) — 5-10x faster than scapy
-# ---------------------------------------------------------------------------
+def _compute_stp_bpdu_gaps(session) -> None:
+    """Detect BPDU starvation: gaps in per-port BPDU stream exceeding max_age.
+
+    A switch port that was steadily receiving BPDUs every 2s (hello interval)
+    and then stops for >20s (max_age) is a critical loop risk — the port will
+    transition to Forwarding and may create a bridging loop.
+    """
+    # Determine max_age from captured timers (default 20s)
+    max_age = 20
+    if session.stp_timers.get('max_age'):
+        max_age = session.stp_timers['max_age'].most_common(1)[0][0] or 20
+
+    for src_mac, timestamps in session._stp_per_port_ts.items():
+        if len(timestamps) < 3:
+            continue  # need at least a few BPDUs to establish a stream
+        ts_sorted = sorted(timestamps)
+        for i in range(1, len(ts_sorted)):
+            gap = ts_sorted[i] - ts_sorted[i - 1]
+            if gap > max_age:
+                session.stp_bpdu_gaps.append((src_mac, ts_sorted[i - 1], round(gap, 1)))
+
 
 DPKT_AVAILABLE = False
 try:
@@ -1030,6 +1066,7 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
                             # Source MAC of the switch sending this BPDU
                             src_mac = ':'.join(f'{b:02x}' for b in eth.src)
                             session.stp_src_macs[src_mac] += 1
+                            session._stp_per_port_ts[src_mac].append(ts)
 
                             # STP version byte at offset 1
                             version = stp_data[1]
@@ -1091,6 +1128,14 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
                                 bridge_key = f"{bridge_prio}:{bridge_mac}"
                                 session.stp_bridges[bridge_key] += 1
                                 session.stp_path_costs[bridge_key].append((ts, path_cost))
+
+                                # MAC mismatch detection (spoofing indicator)
+                                if src_mac and bridge_mac and src_mac != bridge_mac:
+                                    eth_base = src_mac.rsplit(':', 1)[0]
+                                    bpdu_base = bridge_mac.rsplit(':', 1)[0]
+                                    if eth_base != bpdu_base:
+                                        if len(session.stp_mac_mismatches) < 50:
+                                            session.stp_mac_mismatches.append((ts, src_mac, bridge_mac))
 
                                 # VLAN from System ID Extension (lower 12 bits of bridge priority)
                                 vlan_id = bridge_prio & 0x0FFF
@@ -1406,6 +1451,9 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
                             session.eigrp_hello_count += 1
                 except Exception:
                     pass
+
+    # --- Post-process: detect BPDU starvation (gaps > max_age per source port) ---
+    _compute_stp_bpdu_gaps(session)
 
     return session
 

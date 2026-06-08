@@ -546,6 +546,7 @@ def _parse_stp_log(path: Path, session) -> None:
         src_mac = entry.get("src_mac", "")
         if src_mac:
             session.stp_src_macs[src_mac] += 1
+            session._stp_per_port_ts[src_mac].append(ts)
 
         # Protocol version
         version = entry.get("version")
@@ -608,6 +609,14 @@ def _parse_stp_log(path: Path, session) -> None:
             if path_cost is not None:
                 session.stp_path_costs[bridge_key].append((ts, path_cost))
 
+            # MAC mismatch detection (spoofing indicator)
+            if src_mac and bridge_mac and src_mac.lower() != bridge_mac.lower():
+                eth_base = src_mac.lower().rsplit(':', 1)[0]
+                bpdu_base = bridge_mac.lower().rsplit(':', 1)[0]
+                if eth_base != bpdu_base:
+                    if len(session.stp_mac_mismatches) < 50:
+                        session.stp_mac_mismatches.append((ts, src_mac, bridge_mac))
+
         # VLAN from System ID Extension (lower 12 bits of bridge priority)
         sys_id_ext = entry.get("bridge_sys_id_ext")
         if sys_id_ext and sys_id_ext > 0:
@@ -631,6 +640,18 @@ def _parse_stp_log(path: Path, session) -> None:
 
     if count:
         session._stp_last_root_per_vlan = last_root_per_vlan
+        # Detect BPDU starvation (gaps > max_age per source port)
+        max_age = 20
+        if session.stp_timers.get('max_age'):
+            max_age = session.stp_timers['max_age'].most_common(1)[0][0] or 20
+        for mac, timestamps in session._stp_per_port_ts.items():
+            if len(timestamps) < 3:
+                continue
+            ts_sorted = sorted(timestamps)
+            for i in range(1, len(ts_sorted)):
+                gap = ts_sorted[i] - ts_sorted[i - 1]
+                if gap > max_age:
+                    session.stp_bpdu_gaps.append((mac, ts_sorted[i - 1], round(gap, 1)))
         logger.info("Parsed %d STP BPDUs from Zeek stp.log", count)
 
 
