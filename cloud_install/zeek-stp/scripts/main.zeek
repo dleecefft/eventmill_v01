@@ -19,7 +19,7 @@ export {
         ts:                time    &log;
         ## Source MAC of the switch sending the BPDU
         src_mac:           string  &log;
-        ## Destination MAC (usually 01:80:c2:00:00:00 for STP)
+        ## Destination MAC (01:80:c2:00:00:00 for STP, 01:00:0c:cc:cc:cd for PVST+)
         dst_mac:           string  &log;
         ## Protocol version: 0=STP, 2=RSTP, 3=MSTP
         version:           count   &log &optional;
@@ -69,7 +69,7 @@ export {
 }
 
 # Register our STP analyzer as the LLC handler for the Ethernet packet analyzer.
-# STP BPDUs arrive via 802.3 frames with LLC DSAP=0x42, SSAP=0x42.
+# STP BPDUs arrive via 802.3 frames: LLC DSAP=0x42 (standard) or SNAP/PVST+.
 redef PacketAnalyzer::ETHERNET::llc_analyzer = PacketAnalyzer::ANALYZER_STP;
 
 event zeek_init() &priority=5 {

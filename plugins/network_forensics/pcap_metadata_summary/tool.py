@@ -461,7 +461,7 @@ try:
 
     from scapy.utils import PcapReader
     from scapy.layers.inet import IP, TCP, UDP, ICMP
-    from scapy.layers.l2 import ARP, STP
+    from scapy.layers.l2 import ARP, SNAP, STP
     from scapy.layers.dns import DNS, DNSQR, DNSRR
     from scapy.layers.http import HTTPRequest, HTTPResponse
     from scapy.layers.hsrp import HSRP as ScapyHSRP
@@ -540,9 +540,18 @@ def parse_pcap_file(file_path: str) -> PcapSession:
                         session.arp_ip_to_macs[src_ip_arp].add(psrc_mac)
 
             # --- STP / BPDU extraction (L2, before IP check) ---
+            stp = None
             if pkt.haslayer(STP):
+                stp = pkt[STP]
+            elif pkt.haslayer(SNAP):
+                _snap = pkt[SNAP]
+                if _snap.OUI == 0x00000c and _snap.code == 0x010b:
+                    try:
+                        stp = STP(bytes(_snap.payload))
+                    except Exception:
+                        pass
+            if stp is not None:
                 try:
-                    stp = pkt[STP]
                     session.stp_bpdu_count += 1
                     session._stp_timestamps.append(ts)
 
@@ -1051,14 +1060,19 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
                     pass
 
             # --- STP / BPDU extraction (L2, before IP check) ---
-            # STP BPDUs are carried over LLC (ethertype 0x0000 or length-based)
-            # LLC DSAP=0x42, SSAP=0x42 indicates STP
+            # STP BPDUs: standard LLC (DSAP=0x42) or Cisco PVST+ (SNAP)
             try:
                 raw = bytes(eth.data) if not isinstance(eth.data, bytes) else eth.data
-                # Check for LLC header: DSAP=0x42, SSAP=0x42 → STP
+                # STP detection: standard LLC or Cisco PVST+ (SNAP)
                 if len(raw) >= 4 and eth.type <= 1500:  # 802.3 length field
-                    if raw[0] == 0x42 and raw[1] == 0x42:
-                        stp_data = raw[3:]  # skip LLC header (DSAP, SSAP, Control)
+                    _is_std_stp = raw[0] == 0x42 and raw[1] == 0x42
+                    _is_pvst = (len(raw) >= 12
+                                and raw[0] == 0xAA and raw[1] == 0xAA
+                                and raw[2] == 0x03
+                                and raw[3:6] == b'\x00\x00\x0c'
+                                and raw[6:8] == b'\x01\x0b')
+                    if _is_std_stp or _is_pvst:
+                        stp_data = raw[8:] if _is_pvst else raw[3:]
                         if len(stp_data) >= 4:
                             session.stp_bpdu_count += 1
                             session._stp_timestamps.append(ts)

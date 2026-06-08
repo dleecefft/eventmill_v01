@@ -3,8 +3,9 @@
  *
  * Registered as the LLC analyzer in the Ethernet packet analysis chain.
  * When Zeek encounters an 802.3 frame (EtherType <= 1500), the Ethernet
- * analyzer dispatches the LLC payload to us. We check for STP's
- * DSAP=0x42 / SSAP=0x42 and parse the BPDU.
+ * analyzer dispatches the LLC payload to us. We check for standard STP
+ * (DSAP=0x42 / SSAP=0x42) or Cisco PVST+ (SNAP: OUI=00:00:0c, PID=0x010b)
+ * and parse the BPDU.
  *
  * BPDU format (after 3-byte LLC header):
  *   Offset  Size  Field
@@ -63,13 +64,23 @@ bool STPAnalyzer::AnalyzePacket(size_t len, const uint8_t* data, Packet* packet)
     uint8_t dsap = data[0];
     uint8_t ssap = data[1];
 
-    // STP uses LLC SAPs: DSAP=0x42, SSAP=0x42
-    if (dsap != 0x42 || ssap != 0x42)
-        return true;  // Not STP — silently pass (other LLC protocols)
+    const uint8_t* bpdu;
+    size_t bpdu_len;
 
-    // STP BPDU starts after the 3-byte LLC header
-    const uint8_t* bpdu = data + 3;
-    size_t bpdu_len = len - 3;
+    if (dsap == 0x42 && ssap == 0x42) {
+        // Standard 802.1D LLC: DSAP=0x42, SSAP=0x42
+        bpdu = data + 3;
+        bpdu_len = len - 3;
+    } else if (dsap == 0xAA && ssap == 0xAA && len >= 8
+               && data[2] == 0x03           // LLC Control
+               && data[3] == 0x00 && data[4] == 0x00 && data[5] == 0x0C  // OUI = Cisco
+               && data[6] == 0x01 && data[7] == 0x0B) {  // PID = PVST+
+        // Cisco PVST+ — SNAP encapsulation
+        bpdu = data + 8;
+        bpdu_len = len - 8;
+    } else {
+        return true;  // Not STP — silently pass (other LLC protocols)
+    }
 
     // Need at least: Protocol ID(2) + Version(1) + Type(1) = 4 bytes
     if (bpdu_len < 4)
