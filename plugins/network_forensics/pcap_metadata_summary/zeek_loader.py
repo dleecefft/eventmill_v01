@@ -12,6 +12,12 @@ OT/ICS protocol support:
 This allows all downstream tools (pcap_threat_hunter, pcap_ai_analyzer,
 pcap_ip_search, pcap_flow_analyzer, pcap_report_correlator) to work
 on Zeek output with zero changes.
+
+Note: STP (Spanning Tree Protocol) is Layer 2 — Zeek operates at
+Layer 3+ and cannot see STP BPDUs.  STP fields in PcapSession
+(stp_bpdu_count, stp_tcn_count, stp_root_bridges, etc.) will always
+be zero when loaded from Zeek logs.  Use Scapy or dpkt parsers for
+STP analysis.
 """
 
 from __future__ import annotations

@@ -158,9 +158,26 @@ class PcapSession:
         self.stp_bpdu_count: int = 0
         self.stp_tcn_count: int = 0
         self.stp_tc_flag_count: int = 0
-        self.stp_root_bridges: Dict[str, List] = defaultdict(list)
+        self.stp_tca_count: int = 0                          # TC Acknowledgment flag
+        self.stp_root_bridges: Dict[str, List] = defaultdict(list)  # root_key -> [timestamps]
         self._stp_timestamps: List[float] = []
-        self.stp_bridges: Counter = Counter()
+        self.stp_bridges: Counter = Counter()                # bridge_key -> BPDU count
+        self.stp_version_counts: Counter = Counter()         # {STP, RSTP, MSTP} -> count
+        self.stp_port_roles: Counter = Counter()             # {Root, Designated, Alternate, Backup, Unknown} -> count
+        self.stp_port_states: Counter = Counter()            # {Learning, Forwarding, Blocking, ...} -> count
+        self.stp_proposal_count: int = 0                     # RSTP proposal flag count
+        self.stp_agreement_count: int = 0                    # RSTP agreement flag count
+        self.stp_tc_events: List[float] = []                 # timestamps when TC flag set
+        self.stp_tcn_events: List[float] = []                # timestamps when TCN BPDU sent
+        self.stp_root_changes: List[tuple] = []              # (timestamp, old_root, new_root)
+        self._stp_last_root: str = ''                        # track current root for change detection
+        self.stp_path_costs: Dict[str, List] = defaultdict(list)   # bridge_key -> [(ts, cost)]
+        self.stp_port_ids: Counter = Counter()               # port_id_hex -> count
+        self.stp_vlans: Counter = Counter()                  # VLAN ID -> count (from System ID Extension)
+        self.stp_timers: Dict[str, Counter] = {              # timer value distribution
+            'hello': Counter(), 'max_age': Counter(), 'fwd_delay': Counter()
+        }
+        self.stp_src_macs: Counter = Counter()               # source MAC -> count (which switches send BPDUs)
 
         # Control plane — HSRP
         self.hsrp_hello_count: int = 0
@@ -305,10 +322,26 @@ class PcapSession:
         self.stp_bpdu_count += other.stp_bpdu_count
         self.stp_tcn_count += other.stp_tcn_count
         self.stp_tc_flag_count += other.stp_tc_flag_count
+        self.stp_tca_count += other.stp_tca_count
         for bridge, entries in other.stp_root_bridges.items():
             self.stp_root_bridges[bridge].extend(entries)
         self._stp_timestamps.extend(other._stp_timestamps)
         self.stp_bridges += other.stp_bridges
+        self.stp_version_counts += other.stp_version_counts
+        self.stp_port_roles += other.stp_port_roles
+        self.stp_port_states += other.stp_port_states
+        self.stp_proposal_count += other.stp_proposal_count
+        self.stp_agreement_count += other.stp_agreement_count
+        self.stp_tc_events.extend(other.stp_tc_events)
+        self.stp_tcn_events.extend(other.stp_tcn_events)
+        self.stp_root_changes.extend(other.stp_root_changes)
+        for bridge, entries in other.stp_path_costs.items():
+            self.stp_path_costs[bridge].extend(entries)
+        self.stp_port_ids += other.stp_port_ids
+        self.stp_vlans += other.stp_vlans
+        for timer_name in ('hello', 'max_age', 'fwd_delay'):
+            self.stp_timers[timer_name] += other.stp_timers[timer_name]
+        self.stp_src_macs += other.stp_src_macs
 
         # HSRP
         self.hsrp_hello_count += other.hsrp_hello_count
@@ -509,25 +542,90 @@ def parse_pcap_file(file_path: str) -> PcapSession:
                     stp = pkt[STP]
                     session.stp_bpdu_count += 1
                     session._stp_timestamps.append(ts)
+
+                    # Source MAC of the switch sending this BPDU
+                    if hasattr(pkt, 'src'):
+                        session.stp_src_macs[pkt.src] += 1
+
+                    # STP version: 0=STP, 2=RSTP, 3=MSTP
+                    version = getattr(stp, 'version', 0) or 0
+                    version_name = {0: 'STP', 2: 'RSTP', 3: 'MSTP'}.get(version, f'v{version}')
+                    session.stp_version_counts[version_name] += 1
+
                     # Extract bridge ID (priority + MAC)
                     bridge_mac = getattr(stp, 'bridgemac', '') or ''
                     bridge_id = getattr(stp, 'bridgeid', 0) or 0
                     bridge_key = f"{bridge_id}:{bridge_mac}"
                     if bridge_key:
                         session.stp_bridges[bridge_key] += 1
+
+                    # VLAN from System ID Extension (lower 12 bits of bridge priority)
+                    vlan_id = bridge_id & 0x0FFF
+                    if vlan_id > 0:
+                        session.stp_vlans[vlan_id] += 1
+
                     # Root bridge tracking
                     root_mac = getattr(stp, 'rootmac', '') or ''
                     root_id = getattr(stp, 'rootid', 0) or 0
                     root_key = f"{root_id}:{root_mac}"
                     if root_key:
                         session.stp_root_bridges[root_key].append(ts)
-                    # BPDU type detection
+                    # Detect root bridge changes
+                    if session._stp_last_root and root_key != session._stp_last_root:
+                        session.stp_root_changes.append((ts, session._stp_last_root, root_key))
+                    session._stp_last_root = root_key
+
+                    # Root path cost
+                    path_cost = getattr(stp, 'pathcost', None)
+                    if path_cost is not None and bridge_key:
+                        session.stp_path_costs[bridge_key].append((ts, path_cost))
+
+                    # Port ID
+                    port_id = getattr(stp, 'portid', None)
+                    if port_id is not None:
+                        session.stp_port_ids[f"0x{port_id:04x}"] += 1
+
+                    # Timer values
+                    hello = getattr(stp, 'hellotime', None)
+                    maxage = getattr(stp, 'maxage', None)
+                    fwddelay = getattr(stp, 'fwddelay', None)
+                    if hello is not None:
+                        session.stp_timers['hello'][hello // 256 if hello > 255 else hello] += 1
+                    if maxage is not None:
+                        session.stp_timers['max_age'][maxage // 256 if maxage > 255 else maxage] += 1
+                    if fwddelay is not None:
+                        session.stp_timers['fwd_delay'][fwddelay // 256 if fwddelay > 255 else fwddelay] += 1
+
+                    # BPDU type and flags
                     bpdu_type = getattr(stp, 'bpdutype', 0)
-                    bpdu_flags = getattr(stp, 'bpduflags', 0)
+                    bpdu_flags = getattr(stp, 'bpduflags', 0) or 0
                     if bpdu_type == 0x80:  # TCN BPDU
                         session.stp_tcn_count += 1
-                    if bpdu_flags and (bpdu_flags & 0x01):  # TC flag in Config BPDU
+                        session.stp_tcn_events.append(ts)
+                    # Flags parsing (RSTP flags byte)
+                    if bpdu_flags & 0x01:  # Bit 0: Topology Change
                         session.stp_tc_flag_count += 1
+                        session.stp_tc_events.append(ts)
+                    if bpdu_flags & 0x80:  # Bit 7: TC Acknowledgment
+                        session.stp_tca_count += 1
+                    if bpdu_flags & 0x02:  # Bit 1: Proposal (RSTP)
+                        session.stp_proposal_count += 1
+                    if bpdu_flags & 0x40:  # Bit 6: Agreement (RSTP)
+                        session.stp_agreement_count += 1
+                    # Bits 2-3: Port Role (RSTP)
+                    port_role_bits = (bpdu_flags >> 2) & 0x03
+                    port_role = {0: 'Unknown', 1: 'Alternate/Backup',
+                                 2: 'Root', 3: 'Designated'}.get(port_role_bits, 'Unknown')
+                    session.stp_port_roles[port_role] += 1
+                    # Bits 4-5: Learning/Forwarding state (RSTP)
+                    learning = bool(bpdu_flags & 0x10)
+                    forwarding = bool(bpdu_flags & 0x20)
+                    if forwarding and learning:
+                        session.stp_port_states['Forwarding'] += 1
+                    elif learning:
+                        session.stp_port_states['Learning'] += 1
+                    elif not forwarding and not learning:
+                        session.stp_port_states['Blocking/Discarding'] += 1
                 except Exception:
                     pass
 
@@ -926,24 +1024,88 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
                         if len(stp_data) >= 4:
                             session.stp_bpdu_count += 1
                             session._stp_timestamps.append(ts)
+
+                            # Source MAC of the switch sending this BPDU
+                            src_mac = ':'.join(f'{b:02x}' for b in eth.src)
+                            session.stp_src_macs[src_mac] += 1
+
+                            # STP version byte at offset 1
+                            version = stp_data[1]
+                            version_name = {0: 'STP', 2: 'RSTP', 3: 'MSTP'}.get(version, f'v{version}')
+                            session.stp_version_counts[version_name] += 1
+
                             bpdu_type = stp_data[3]
                             if bpdu_type == 0x80:  # TCN BPDU
                                 session.stp_tcn_count += 1
-                            elif bpdu_type == 0x00 and len(stp_data) >= 35:
-                                # Config BPDU — extract root/bridge IDs
+                                session.stp_tcn_events.append(ts)
+                            elif len(stp_data) >= 35:
+                                # Config/RSTP BPDU — full field extraction
                                 bpdu_flags = stp_data[4]
-                                if bpdu_flags & 0x01:  # TC flag
+                                # TC flag (bit 0)
+                                if bpdu_flags & 0x01:
                                     session.stp_tc_flag_count += 1
+                                    session.stp_tc_events.append(ts)
+                                # TCA flag (bit 7)
+                                if bpdu_flags & 0x80:
+                                    session.stp_tca_count += 1
+                                # Proposal (bit 1, RSTP)
+                                if bpdu_flags & 0x02:
+                                    session.stp_proposal_count += 1
+                                # Agreement (bit 6, RSTP)
+                                if bpdu_flags & 0x40:
+                                    session.stp_agreement_count += 1
+                                # Port Role (bits 2-3, RSTP)
+                                port_role_bits = (bpdu_flags >> 2) & 0x03
+                                port_role = {0: 'Unknown', 1: 'Alternate/Backup',
+                                             2: 'Root', 3: 'Designated'}.get(port_role_bits, 'Unknown')
+                                session.stp_port_roles[port_role] += 1
+                                # Port State (bits 4-5, RSTP)
+                                learning = bool(bpdu_flags & 0x10)
+                                forwarding = bool(bpdu_flags & 0x20)
+                                if forwarding and learning:
+                                    session.stp_port_states['Forwarding'] += 1
+                                elif learning:
+                                    session.stp_port_states['Learning'] += 1
+                                elif not forwarding and not learning:
+                                    session.stp_port_states['Blocking/Discarding'] += 1
+
                                 # Root bridge: priority (2 bytes) + MAC (6 bytes) at offset 5-12
                                 root_prio = int.from_bytes(stp_data[5:7], 'big')
                                 root_mac = ':'.join(f'{b:02x}' for b in stp_data[7:13])
                                 root_key = f"{root_prio}:{root_mac}"
                                 session.stp_root_bridges[root_key].append(ts)
+                                # Detect root bridge changes
+                                if session._stp_last_root and root_key != session._stp_last_root:
+                                    session.stp_root_changes.append((ts, session._stp_last_root, root_key))
+                                session._stp_last_root = root_key
+
+                                # Root path cost: 4 bytes at offset 13-16
+                                path_cost = int.from_bytes(stp_data[13:17], 'big')
                                 # Bridge ID: priority (2 bytes) + MAC (6 bytes) at offset 17-24
                                 bridge_prio = int.from_bytes(stp_data[17:19], 'big')
                                 bridge_mac = ':'.join(f'{b:02x}' for b in stp_data[19:25])
                                 bridge_key = f"{bridge_prio}:{bridge_mac}"
                                 session.stp_bridges[bridge_key] += 1
+                                session.stp_path_costs[bridge_key].append((ts, path_cost))
+
+                                # VLAN from System ID Extension (lower 12 bits of bridge priority)
+                                vlan_id = bridge_prio & 0x0FFF
+                                if vlan_id > 0:
+                                    session.stp_vlans[vlan_id] += 1
+
+                                # Port ID: 2 bytes at offset 25-26
+                                port_id = int.from_bytes(stp_data[25:27], 'big')
+                                session.stp_port_ids[f"0x{port_id:04x}"] += 1
+
+                                # Timers at offsets 27-34 (each 2 bytes, in 1/256s units)
+                                if len(stp_data) >= 35:
+                                    msg_age = int.from_bytes(stp_data[27:29], 'big') // 256
+                                    max_age = int.from_bytes(stp_data[29:31], 'big') // 256
+                                    hello_time = int.from_bytes(stp_data[31:33], 'big') // 256
+                                    fwd_delay = int.from_bytes(stp_data[33:35], 'big') // 256
+                                    session.stp_timers['hello'][hello_time] += 1
+                                    session.stp_timers['max_age'][max_age] += 1
+                                    session.stp_timers['fwd_delay'][fwd_delay] += 1
             except Exception:
                 pass
 
