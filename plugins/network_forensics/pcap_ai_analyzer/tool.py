@@ -362,9 +362,21 @@ CONTROL PLANE & TOPOLOGY ANALYSIS:
     floods (>10/min) indicate port flapping, cable issues, or misconfiguration.
   - TC flag set in Config BPDUs triggers MAC table aging acceleration across bridges.
     Many TC flags = many topology changes = network instability.
+  - TCA (Topology Change Acknowledgment) = root bridge acknowledging TCN receipt.
   - Multiple root bridges seen means root bridge election occurred during the capture.
     This is a CRITICAL event that causes seconds-long traffic blackout.
+  - Root Change Events provide the exact timeline of root elections with timestamps.
   - BPDU rate >5/s on a single bridge is elevated; standard STP sends every 2s.
+  - RSTP Proposal/Agreement counts show port negotiation — high counts = flapping.
+  - Port Roles (Root/Designated/Alternate/Backup) reveal the topology structure.
+  - Port States (Forwarding/Learning/Blocking) — many Blocking = redundant paths,
+    many Learning = topology converging, Forwarding = stable.
+  - Path Cost changes for a bridge over time indicate link speed changes or failover.
+  - VLANs from System ID Extension show which VLANs have STP instances.
+  - Source switch MACs identify which physical switches are participating.
+  - Non-standard timer values (hello ≠ 2s, max_age ≠ 20s, fwd_delay ≠ 15s)
+    indicate custom tuning — may be intentional or misconfiguration.
+  - TC event bursts (clusters of TC flags within seconds) = active instability.
 - HSRP (Hot Standby Router Protocol):
   - HSRP state transitions (Standby→Active or Active→Standby) represent gateway
     failover events. Each transition causes brief traffic disruption for hosts
@@ -2778,6 +2790,27 @@ class PcapAiAnalyzer:
                 lines.append(f"  TCN BPDUs (Topology Change Notifications): "
                              f"{session.stp_tcn_count:,}")
                 lines.append(f"  BPDUs with TC flag set: {session.stp_tc_flag_count:,}")
+                lines.append(f"  TC Acknowledgments: {session.stp_tca_count:,}")
+
+                # Protocol version distribution
+                if session.stp_version_counts:
+                    ver_parts = [f"{v}: {c:,}" for v, c in session.stp_version_counts.most_common()]
+                    lines.append(f"  Versions: {', '.join(ver_parts)}")
+
+                # RSTP negotiation
+                if session.stp_proposal_count or session.stp_agreement_count:
+                    lines.append(f"  RSTP Proposals: {session.stp_proposal_count:,}  "
+                                 f"Agreements: {session.stp_agreement_count:,}")
+
+                # Port roles
+                if session.stp_port_roles:
+                    role_parts = [f"{r}: {c:,}" for r, c in session.stp_port_roles.most_common()]
+                    lines.append(f"  Port Roles: {', '.join(role_parts)}")
+
+                # Port states
+                if session.stp_port_states:
+                    state_parts = [f"{s}: {c:,}" for s, c in session.stp_port_states.most_common()]
+                    lines.append(f"  Port States: {', '.join(state_parts)}")
 
                 root_bridges = list(session.stp_root_bridges.keys())
                 if len(root_bridges) == 1:
@@ -2791,9 +2824,41 @@ class PcapAiAnalyzer:
                     lines.append(f"    ⚠️  Root bridge instability indicates "
                                  f"STP reconvergence — check for priority misconfiguration")
 
+                # Root change timeline
+                if session.stp_root_changes:
+                    lines.append(f"  🔴 ROOT CHANGE EVENTS ({len(session.stp_root_changes)}):")
+                    for ts, old_root, new_root in session.stp_root_changes[:20]:
+                        from datetime import datetime, timezone
+                        dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%H:%M:%S.%f')[:-3]
+                        lines.append(f"    {dt}: {old_root} → {new_root}")
+
                 if session.stp_tcn_count > 10:
                     lines.append(f"  ⚠️  HIGH TCN COUNT: {session.stp_tcn_count} topology "
                                  f"change notifications — indicates L2 flapping")
+
+                # TC event clustering (detect bursts)
+                if session.stp_tc_events and len(session.stp_tc_events) > 5:
+                    tc_sorted = sorted(session.stp_tc_events)
+                    # Find clusters: TC events within 10s of each other
+                    bursts = []
+                    burst_start = tc_sorted[0]
+                    burst_count = 1
+                    for i in range(1, len(tc_sorted)):
+                        if tc_sorted[i] - tc_sorted[i-1] < 10:
+                            burst_count += 1
+                        else:
+                            if burst_count >= 3:
+                                bursts.append((burst_start, burst_count))
+                            burst_start = tc_sorted[i]
+                            burst_count = 1
+                    if burst_count >= 3:
+                        bursts.append((burst_start, burst_count))
+                    if bursts:
+                        lines.append(f"  ⚠️  TC BURSTS ({len(bursts)} clusters):")
+                        for ts, cnt in bursts[:10]:
+                            from datetime import datetime, timezone
+                            dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%H:%M:%S')
+                            lines.append(f"    {dt}: {cnt} TC events in rapid succession")
 
                 if len(session._stp_timestamps) >= 2:
                     stp_duration = max(session._stp_timestamps) - min(session._stp_timestamps)
@@ -2807,6 +2872,38 @@ class PcapAiAnalyzer:
                     lines.append(f"  Bridges seen: {len(session.stp_bridges)}")
                     for bridge, count in session.stp_bridges.most_common(10):
                         lines.append(f"    {bridge}: {count:,} BPDUs")
+
+                # Source MACs (which switches send BPDUs)
+                if session.stp_src_macs:
+                    lines.append(f"  Source switch MACs ({len(session.stp_src_macs)}):")
+                    for mac, count in session.stp_src_macs.most_common(10):
+                        lines.append(f"    {mac}: {count:,} BPDUs")
+
+                # VLANs
+                if session.stp_vlans:
+                    vlan_parts = [f"VLAN {v}: {c:,}" for v, c in session.stp_vlans.most_common(20)]
+                    lines.append(f"  VLANs (from System ID Extension): {', '.join(vlan_parts)}")
+
+                # Path cost changes
+                if session.stp_path_costs:
+                    for bridge_key, costs in session.stp_path_costs.items():
+                        unique_costs = set(c for _, c in costs)
+                        if len(unique_costs) > 1:
+                            lines.append(f"  ⚠️  PATH COST CHANGE on {bridge_key}: "
+                                         f"seen values {sorted(unique_costs)}")
+
+                # Timer values (flag non-standard)
+                if session.stp_timers:
+                    for timer_name, dist in session.stp_timers.items():
+                        if dist:
+                            vals = [f"{v}s:{c:,}" for v, c in dist.most_common(5)]
+                            lines.append(f"  Timer {timer_name}: {', '.join(vals)}")
+
+                # Port IDs
+                if session.stp_port_ids and len(session.stp_port_ids) > 1:
+                    lines.append(f"  Port IDs ({len(session.stp_port_ids)} unique):")
+                    for pid, count in session.stp_port_ids.most_common(10):
+                        lines.append(f"    {pid}: {count:,}")
 
             # --- HSRP ---
             if session.hsrp_hello_count > 0:
