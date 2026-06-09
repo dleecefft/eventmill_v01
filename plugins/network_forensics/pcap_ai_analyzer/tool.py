@@ -1768,28 +1768,38 @@ def _export_pdf(
                     if "LATERAL" in sub_title.upper():
                         _render_lateral_table(sub_lines, max_rows=20)
                     elif "CROSS-ZONE" in sub_title.upper():
-                        # Cross-zone: render as table too
+                        # Cross-zone: render as table with Source / Destination
                         xz_rows: list[list[str]] = []
                         for ln in sub_lines:
                             s = ln.strip()
                             if not s or s.startswith("-"):
                                 continue
-                            if "(INT)" in s and "(EXT)" in s:
+                            if ("(INT)" in s or "(EXT)" in s) and "->" in s:
                                 # "10.70.1.75 (INT) -> 161.141.96.182 (EXT):44818 (EtherNet/IP) -- 2 pkts"
+                                # or "161.141.113.37 (EXT) -> 10.59.244.32 (INT):44818 (...) -- 506 pkts"
                                 parts = s.split("->", 1)
-                                src = parts[0].replace("(INT)", "").strip()
+                                src_part = parts[0].strip()
                                 rest = parts[1].strip() if len(parts) > 1 else ""
-                                # Parse dest, port, proto, pkts
+                                # Parse dest, port/proto, pkts from rest
                                 dst_part = rest.split("--")[0].strip() if "--" in rest else rest
                                 pkts = rest.split("--")[1].strip() if "--" in rest else ""
-                                # "161.141.96.182 (EXT):44818 (EtherNet/IP)"
-                                dst_ip = dst_part.split("(EXT)")[0].strip()
-                                port_proto = dst_part.split("(EXT)")[1].strip(": ") if "(EXT)" in dst_part else ""
-                                xz_rows.append([src, dst_ip, port_proto, pkts])
+                                # Extract port/protocol from destination side
+                                # dst_part is like "161.141.96.182 (EXT):44818 (EtherNet/IP)"
+                                # or "10.59.244.32 (INT):44818 (EtherNet/IP)"
+                                port_proto = ""
+                                for tag in ("(INT)", "(EXT)"):
+                                    if tag in dst_part:
+                                        idx = dst_part.index(tag)
+                                        after = dst_part[idx + len(tag):].strip().lstrip(":")
+                                        if after:
+                                            port_proto = after
+                                        dst_part = dst_part[:idx].strip()
+                                        break
+                                xz_rows.append([src_part, dst_part, port_proto, pkts])
                         if xz_rows:
                             show = xz_rows[:20]
                             _table(
-                                ["Internal IP", "External IP", "Port / Protocol", "Volume"],
+                                ["Source", "Destination", "Port / Protocol", "Volume"],
                                 show,
                                 col_widths=[38, 38, 55, eff_w - 131],
                             )
