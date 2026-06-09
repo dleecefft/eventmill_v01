@@ -159,7 +159,7 @@ class PcapIpSearch:
         query_lower = query.lower()
         for q in session.dns_queries:
             if (
-                (is_ip and (q["src"] == query or q["dst"] == query))
+                (is_ip and (q["src"] == query or q.get("dst", "") == query))
                 or (not is_ip and not is_port and query_lower in q["query"].lower())
                 or (is_ip and query in q.get("resolved", []))
             ):
@@ -226,9 +226,9 @@ class PcapIpSearch:
 
         # DNS queries from/to this IP
         for q in session.dns_queries:
-            if q["src"] == ip or q["dst"] == ip:
+            if q["src"] == ip or q.get("dst", "") == ip:
                 events.append({
-                    "timestamp": q["timestamp"],
+                    "timestamp": q.get("ts") or q.get("timestamp"),
                     "type": "dns",
                     "query": q["query"],
                     "dns_type": q.get("type", "query"),
@@ -237,9 +237,9 @@ class PcapIpSearch:
 
         # HTTP requests from/to this IP
         for r in session.http_requests:
-            if r["src"] == ip or r["dst"] == ip:
+            if r["src"] == ip or r.get("dst", "") == ip:
                 events.append({
-                    "timestamp": r["timestamp"],
+                    "timestamp": r.get("ts") or r.get("timestamp"),
                     "type": "http",
                     "method": r["method"],
                     "host": r["host"],
@@ -248,9 +248,9 @@ class PcapIpSearch:
 
         # TLS handshakes from/to this IP
         for h in session.tls_handshakes:
-            if h["src"] == ip or h["dst"] == ip:
+            if h["src"] == ip or h.get("dst", "") == ip:
                 events.append({
-                    "timestamp": h["timestamp"],
+                    "timestamp": h.get("ts") or h.get("timestamp"),
                     "type": "tls",
                     "sni": h.get("sni", ""),
                     "dport": h.get("dport", 443),

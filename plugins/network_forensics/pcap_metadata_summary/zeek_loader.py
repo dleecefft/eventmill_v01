@@ -407,9 +407,9 @@ def _parse_dns_log(path: Path, session) -> None:
             session.dns_queries.append({
                 "query": query_name,
                 "type": str(qtype),
-                "src_ip": src_ip,
-                "dst_ip": dst_ip,
-                "timestamp": ts,
+                "src": src_ip,
+                "dst": dst_ip,
+                "ts": ts,
             })
 
         if answers and isinstance(answers, list):
@@ -419,9 +419,9 @@ def _parse_dns_log(path: Path, session) -> None:
                     "type": str(qtype),
                     "answer": str(answer),
                     "rcode": str(rcode),
-                    "src_ip": dst_ip,  # DNS server responds
-                    "dst_ip": src_ip,
-                    "timestamp": ts,
+                    "src": dst_ip,  # DNS server responds
+                    "dst": src_ip,
+                    "ts": ts,
                 })
 
 
@@ -432,11 +432,12 @@ def _parse_ssl_log(path: Path, session) -> None:
         _update_time_range(session, ts)
 
         session.tls_handshakes.append({
-            "src_ip": entry.get("id.orig_h", ""),
-            "dst_ip": entry.get("id.resp_h", ""),
-            "src_port": int(entry.get("id.orig_p", 0)),
-            "dst_port": int(entry.get("id.resp_p", 0)),
-            "server_name": entry.get("server_name", ""),
+            "src": entry.get("id.orig_h", ""),
+            "dst": entry.get("id.resp_h", ""),
+            "sport": int(entry.get("id.orig_p", 0)),
+            "dport": int(entry.get("id.resp_p", 0)),
+            "sni": entry.get("server_name", ""),
+            "type": "ClientHello",
             "version": entry.get("version", ""),
             "cipher": entry.get("cipher", ""),
             "ja3": entry.get("ja3", ""),
@@ -444,7 +445,7 @@ def _parse_ssl_log(path: Path, session) -> None:
             "subject": entry.get("subject", ""),
             "issuer": entry.get("issuer", ""),
             "validation_status": entry.get("validation_status", ""),
-            "timestamp": ts,
+            "ts": ts,
         })
 
 
@@ -455,19 +456,19 @@ def _parse_http_log(path: Path, session) -> None:
         _update_time_range(session, ts)
 
         session.http_requests.append({
-            "src_ip": entry.get("id.orig_h", ""),
-            "dst_ip": entry.get("id.resp_h", ""),
-            "src_port": int(entry.get("id.orig_p", 0)),
-            "dst_port": int(entry.get("id.resp_p", 0)),
+            "src": entry.get("id.orig_h", ""),
+            "dst": entry.get("id.resp_h", ""),
+            "sport": int(entry.get("id.orig_p", 0)),
+            "dport": int(entry.get("id.resp_p", 0)),
             "method": entry.get("method", ""),
             "host": entry.get("host", ""),
-            "uri": entry.get("uri", ""),
+            "path": entry.get("uri", ""),
             "user_agent": entry.get("user_agent", ""),
             "status_code": entry.get("status_code"),
             "content_type": entry.get("resp_mime_types", [None])[0] if isinstance(entry.get("resp_mime_types"), list) else entry.get("resp_mime_types"),
             "request_body_len": int(entry.get("request_body_len", 0)),
             "response_body_len": int(entry.get("response_body_len", 0)),
-            "timestamp": ts,
+            "ts": ts,
         })
 
 
@@ -490,11 +491,11 @@ def _parse_notice_log(path: Path, session) -> None:
         if "Password" in note or "Cleartext" in note or "HTTP::Basic" in note:
             session.cleartext_creds.append({
                 "protocol": note,
-                "src_ip": src_ip,
-                "dst_ip": dst_ip,
+                "src": src_ip,
+                "dst": dst_ip,
                 "username": "[redacted by Zeek]",
                 "service": entry.get("sub", ""),
-                "timestamp": ts,
+                "ts": ts,
             })
 
 
@@ -510,10 +511,10 @@ def _parse_weird_log(path: Path, session) -> None:
 
         weirdness.append({
             "name": entry.get("name", ""),
-            "src_ip": entry.get("id.orig_h", ""),
-            "dst_ip": entry.get("id.resp_h", ""),
+            "src": entry.get("id.orig_h", ""),
+            "dst": entry.get("id.resp_h", ""),
             "addl": entry.get("addl", ""),
-            "timestamp": ts,
+            "ts": ts,
         })
 
     # Store as an extra attribute — downstream tools can check for it
