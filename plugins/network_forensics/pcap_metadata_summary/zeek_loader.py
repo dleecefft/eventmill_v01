@@ -280,8 +280,8 @@ def _parse_conn_log(path: Path, session) -> None:
             if service:
                 session.protocols[service.upper()] += 1
 
-        # Accumulate total transferred bytes for file_size estimate
-        session.file_size += orig_bytes + resp_bytes
+        # Accumulate total payload bytes transferred (NOT the PCAP file size)
+        session.bytes_transferred += orig_bytes + resp_bytes
 
         # Build conversation key (matches scapy/dpkt parser format)
         conv_key = (src_ip, dst_ip, dst_port, proto_upper)

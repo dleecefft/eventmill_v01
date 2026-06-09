@@ -1420,6 +1420,29 @@ class EventMillShell(cmd.Cmd):
             # Parse Zeek logs into PcapSession
             print(f"  Parsing Zeek logs...")
             session = parse_zeek_logs(local_dir)
+
+            # Try to get the original PCAP file size from GCS
+            # (bytes_transferred from conn.log is payload bytes, not PCAP size)
+            pcap_uri = None
+            for job in reversed(list(self._zeek_jobs.values())):
+                if job.get("output_prefix", "").rstrip("/") == output_prefix.rstrip("/"):
+                    pcap_uri = job.get("pcap_uri")
+                    break
+            if pcap_uri and pcap_uri.startswith("gs://"):
+                try:
+                    pcap_clean = pcap_uri.replace("gs://", "")
+                    pcap_parts = pcap_clean.split("/", 1)
+                    pcap_blob = client.bucket(pcap_parts[0]).get_blob(pcap_parts[1])
+                    if pcap_blob and pcap_blob.size:
+                        session.file_size = pcap_blob.size
+                except Exception:
+                    pass  # non-critical — display will adapt
+
+            # Extract original PCAP filename for display
+            if pcap_uri:
+                pcap_name = pcap_uri.rsplit("/", 1)[-1]
+                session.filename = pcap_name
+
             set_pcap_session(session)
 
             # Print summary (same format as _auto_parse_pcap)

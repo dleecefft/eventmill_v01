@@ -78,6 +78,7 @@ class PcapSession:
         self.file_path: str = ""
         self._temp_path: Optional[str] = None
         self.file_size: int = 0
+        self.bytes_transferred: int = 0  # total payload bytes from conn.log (Zeek)
         self.packet_count: int = 0
         self.start_time: Optional[float] = None
         self.end_time: Optional[float] = None
@@ -250,6 +251,7 @@ class PcapSession:
             else:
                 self.file_path = other.file_path
         self.file_size += other.file_size
+        self.bytes_transferred += other.bytes_transferred
         self.packet_count += other.packet_count
 
         # Time range — take the widest window
@@ -2035,7 +2037,10 @@ class PcapMetadataSummary:
         lines.append("✅ PCAP Loaded Successfully")
         lines.append("")
         lines.append(f"  File:      {s.filename}")
-        lines.append(f"  Size:      {_format_bytes(s.file_size)}")
+        if s.file_size:
+            lines.append(f"  Size:      {_format_bytes(s.file_size)}")
+        if s.bytes_transferred and s.bytes_transferred != s.file_size:
+            lines.append(f"  Transferred: {_format_bytes(s.bytes_transferred)}")
         lines.append(f"  Packets:   {s.packet_count:,}")
         lines.append(f"  Duration:  {s.duration_str}")
         if s.start_time:
@@ -2071,7 +2076,10 @@ class PcapMetadataSummary:
         lines = []
         lines.append("=== PCAP Summary ===")
         lines.append(f"  File:      {s.filename}")
-        lines.append(f"  Size:      {_format_bytes(s.file_size)}")
+        if s.file_size:
+            lines.append(f"  Size:      {_format_bytes(s.file_size)}")
+        if s.bytes_transferred and s.bytes_transferred != s.file_size:
+            lines.append(f"  Transferred: {_format_bytes(s.bytes_transferred)}")
         lines.append(f"  Packets:   {s.packet_count:,}")
         lines.append(f"  Duration:  {s.duration_str}")
         if s.start_time:

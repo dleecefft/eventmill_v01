@@ -3454,9 +3454,18 @@ class PcapAiAnalyzer:
             "=" * 60,
             f"PCAP ANALYSIS: {session.filename}",
             "=" * 60,
-            f"Size: {_format_bytes(session.file_size)} | "
-            f"Packets: {session.packet_count:,} | Duration: {duration:.1f}s",
         ]
+        if session.file_size:
+            lines.append(
+                f"Size: {_format_bytes(session.file_size)} | "
+                f"Packets: {session.packet_count:,} | Duration: {duration:.1f}s"
+            )
+        else:
+            lines.append(
+                f"Packets: {session.packet_count:,} | Duration: {duration:.1f}s"
+            )
+        if getattr(session, "bytes_transferred", 0):
+            lines.append(f"Network bytes transferred: {_format_bytes(session.bytes_transferred)}")
         if session.start_time:
             from datetime import datetime, timezone
             start = datetime.fromtimestamp(session.start_time, tz=timezone.utc)
