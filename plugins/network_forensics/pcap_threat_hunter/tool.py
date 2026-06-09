@@ -297,7 +297,8 @@ class PcapThreatHunter:
                 svc = ICS_PORTS[port]
                 lines.append(
                     f"  {port:<6} {svc:<16} flows={stats['count']}  "
-                    f"sources={len(stats['sources'])}"
+                    f"sources={len(stats['sources'])}  "
+                    f"{_format_bytes(stats['bytes'])}"
                 )
                 findings.append({
                     "port": port,
@@ -319,7 +320,8 @@ class PcapThreatHunter:
                 svc = SUSPICIOUS_PORTS[port]
                 lines.append(
                     f"  {port:<6} {svc:<16} flows={stats['count']}  "
-                    f"sources={len(stats['sources'])}"
+                    f"sources={len(stats['sources'])}  "
+                    f"{_format_bytes(stats['bytes'])}"
                 )
                 findings.append({
                     "port": port,
