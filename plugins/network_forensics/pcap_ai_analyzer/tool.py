@@ -2313,10 +2313,65 @@ class PcapAiAnalyzer:
         if not loaded:
             return ""
 
+        # --- Parse for known organization IP ranges ---
+        # If the context file has a section headed with words like
+        # "Known Organization Public IP Ranges", IPs/CIDRs listed
+        # beneath it are registered so is_internal() treats them as
+        # trusted internal assets (suppresses false-positive EXT alerts).
+        import re as _re
+        import ipaddress as _ipa
+        _org_nets: list = []
+        for _fn, _fc in loaded:
+            _in_org = False
+            for _line in _fc.split('\n'):
+                _s = _line.strip()
+                if _s.startswith('#'):
+                    _h = _s.lower()
+                    _in_org = (
+                        any(w in _h for w in
+                            ['public', 'organization', 'corporate'])
+                        and any(w in _h for w in ['ip', 'network', 'range'])
+                    )
+                    continue
+                if not _in_org:
+                    continue
+                if not _s or _s.startswith('|--') or _s.startswith('|-'):
+                    continue
+                _clean = _s.strip('|').strip()
+                _m = _re.search(
+                    r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?:/\d{1,2})?)',
+                    _clean)
+                if _m:
+                    _ip = _m.group(1)
+                    try:
+                        if '/' in _ip:
+                            _org_nets.append(
+                                _ipa.ip_network(_ip, strict=False))
+                        else:
+                            _org_nets.append(
+                                _ipa.ip_network(f"{_ip}/32"))
+                    except ValueError:
+                        pass
+
+        if _org_nets:
+            from plugins.network_forensics.pcap_metadata_summary.tool import (
+                register_org_networks,
+            )
+            register_org_networks(_org_nets)
+            _rs = [str(n) for n in _org_nets]
+            print(f"  \U0001f3e2 Registered {len(_org_nets)} organization IP "
+                  f"range(s): {', '.join(_rs[:5])}"
+                  + (f" (+{len(_rs)-5} more)" if len(_rs) > 5 else ""))
+
         parts = ["INVESTIGATION CONTEXT (analyst-provided notes):"]
         for filename, content in loaded:
             parts.append(f"--- {filename} ---")
             parts.append(content)
+        if _org_nets:
+            parts.append(
+                "--- KNOWN ORGANIZATION IP RANGES "
+                "(treated as internal/trusted) ---")
+            parts.append(", ".join(str(n) for n in _org_nets))
         parts.append("--- END INVESTIGATION CONTEXT ---\n")
         block = "\n".join(parts) + "\n"
 
@@ -3332,6 +3387,45 @@ class PcapAiAnalyzer:
                         f"sources={len(stats_d['sources']):<4} "
                         f"{_format_bytes(stats_d['bytes'])}"
                     )
+
+        # --- Active /24 Network Inventory ---
+        net_inventory: dict = defaultdict(lambda: {
+            "ips": set(), "bytes": 0, "flows": 0,
+        })
+        for (src, dst, dport, proto), stats in session.conversations.items():
+            for ip in (src, dst):
+                parts = ip.rsplit(".", 1)
+                if len(parts) == 2:
+                    sn = f"{parts[0]}.0/24"
+                    net_inventory[sn]["ips"].add(ip)
+            src_sn = ".".join(src.split(".")[:3]) + ".0/24"
+            net_inventory[src_sn]["bytes"] += stats.get("bytes_out", 0)
+            net_inventory[src_sn]["flows"] += 1
+
+        if net_inventory:
+            sorted_nets = sorted(net_inventory.items(),
+                                 key=lambda x: x[1]["bytes"], reverse=True)
+            int_nets = [(sn, s) for sn, s in sorted_nets if is_internal(sn.split("/")[0])]
+            ext_nets = [(sn, s) for sn, s in sorted_nets if not is_internal(sn.split("/")[0])]
+
+            lines.append(f"\n{'=' * 60}")
+            lines.append(f"ACTIVE /24 NETWORK INVENTORY — {len(sorted_nets)} subnet(s)")
+            lines.append(f"{'=' * 60}")
+            lines.append(f"  Internal: {len(int_nets)}  |  External: {len(ext_nets)}")
+            lines.append(
+                f"\n  {'Subnet':<20} {'Hosts':<7} {'Flows':<8} {'Bytes':<12} {'Type'}"
+            )
+            lines.append("  " + "-" * 65)
+            for sn, s in sorted_nets[:50]:
+                ip_base = sn.split("/")[0]
+                loc = "INT" if is_internal(ip_base) else "EXT"
+                lines.append(
+                    f"  {sn:<20} {len(s['ips']):<7} {s['flows']:<8} "
+                    f"{_format_bytes(s['bytes']):<12} {loc}"
+                )
+            if len(sorted_nets) > 50:
+                lines.append(f"  ... +{len(sorted_nets) - 50} more subnet(s) "
+                             "(see companion .md for full list)")
 
         # --- Subnet Anomaly Summary ---
         subnet_scores: dict = defaultdict(lambda: {

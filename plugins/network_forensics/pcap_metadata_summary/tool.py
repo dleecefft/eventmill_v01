@@ -28,12 +28,35 @@ PRIVATE_NETWORKS = [
     ipaddress.ip_network("192.168.0.0/16"),
 ]
 
+# Organization-owned public IP ranges (populated from investigation context).
+# When a loaded context .md contains a section like
+#   # Known Organization Public IP Ranges
+#   161.141.0.0/16
+# those ranges are registered here so every tool treats them as internal.
+KNOWN_ORG_NETWORKS: list[ipaddress.IPv4Network] = []
 
-def is_internal(ip_str: str) -> bool:
-    """Check if an IP is in RFC1918 private ranges."""
+
+def register_org_networks(networks: list[ipaddress.IPv4Network]) -> None:
+    """Register organization-owned public IP ranges as internal."""
+    KNOWN_ORG_NETWORKS.clear()
+    KNOWN_ORG_NETWORKS.extend(networks)
+
+
+def is_known_org(ip_str: str) -> bool:
+    """Check if IP belongs to a known organization public range (non-RFC1918)."""
     try:
         addr = ipaddress.ip_address(ip_str)
-        return any(addr in net for net in PRIVATE_NETWORKS)
+        return any(addr in net for net in KNOWN_ORG_NETWORKS)
+    except ValueError:
+        return False
+
+
+def is_internal(ip_str: str) -> bool:
+    """Check if an IP is in RFC1918 private ranges or known organization ranges."""
+    try:
+        addr = ipaddress.ip_address(ip_str)
+        return (any(addr in net for net in PRIVATE_NETWORKS)
+                or any(addr in net for net in KNOWN_ORG_NETWORKS))
     except ValueError:
         return False
 
@@ -1543,7 +1566,7 @@ def _extract_ot_transaction_dpkt(
 
     entry: Dict[str, Any] = {
         "protocol": ot_proto, "port": ot_port,
-        "src_ip": src_ip, "dst_ip": dst_ip,
+        "src": src_ip, "dst": dst_ip,
         "src_port": sport, "dst_port": dport,
         "ts": ts,
     }
@@ -1693,8 +1716,8 @@ def _extract_ot_transaction(
     entry: Dict[str, Any] = {
         "protocol": ot_proto,
         "port": ot_port,
-        "src_ip": src_ip,
-        "dst_ip": dst_ip,
+        "src": src_ip,
+        "dst": dst_ip,
         "src_port": sport,
         "dst_port": dport,
         "ts": ts,
