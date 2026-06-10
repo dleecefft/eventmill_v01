@@ -1976,7 +1976,7 @@ def _resolve_file(file_path: str, context: Any) -> Optional[str]:
 class PcapMetadataSummary:
     """Load, parse, and summarize PCAP network captures.
 
-    Modes: load, summary, conversations, dns, http, tls, timeline, ioc
+    Modes: load, summary, conversations, dns, http, tls, timeline, ioc, networks
     """
 
     def metadata(self) -> dict[str, Any]:
@@ -1990,7 +1990,7 @@ class PcapMetadataSummary:
     def validate_inputs(self, payload: dict[str, Any]) -> ValidationResult:
         errors: list[str] = []
         mode = payload.get("mode", "load")
-        valid_modes = ("load", "summary", "conversations", "dns", "http", "tls", "timeline", "ioc")
+        valid_modes = ("load", "summary", "conversations", "dns", "http", "tls", "timeline", "ioc", "networks")
         if mode not in valid_modes:
             errors.append(f"Invalid mode '{mode}'. Must be one of: {', '.join(valid_modes)}")
         if mode == "load" and "file_path" not in payload:
