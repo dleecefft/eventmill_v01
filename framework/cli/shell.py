@@ -1762,8 +1762,9 @@ class EventMillShell(cmd.Cmd):
             "condition_orange": ["true", "false"],
         },
         "pcap_metadata_summary": {
-            "mode": ["load", "summary", "conversations", "dns", "http", "tls", "timeline", "ioc"],
-            "sort_by": ["bytes", "packets", "duration"],
+            "mode": ["load", "summary", "conversations", "dns", "http", "tls", "timeline", "ioc", "networks"],
+            "sort_by": ["bytes", "packets", "duration", "hosts", "flows", "subnet"],
+            "filter": ["int", "ext", "ot"],
         },
         "pcap_threat_hunter": {
             "hunt": ["talkers", "ports", "beacons", "dns", "tls", "lateral", "exfil"],

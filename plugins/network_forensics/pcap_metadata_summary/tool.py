@@ -2021,6 +2021,8 @@ class PcapMetadataSummary:
                 return self._timeline(payload)
             elif mode == "ioc":
                 return self._ioc_search(payload)
+            elif mode == "networks":
+                return self._networks(payload)
             else:
                 return ToolResult(ok=False, error_code="INVALID_MODE", message=f"Unknown mode: {mode}")
         except Exception as e:
@@ -2307,6 +2309,83 @@ class PcapMetadataSummary:
         return ToolResult(ok=True, result={"text": "\n".join(lines)})
 
     # ----- ioc -----
+    # ----- networks -----
+    def _networks(self, payload: dict[str, Any]) -> ToolResult:
+        """List all /24 networks observed in the PCAP."""
+        s = get_pcap_session()
+        sort_by = payload.get("sort_by", "bytes")  # bytes | hosts | flows
+        filter_type = payload.get("filter", "")     # int | ext | ot | ""
+
+        net_stats: dict[str, dict] = defaultdict(lambda: {
+            "ips": set(), "bytes": 0, "flows": 0,
+        })
+        for (src, dst, dport, proto), stats in s.conversations.items():
+            for ip in (src, dst):
+                parts = ip.rsplit(".", 1)
+                if len(parts) == 2:
+                    sn = f"{parts[0]}.0/24"
+                    net_stats[sn]["ips"].add(ip)
+            src_sn = ".".join(src.split(".")[:3]) + ".0/24"
+            net_stats[src_sn]["bytes"] += stats.get("bytes_out", 0)
+            net_stats[src_sn]["flows"] += 1
+
+        # Filter
+        if filter_type == "int":
+            net_stats = {sn: s for sn, s in net_stats.items()
+                         if is_internal(sn.split("/")[0])}
+        elif filter_type == "ext":
+            net_stats = {sn: s for sn, s in net_stats.items()
+                         if not is_internal(sn.split("/")[0])}
+        elif filter_type == "ot":
+            ot_ips = set()
+            for t in s.ot_transactions:
+                ot_ips.add(t.get("src", ""))
+                ot_ips.add(t.get("dst", ""))
+            ot_nets = set()
+            for ip in ot_ips:
+                parts = ip.rsplit(".", 1)
+                if len(parts) == 2:
+                    ot_nets.add(f"{parts[0]}.0/24")
+            net_stats = {sn: s for sn, s in net_stats.items()
+                         if sn in ot_nets}
+
+        # Sort
+        sort_key = {
+            "bytes": lambda x: x[1]["bytes"],
+            "hosts": lambda x: len(x[1]["ips"]),
+            "flows": lambda x: x[1]["flows"],
+            "subnet": lambda x: tuple(int(o) for o in x[0].split("/")[0].split(".")),
+        }.get(sort_by, lambda x: x[1]["bytes"])
+        sorted_nets = sorted(net_stats.items(), key=sort_key, reverse=(sort_by != "subnet"))
+
+        int_count = sum(1 for sn, _ in sorted_nets if is_internal(sn.split("/")[0]))
+        ext_count = len(sorted_nets) - int_count
+
+        lines = [
+            f"=== Active /24 Networks ({len(sorted_nets)} total) ===",
+            f"  Internal: {int_count}  |  External: {ext_count}",
+            f"  Sorted by: {sort_by}"
+            + (f"  |  Filter: {filter_type}" if filter_type else ""),
+            "",
+            f"  {'Subnet':<20} {'Hosts':<7} {'Flows':<8} {'Bytes':<12} {'Type'}",
+            "  " + "-" * 60,
+        ]
+
+        for sn, st in sorted_nets:
+            ip_base = sn.split("/")[0]
+            if is_known_org(ip_base):
+                loc = "ORG"
+            elif is_internal(ip_base):
+                loc = "INT"
+            else:
+                loc = "EXT"
+            lines.append(
+                f"  {sn:<20} {len(st['ips']):<7} {st['flows']:<8} "
+                f"{_format_bytes(st['bytes']):<12} {loc}"
+            )
+
+        return ToolResult(ok=True, result={"text": "\n".join(lines)})
+
     def _ioc_search(self, payload: dict[str, Any]) -> ToolResult:
         s = get_pcap_session()
         indicator = payload.get("indicator", "")
