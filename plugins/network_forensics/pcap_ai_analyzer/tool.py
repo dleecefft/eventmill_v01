@@ -938,7 +938,7 @@ def _render_purdue_zone_graph(session: Any) -> bytes | None:
                     fontsize=8, ha="center", va="center",
                     color="#7f8c8d", style="italic")
 
-    # --- Draw /24-to-/24 traffic flow edges (cross-zone only) ---
+    # --- Draw /24-to-/24 traffic flow edges (cross-zone only, top 75) ---
     cross_zone_flows: list[tuple[str, str, int]] = []
     for (net_a, net_b), total_bytes in net_pair_bytes.items():
         zone_a = net_zones.get(net_a, "External")
@@ -946,6 +946,11 @@ def _render_purdue_zone_graph(session: Any) -> bytes | None:
         if zone_a == zone_b:
             continue
         cross_zone_flows.append((net_a, net_b, total_bytes))
+
+    # Cap to top 75 flows by volume to keep rendering fast
+    cross_zone_flows.sort(key=lambda x: x[2], reverse=True)
+    total_cross = len(cross_zone_flows)
+    cross_zone_flows = cross_zone_flows[:75]
 
     if cross_zone_flows:
         max_flow = max(f[2] for f in cross_zone_flows)
@@ -1024,14 +1029,16 @@ def _render_purdue_zone_graph(session: Any) -> bytes | None:
     ax.legend(handles=legend_elements, loc="lower right",
               fontsize=7, framealpha=0.9, ncol=2)
 
-    ax.set_title("Purdue Model - Network Zone Traffic Flow",
+    ax.set_title("Purdue Model - Network Zone Traffic Flow"
+                 + (f" (top {len(cross_zone_flows)} of {total_cross} flows)"
+                    if total_cross > 75 else ""),
                  fontsize=13, fontweight="bold", pad=12)
 
     plt.tight_layout()
 
     # Render to PNG bytes in memory
     buf = BytesIO()
-    fig.savefig(buf, format="png", dpi=150, bbox_inches="tight",
+    fig.savefig(buf, format="png", dpi=120, bbox_inches="tight",
                 facecolor="white", edgecolor="none")
     plt.close(fig)
     buf.seek(0)
@@ -1178,6 +1185,7 @@ def _export_pdf(
         # PURDUE ZONE TRAFFIC DIAGRAM (OT reports only)
         # ===================================================================
         if mode.startswith("ot_") and session is not None:
+            print("  \U0001f5fa Rendering Purdue zone diagram...", flush=True)
             graph_png = _render_purdue_zone_graph(session)
             if graph_png:
                 import tempfile
@@ -1221,6 +1229,7 @@ def _export_pdf(
         # ===================================================================
         # BODY PAGES — parse content into structured sections
         # ===================================================================
+        print("  \U0001f4dd Rendering PDF body...", flush=True)
 
         # Helper: draw a coloured section header bar
         def _section_header(title_text: str, bg: tuple = CLR_NAVY) -> None:
@@ -2216,6 +2225,7 @@ class PcapAiAnalyzer:
             export_type = payload.get("export_type", "").lower()
             pdf_path = None
             if export_type == "pdf":
+                print("  \U0001f4c4 Generating PDF report...", flush=True)
                 pdf_path = _export_pdf(
                     combined, output_dir,
                     f"pcap_ai_analyzer_{mode}_{ts}.pdf",
@@ -2223,6 +2233,8 @@ class PcapAiAnalyzer:
                     condition_orange=condition_orange,
                     session=session,
                 )
+                if pdf_path:
+                    print(f"  \u2705 PDF saved: {pdf_path}", flush=True)
 
             # Register the markdown file as an artifact
             if hasattr(context, "register_artifact"):
