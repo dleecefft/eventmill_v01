@@ -65,6 +65,14 @@ YOUR ROLE:
 2. CORRELATE: Connect indicators across DNS, HTTP, TLS, and flow data.
 3. PRIORITIZE: Rank findings by severity with clear justification. If nothing is suspicious, say so.
 4. RECOMMEND: Suggest specific next steps for human analysts to execute.
+
+ORGANIZATION IP CLASSIFICATION RULE:
+- The investigation context may list KNOWN ORGANIZATION IP RANGES. These are public IP
+  addresses owned by the organization (e.g., partner links, monitoring feeds, WAN endpoints).
+- IPs within these ranges MUST be classified as INTERNAL/ORG — NOT external.
+  Do NOT flag traffic from these IPs as external threats or suspicious.
+- Only flag IPs that are BOTH outside RFC1918 AND outside the listed organization ranges.
+- Label organization IPs as "ORG" not "EXT" in your analysis.
 """
 
 # ---------------------------------------------------------------------------
@@ -104,6 +112,16 @@ KEY OT SECURITY PRINCIPLES:
   Unauthorized access is trivial — the question is whether it happened.
 - Cleartext credentials on OT networks are a severe finding — they enable lateral movement
   from IT to safety-critical systems.
+
+ORGANIZATION IP CLASSIFICATION RULE:
+- The investigation context may list KNOWN ORGANIZATION IP RANGES. These are public IP
+  addresses owned by the organization (e.g., partner links, AESO monitoring, SCADA WAN,
+  PCS process control networks, VPN endpoints).
+- IPs that fall within these ranges MUST be classified as INTERNAL/ORG — NOT external.
+  Do NOT flag traffic from these IPs as "external-to-internal" zone violations.
+- Only flag traffic from IPs that are BOTH outside RFC1918 AND outside the listed
+  organization ranges as truly external.
+- When referencing organization IPs, label them as "ORG (organization-owned)" not "EXT".
 """
 
 # ---------------------------------------------------------------------------
@@ -440,6 +458,12 @@ CONTROL PLANE & TOPOLOGY ANALYSIS:
     resets the neighbor adjacency. Look for high Query counts with low Reply counts.
   - Update packets carry route changes; elevated Update/Hello ratio indicates
     active topology changes rather than steady-state operation.
+
+ORGANIZATION IP CLASSIFICATION RULE:
+- The investigation context may list KNOWN ORGANIZATION IP RANGES. These are public IP
+  addresses owned by the organization (e.g., partner links, AESO monitoring, SCADA WAN).
+- IPs within these ranges MUST be classified as INTERNAL/ORG — NOT external.
+- Label organization IPs as "ORG" not "EXT" in your analysis.
 """
 
 # ---------------------------------------------------------------------------
@@ -2381,8 +2405,11 @@ class PcapAiAnalyzer:
             parts.append(content)
         if _org_nets:
             parts.append(
-                "--- KNOWN ORGANIZATION IP RANGES "
-                "(treated as internal/trusted) ---")
+                "--- KNOWN ORGANIZATION IP RANGES ---")
+            parts.append(
+                "IMPORTANT: The following IP ranges are OWNED BY THIS ORGANIZATION. "
+                "They are NOT external threats. Classify them as INTERNAL/ORG. "
+                "Do NOT flag them as external-to-internal zone violations.")
             parts.append(", ".join(str(n) for n in _org_nets))
         parts.append("--- END INVESTIGATION CONTEXT ---\n")
         block = "\n".join(parts) + "\n"
