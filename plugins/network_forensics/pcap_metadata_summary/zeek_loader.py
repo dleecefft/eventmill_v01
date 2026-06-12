@@ -154,6 +154,28 @@ def parse_zeek_logs(log_dir: str | Path) -> "PcapSession":
     if ot_files_parsed:
         logger.info("Zeek OT/ICS logs parsed: %s", ", ".join(ot_files_parsed))
 
+    # --- IT security / infrastructure protocol logs ---
+    _it_log_parsers: Dict[str, Any] = {
+        "kerberos.log": _parse_kerberos_log,
+        "smb_mapping.log": _parse_smb_mapping_log,
+        "smb_files.log": _parse_smb_files_log,
+        "dce_rpc.log": _parse_dce_rpc_log,
+        "syslog.log": _parse_syslog_log,
+        "ldap.log": _parse_ldap_log,
+        "ntlm.log": _parse_ntlm_log,
+        "ssh.log": _parse_ssh_log,
+        "snmp.log": _parse_snmp_log,
+    }
+    it_files_parsed: List[str] = []
+    for log_name, parser_fn in _it_log_parsers.items():
+        it_path = log_dir / log_name
+        if it_path.exists():
+            parser_fn(it_path, session)
+            it_files_parsed.append(log_name)
+
+    if it_files_parsed:
+        logger.info("Zeek IT/security logs parsed: %s", ", ".join(it_files_parsed))
+
     # Estimate packet count from connection metadata
     if session.packet_count == 0:
         # Sum orig_pkts + resp_pkts from conversations if we tracked them
@@ -163,6 +185,8 @@ def parse_zeek_logs(log_dir: str | Path) -> "PcapSession":
     _ALL_KNOWN_LOGS = {
         "conn.log", "dns.log", "ssl.log", "http.log", "notice.log", "weird.log",
         "stp.log",
+        "kerberos.log", "smb_mapping.log", "smb_files.log", "dce_rpc.log",
+        "syslog.log", "ldap.log", "ntlm.log", "ssh.log", "snmp.log",
     } | set(_OT_LOG_FILES)
     files_parsed = [
         f.name for f in log_dir.glob("*.log")
@@ -982,6 +1006,253 @@ def _parse_opcua_log(path: Path, session) -> None:
         session.ot_transactions.append(ot)
 
     logger.info("Parsed OPC-UA log: %s", path.name)
+
+
+# ---------------------------------------------------------------------------
+# IT / Security protocol log parsers
+# ---------------------------------------------------------------------------
+
+def _parse_kerberos_log(path: Path, session) -> None:
+    """Parse kerberos.log — Zeek built-in Kerberos analyzer.
+
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    request_type, client, service, success, error_msg, cipher, ...
+    """
+    cap = 500
+    for entry in _read_zeek_json(path):
+        if len(session.kerberos_tickets) >= cap:
+            break
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+        id_info = entry.get("id", {})
+        session.kerberos_tickets.append({
+            "src": id_info.get("orig_h", ""),
+            "dst": id_info.get("resp_h", ""),
+            "client": entry.get("client", ""),
+            "service": entry.get("service", ""),
+            "request_type": entry.get("request_type", ""),
+            "cipher": entry.get("cipher", ""),
+            "success": entry.get("success", ""),
+            "error_msg": entry.get("error_msg", ""),
+            "ts": ts,
+        })
+    logger.info("Parsed Kerberos log: %d tickets from %s", len(session.kerberos_tickets), path.name)
+
+
+def _parse_smb_mapping_log(path: Path, session) -> None:
+    """Parse smb_mapping.log — Zeek SMB tree connect/disconnect.
+
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    path, share_type, native_file_system, ...
+    """
+    cap = 500
+    for entry in _read_zeek_json(path):
+        if len(session.smb_mappings) >= cap:
+            break
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+        id_info = entry.get("id", {})
+        share_path = entry.get("path", "")
+        session.smb_mappings.append({
+            "src": id_info.get("orig_h", ""),
+            "dst": id_info.get("resp_h", ""),
+            "share": share_path,
+            "share_type": entry.get("share_type", ""),
+            "ts": ts,
+        })
+    logger.info("Parsed SMB mapping log: %d entries from %s", len(session.smb_mappings), path.name)
+
+
+def _parse_smb_files_log(path: Path, session) -> None:
+    """Parse smb_files.log — Zeek SMB file operations.
+
+    Fields: ts, uid, id.orig_h, id.resp_h, action, path, name, size, ...
+    """
+    cap = 500
+    for entry in _read_zeek_json(path):
+        if len(session.smb_files) >= cap:
+            break
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+        id_info = entry.get("id", {})
+        session.smb_files.append({
+            "src": id_info.get("orig_h", ""),
+            "dst": id_info.get("resp_h", ""),
+            "action": entry.get("action", ""),
+            "name": entry.get("name", ""),
+            "path": entry.get("path", ""),
+            "size": _safe_int(entry.get("size")),
+            "ts": ts,
+        })
+    logger.info("Parsed SMB files log: %d entries from %s", len(session.smb_files), path.name)
+
+
+def _parse_dce_rpc_log(path: Path, session) -> None:
+    """Parse dce_rpc.log — Zeek DCE/RPC analyzer.
+
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    rtt, named_pipe, endpoint, operation, ...
+    """
+    cap = 500
+    for entry in _read_zeek_json(path):
+        if len(session.dce_rpc_calls) >= cap:
+            break
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+        id_info = entry.get("id", {})
+        session.dce_rpc_calls.append({
+            "src": id_info.get("orig_h", ""),
+            "dst": id_info.get("resp_h", ""),
+            "endpoint": entry.get("endpoint", ""),
+            "operation": entry.get("operation", ""),
+            "named_pipe": entry.get("named_pipe", ""),
+            "ts": ts,
+        })
+    logger.info("Parsed DCE/RPC log: %d calls from %s", len(session.dce_rpc_calls), path.name)
+
+
+def _parse_syslog_log(path: Path, session) -> None:
+    """Parse syslog.log — Zeek syslog analyzer (summary stats only).
+
+    Fields: ts, uid, id.orig_h, id.resp_h, proto, facility, severity, message
+    """
+    for entry in _read_zeek_json(path):
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+        id_info = entry.get("id", {})
+        src = id_info.get("orig_h", "")
+
+        session.syslog_total += 1
+        session.syslog_sources[src] += 1
+
+        sev = entry.get("severity")
+        if sev is not None and sev != "-":
+            sev_int = _safe_int(sev)
+            if sev_int is not None:
+                session.syslog_severity[sev_int] += 1
+
+        fac = entry.get("facility")
+        if fac is not None and fac != "-":
+            fac_int = _safe_int(fac)
+            if fac_int is not None:
+                session.syslog_facilities[fac_int] += 1
+
+        msg = entry.get("message", "")
+        if msg and msg != "-":
+            msg_lower = msg.lower()
+            if any(w in msg_lower for w in ("fail", "denied", "invalid", "reject", "unauthorized")):
+                session.syslog_patterns["auth_failure"] += 1
+            if any(w in msg_lower for w in ("config", "changed", "modified", "reload")):
+                session.syslog_patterns["config_change"] += 1
+            if any(w in msg_lower for w in ("up", "down", "link ")):
+                session.syslog_patterns["interface_state"] += 1
+            if any(w in msg_lower for w in ("login", "logged in", "session open")):
+                session.syslog_patterns["login_event"] += 1
+            if any(w in msg_lower for w in ("blocked", "drop", "firewall")):
+                session.syslog_patterns["firewall_event"] += 1
+
+    logger.info("Parsed syslog log: %d messages from %s", session.syslog_total, path.name)
+
+
+def _parse_ldap_log(path: Path, session) -> None:
+    """Parse ldap.log — Zeek LDAP analyzer (requires zeek-ldap plugin).
+
+    Fields: ts, uid, id.orig_h, id.resp_h, message_type,
+    base_object, result_code, result, diagnostic_message, ...
+    """
+    cap = 500
+    for entry in _read_zeek_json(path):
+        if len(session.ldap_operations) >= cap:
+            break
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+        id_info = entry.get("id", {})
+        session.ldap_operations.append({
+            "src": id_info.get("orig_h", ""),
+            "dst": id_info.get("resp_h", ""),
+            "message_type": entry.get("message_type", entry.get("operation", "")),
+            "base_object": entry.get("base_object", entry.get("object", "")),
+            "result": entry.get("result", entry.get("result_code", "")),
+            "ts": ts,
+        })
+    logger.info("Parsed LDAP log: %d operations from %s", len(session.ldap_operations), path.name)
+
+
+def _parse_ntlm_log(path: Path, session) -> None:
+    """Parse ntlm.log — Zeek NTLM analyzer.
+
+    Fields: ts, uid, id.orig_h, id.resp_h, username, hostname,
+    domainname, success, status, ...
+    """
+    cap = 500
+    for entry in _read_zeek_json(path):
+        if len(session.ntlm_auths) >= cap:
+            break
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+        id_info = entry.get("id", {})
+        session.ntlm_auths.append({
+            "src": id_info.get("orig_h", ""),
+            "dst": id_info.get("resp_h", ""),
+            "hostname": entry.get("hostname", ""),
+            "domain": entry.get("domainname", entry.get("domain", "")),
+            "username": entry.get("username", ""),
+            "success": entry.get("success", ""),
+            "ts": ts,
+        })
+    logger.info("Parsed NTLM log: %d auths from %s", len(session.ntlm_auths), path.name)
+
+
+def _parse_ssh_log(path: Path, session) -> None:
+    """Parse ssh.log — Zeek SSH analyzer.
+
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    version, auth_success, auth_attempts, direction, client, server, ...
+    """
+    cap = 200
+    for entry in _read_zeek_json(path):
+        if len(session.ssh_sessions) >= cap:
+            break
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+        id_info = entry.get("id", {})
+        banner_parts = []
+        client = entry.get("client", "")
+        server = entry.get("server", "")
+        if client and client != "-":
+            banner_parts.append(f"client={client}")
+        if server and server != "-":
+            banner_parts.append(f"server={server}")
+        session.ssh_sessions.append({
+            "src": id_info.get("orig_h", ""),
+            "dst": id_info.get("resp_h", ""),
+            "src_port": _safe_int(id_info.get("orig_p")) or 0,
+            "ts": ts,
+            "banner": "; ".join(banner_parts) if banner_parts else "",
+            "auth_success": entry.get("auth_success", ""),
+            "auth_attempts": _safe_int(entry.get("auth_attempts")),
+            "version": _safe_int(entry.get("version")),
+        })
+    logger.info("Parsed SSH log: %d sessions from %s", len(session.ssh_sessions), path.name)
+
+
+def _parse_snmp_log(path: Path, session) -> None:
+    """Parse snmp.log — Zeek SNMP analyzer.
+
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    duration, version, community, get_requests, get_bulk_requests,
+    get_responses, set_requests, ...
+    """
+    for entry in _read_zeek_json(path):
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+        id_info = entry.get("id", {})
+        src = id_info.get("orig_h", "")
+        session.snmp_sources[src] += 1
+        community = entry.get("community", "")
+        if community and community != "-":
+            session.snmp_communities[community] += 1
+    logger.info("Parsed SNMP log from %s", path.name)
 
 
 # ---------------------------------------------------------------------------

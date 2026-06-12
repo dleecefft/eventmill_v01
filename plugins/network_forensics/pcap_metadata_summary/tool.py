@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import tempfile
 import ipaddress
@@ -138,6 +139,30 @@ class PcapSession:
 
         # OT / ICS protocol transactions
         self.ot_transactions: List[Dict] = []
+
+        # SCADA message-bus tag data (JSON payloads from OASyS / AMQP-like)
+        self.scada_tags: Dict[str, Dict] = {}  # tag_name -> {src, dst, count, values_sample, quality}
+        self.scada_tag_sources: Counter = Counter()  # src_ip -> message count
+
+        # Syslog summary (condensed stats, not raw messages)
+        self.syslog_sources: Counter = Counter()      # src_ip -> message count
+        self.syslog_severity: Counter = Counter()     # severity_int -> count
+        self.syslog_facilities: Counter = Counter()   # facility_int -> count
+        self.syslog_patterns: Counter = Counter()     # pattern keyword -> count
+        self.syslog_total: int = 0
+
+        # IT security protocol activity (port-level detection + basic extraction)
+        self.ssh_sessions: List[Dict] = []            # {src, dst, src_port, ts, banner}
+        self.snmp_communities: Counter = Counter()    # community_string -> count
+        self.snmp_sources: Counter = Counter()        # src_ip -> count
+
+        # AD / Windows protocol activity (Zeek-populated)
+        self.kerberos_tickets: List[Dict] = []        # {client, service, cipher, success, src, dst, ts}
+        self.smb_mappings: List[Dict] = []            # {src, dst, share, path, ts}
+        self.smb_files: List[Dict] = []               # {src, dst, action, name, path, size, ts}
+        self.dce_rpc_calls: List[Dict] = []           # {src, dst, endpoint, operation, ts}
+        self.ldap_operations: List[Dict] = []         # {src, dst, message_type, base_object, result, ts}
+        self.ntlm_auths: List[Dict] = []              # {src, dst, hostname, domain, username, success, ts}
 
         # Cleartext credential detections (values are redacted)
         self.cleartext_creds: List[Dict] = []
@@ -291,7 +316,14 @@ class PcapSession:
             sconv["packets"] += oconv["packets"]
             sconv["bytes_out"] += oconv["bytes_out"]
             sconv["bytes_in"] += oconv["bytes_in"]
-            sconv["timestamps"].extend(oconv["timestamps"])
+            # Cap timestamps to avoid OOM on large multi-file merges.
+            # Keep first/last 500 per flow — enough for beacon detection.
+            _TS_CAP = 1000
+            combined = sconv["timestamps"]
+            combined.extend(oconv["timestamps"])
+            if len(combined) > _TS_CAP:
+                combined.sort()
+                sconv["timestamps"] = combined[:500] + combined[-500:]
             if oconv["first_seen"] is not None:
                 if sconv["first_seen"] is None or oconv["first_seen"] < sconv["first_seen"]:
                     sconv["first_seen"] = oconv["first_seen"]
@@ -405,6 +437,57 @@ class PcapSession:
         # IP fragmentation & TTL
         self.ip_fragment_count += other.ip_fragment_count
         self.ttl_distribution += other.ttl_distribution
+
+        # --- New protocol fields ---
+
+        # SCADA tags — merge dicts (add counts, extend samples)
+        for tag, info in other.scada_tags.items():
+            if tag in self.scada_tags:
+                self.scada_tags[tag]["count"] += info["count"]
+                samples = self.scada_tags[tag]["values_sample"]
+                for v in info.get("values_sample", []):
+                    if len(samples) < 10:
+                        samples.append(v)
+                self.scada_tags[tag]["quality"] = info.get("quality", self.scada_tags[tag]["quality"])
+            else:
+                self.scada_tags[tag] = dict(info)  # copy
+        self.scada_tag_sources += other.scada_tag_sources
+
+        # Syslog summary
+        self.syslog_sources += other.syslog_sources
+        self.syslog_severity += other.syslog_severity
+        self.syslog_facilities += other.syslog_facilities
+        self.syslog_patterns += other.syslog_patterns
+        self.syslog_total += other.syslog_total
+
+        # SSH sessions (cap at 500)
+        remaining = max(0, 500 - len(self.ssh_sessions))
+        self.ssh_sessions.extend(other.ssh_sessions[:remaining])
+
+        # SNMP
+        self.snmp_communities += other.snmp_communities
+        self.snmp_sources += other.snmp_sources
+
+        # AD / Windows protocols (cap at 1000 each)
+        for attr, cap in (
+            ("kerberos_tickets", 1000),
+            ("smb_mappings", 1000),
+            ("smb_files", 1000),
+            ("dce_rpc_calls", 1000),
+            ("ldap_operations", 1000),
+            ("ntlm_auths", 1000),
+        ):
+            mine = getattr(self, attr)
+            remaining = max(0, cap - len(mine))
+            mine.extend(getattr(other, attr)[:remaining])
+
+        # Cap unbounded lists accumulated across files
+        _LIST_CAP = 50_000
+        for attr in ("dns_queries", "dns_responses", "http_requests",
+                      "tls_handshakes", "ot_transactions", "icmp_errors"):
+            lst = getattr(self, attr)
+            if len(lst) > _LIST_CAP:
+                setattr(self, attr, lst[:_LIST_CAP])
 
 
 # ---------------------------------------------------------------------------
@@ -832,6 +915,30 @@ def parse_pcap_file(file_path: str) -> PcapSession:
             # OT / ICS protocol extraction (port-based heuristic)
             # ---------------------------------------------------------------
             _extract_ot_transaction(pkt, session, src_ip, dst_ip, sport, dport, proto, ts)
+
+            # ---------------------------------------------------------------
+            # SCADA JSON tag data (port 5672 / OASyS message bus)
+            # ---------------------------------------------------------------
+            if (dport in _SCADA_MQ_PORTS or sport in _SCADA_MQ_PORTS) and pkt.haslayer(Raw):
+                _extract_scada_json(pkt[Raw].load, session, src_ip, dst_ip, ts)
+
+            # ---------------------------------------------------------------
+            # Syslog (UDP 514 summary stats)
+            # ---------------------------------------------------------------
+            if proto == "UDP" and (dport == 514 or sport == 514) and pkt.haslayer(Raw):
+                _extract_syslog(pkt[Raw].load, session, src_ip)
+
+            # ---------------------------------------------------------------
+            # SNMP community strings (UDP 161/162)
+            # ---------------------------------------------------------------
+            if proto == "UDP" and dport in (161, 162) and pkt.haslayer(Raw):
+                _extract_snmp_community(pkt[Raw].load, session, src_ip)
+
+            # ---------------------------------------------------------------
+            # SSH banner (port 22)
+            # ---------------------------------------------------------------
+            if proto == "TCP" and (dport == 22 or sport == 22) and pkt.haslayer(Raw):
+                _extract_ssh_banner(pkt[Raw].load, session, src_ip, dst_ip, sport, ts)
 
             # ---------------------------------------------------------------
             # Cleartext credential detection (redacted values)
@@ -1351,6 +1458,22 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
                 session, src_ip, dst_ip, sport, dport, proto, ts, tcp_data,
             )
 
+            # SCADA JSON tag data (port 5672 / OASyS message bus)
+            if (dport in _SCADA_MQ_PORTS or sport in _SCADA_MQ_PORTS) and tcp_data:
+                _extract_scada_json_dpkt(tcp_data, session, src_ip, dst_ip, ts)
+
+            # Syslog (UDP 514 summary stats)
+            if proto == "UDP" and (dport == 514 or sport == 514) and tcp_data:
+                _extract_syslog(tcp_data, session, src_ip)
+
+            # SNMP community strings (UDP 161/162)
+            if proto == "UDP" and dport in (161, 162) and tcp_data:
+                _extract_snmp_community(tcp_data, session, src_ip)
+
+            # SSH banner (port 22)
+            if proto == "TCP" and (dport == 22 or sport == 22) and tcp_data:
+                _extract_ssh_banner(tcp_data, session, src_ip, dst_ip, sport, ts)
+
             # Cleartext credential detection
             _extract_cleartext_creds_dpkt(
                 session, src_ip, dst_ip, sport, dport, ts, tcp_data,
@@ -1681,6 +1804,33 @@ _OT_PORT_PROTOCOL: Dict[int, str] = {
     18245: "GE-SRTP",
 }
 
+# IT/OT service port labels (for flow enrichment, not deep parsing)
+_SERVICE_PORTS: Dict[int, str] = {
+    22: "SSH", 53: "DNS", 88: "Kerberos", 135: "DCE/RPC",
+    139: "NetBIOS", 161: "SNMP", 162: "SNMP-Trap", 389: "LDAP",
+    445: "SMB", 514: "Syslog", 636: "LDAPS", 3389: "RDP",
+    5432: "PostgreSQL", 5672: "SCADA-MQ", 5985: "WinRM",
+    5986: "WinRM-TLS",
+}
+
+# SCADA message-bus ports (JSON-over-TCP tag data, e.g., OASyS)
+_SCADA_MQ_PORTS = {5672}
+
+# Syslog severity names (RFC 5424)
+_SYSLOG_SEVERITY = {
+    0: "emerg", 1: "alert", 2: "crit", 3: "error",
+    4: "warning", 5: "notice", 6: "info", 7: "debug",
+}
+
+# Syslog security-relevant pattern keywords
+_SYSLOG_PATTERNS = [
+    (re.compile(rb'(?i)fail|denied|invalid|reject|unauthorized'), "auth_failure"),
+    (re.compile(rb'(?i)config|changed|modified|reload'), "config_change"),
+    (re.compile(rb'(?i)up|down|link\s'), "interface_state"),
+    (re.compile(rb'(?i)login|logged\s?in|session\s?open'), "login_event"),
+    (re.compile(rb'(?i)blocked|drop|firewall'), "firewall_event"),
+]
+
 # Modbus function code names
 _MODBUS_FUNC_NAMES: Dict[int, str] = {
     1: "Read Coils", 2: "Read Discrete Inputs",
@@ -1796,6 +1946,147 @@ def _extract_ot_transaction(
             pass
 
     session.ot_transactions.append(entry)
+
+
+# ---------------------------------------------------------------------------
+# SCADA message-bus JSON extraction (OASyS tag data on TCP port 5672 etc.)
+# ---------------------------------------------------------------------------
+
+_SCADA_JSON_RE = re.compile(rb'"ScadaDataSource"\s*:\s*"([^"]*)"')
+_SCADA_TAG_RE = re.compile(rb'"Tag"\s*:\s*"([^"]*)"')
+_SCADA_VAL_RE = re.compile(rb'"Value"\s*:\s*"([^"]*)"')
+_SCADA_QUAL_RE = re.compile(rb'"Quality"\s*:\s*"([^"]*)"')
+_MAX_SCADA_TAGS = 500
+_MAX_VALUE_SAMPLES = 10
+
+
+def _extract_scada_json(payload: bytes, session: Any,
+                        src_ip: str, dst_ip: str, ts: float) -> None:
+    """Extract SCADA tag data from JSON-over-TCP payloads."""
+    if b'"ScadaDataSource"' not in payload:
+        return
+    tag_m = _SCADA_TAG_RE.search(payload)
+    if not tag_m:
+        return
+    tag_name = tag_m.group(1).decode("utf-8", errors="replace")
+    val_m = _SCADA_VAL_RE.search(payload)
+    qual_m = _SCADA_QUAL_RE.search(payload)
+    value = val_m.group(1).decode("utf-8", errors="replace") if val_m else None
+    quality = qual_m.group(1).decode("utf-8", errors="replace") if qual_m else None
+
+    session.scada_tag_sources[src_ip] += 1
+
+    if tag_name in session.scada_tags:
+        entry = session.scada_tags[tag_name]
+        entry["count"] += 1
+        if value and len(entry["values_sample"]) < _MAX_VALUE_SAMPLES:
+            entry["values_sample"].append(value)
+        if quality and quality != entry.get("quality"):
+            entry["quality"] = quality  # track latest
+    elif len(session.scada_tags) < _MAX_SCADA_TAGS:
+        session.scada_tags[tag_name] = {
+            "src": src_ip,
+            "dst": dst_ip,
+            "count": 1,
+            "values_sample": [value] if value else [],
+            "quality": quality or "unknown",
+            "first_ts": ts,
+        }
+
+
+def _extract_scada_json_dpkt(tcp_data: bytes, session: Any,
+                             src_ip: str, dst_ip: str, ts: float) -> None:
+    """dpkt version — identical logic, different caller."""
+    _extract_scada_json(tcp_data, session, src_ip, dst_ip, ts)
+
+
+# ---------------------------------------------------------------------------
+# Syslog extraction (condensed summary only — UDP 514)
+# ---------------------------------------------------------------------------
+
+
+def _extract_syslog(payload: bytes, session: Any, src_ip: str) -> None:
+    """Extract syslog severity/facility and pattern counts from raw message."""
+    session.syslog_total += 1
+    session.syslog_sources[src_ip] += 1
+
+    # RFC 5424 / RFC 3164: message starts with <PRI> where PRI = facility*8+severity
+    if payload and payload[0:1] == b'<':
+        end = payload.find(b'>', 1, 6)
+        if end > 0:
+            try:
+                pri = int(payload[1:end])
+                severity = pri & 0x07
+                facility = pri >> 3
+                session.syslog_severity[severity] += 1
+                session.syslog_facilities[facility] += 1
+            except (ValueError, IndexError):
+                pass
+
+    # Match security-relevant patterns
+    for pattern, label in _SYSLOG_PATTERNS:
+        if pattern.search(payload):
+            session.syslog_patterns[label] += 1
+
+
+# ---------------------------------------------------------------------------
+# SSH banner extraction (port 22)
+# ---------------------------------------------------------------------------
+
+_SSH_BANNER_RE = re.compile(rb'^SSH-\d+\.\d+-\S+')
+
+
+def _extract_ssh_banner(payload: bytes, session: Any,
+                        src_ip: str, dst_ip: str, sport: int,
+                        ts: float) -> None:
+    """Capture SSH version banners from the first packet of a session."""
+    if len(session.ssh_sessions) >= 200:
+        return
+    m = _SSH_BANNER_RE.match(payload)
+    if m:
+        banner = m.group(0).decode("utf-8", errors="replace")
+        session.ssh_sessions.append({
+            "src": src_ip, "dst": dst_ip, "src_port": sport,
+            "ts": ts, "banner": banner,
+        })
+
+
+# ---------------------------------------------------------------------------
+# SNMP community string extraction (UDP 161/162)
+# ---------------------------------------------------------------------------
+
+
+def _extract_snmp_community(payload: bytes, session: Any,
+                            src_ip: str) -> None:
+    """Extract SNMPv1/v2c community strings from raw payload."""
+    session.snmp_sources[src_ip] += 1
+    # SNMPv1/v2c: SEQUENCE → INTEGER(version) → OCTET STRING(community)
+    # Minimal ASN.1 parse: look for version 0 or 1, then next octet-string
+    if len(payload) < 10:
+        return
+    try:
+        # payload[0] should be 0x30 (SEQUENCE)
+        if payload[0] != 0x30:
+            return
+        # Find version field (INTEGER tag = 0x02)
+        idx = 2  # skip SEQUENCE tag + length
+        if payload[1] & 0x80:
+            idx += (payload[1] & 0x7F)
+        if idx >= len(payload) or payload[idx] != 0x02:
+            return
+        ver_len = payload[idx + 1]
+        idx += 2 + ver_len
+        # Next should be OCTET STRING (0x04) = community
+        if idx >= len(payload) or payload[idx] != 0x04:
+            return
+        comm_len = payload[idx + 1]
+        idx += 2
+        if idx + comm_len <= len(payload):
+            community = payload[idx:idx + comm_len].decode("ascii", errors="replace")
+            if community and len(community) < 64:
+                session.snmp_communities[community] += 1
+    except (IndexError, ValueError):
+        pass
 
 
 # ---------------------------------------------------------------------------

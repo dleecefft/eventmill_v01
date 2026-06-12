@@ -2601,6 +2601,54 @@ class PcapAiAnalyzer:
                 if len(src_dst_pairs) > 5:
                     lines.append(f"    ... +{len(src_dst_pairs) - 5} more pairs")
 
+        # --- SCADA Message Bus Tag Data ---
+        if hasattr(session, "scada_tags") and session.scada_tags:
+            lines.append(f"\n{'=' * 60}")
+            lines.append("SCADA MESSAGE BUS TAG DATA (OASyS / AMQP)")
+            lines.append(f"{'=' * 60}")
+            lines.append(f"Unique tags: {len(session.scada_tags):,}")
+            if hasattr(session, "scada_tag_sources") and session.scada_tag_sources:
+                lines.append(f"Source hosts: {', '.join(sorted(session.scada_tag_sources.keys())[:10])}")
+            for tag_name, info in sorted(session.scada_tags.items(),
+                                         key=lambda x: x[1]["count"], reverse=True)[:30]:
+                vals = info.get("values_sample", [])
+                val_str = f" | samples: {', '.join(vals[:3])}" if vals else ""
+                lines.append(
+                    f"  {tag_name} — {info['count']:,} msgs | "
+                    f"quality={info.get('quality', '?')}{val_str}"
+                )
+
+        # --- Syslog Summary ---
+        if hasattr(session, "syslog_total") and session.syslog_total:
+            lines.append(f"\n{'=' * 60}")
+            lines.append("SYSLOG SUMMARY")
+            lines.append(f"{'=' * 60}")
+            lines.append(f"Total messages: {session.syslog_total:,}")
+            if session.syslog_sources:
+                lines.append(f"Sources: {', '.join(sorted(session.syslog_sources.keys())[:10])}")
+            if session.syslog_severity:
+                from plugins.network_forensics.pcap_metadata_summary.tool import _SYSLOG_SEVERITY
+                sev_strs = [f"{_SYSLOG_SEVERITY.get(k, str(k))}={v:,}"
+                            for k, v in session.syslog_severity.most_common()]
+                lines.append(f"Severity: {', '.join(sev_strs)}")
+            if session.syslog_patterns:
+                pat_strs = [f"{k}={v:,}" for k, v in session.syslog_patterns.most_common()]
+                lines.append(f"Patterns: {', '.join(pat_strs)}")
+
+        # --- SNMP Activity ---
+        if hasattr(session, "snmp_sources") and session.snmp_sources:
+            lines.append(f"\nSNMP: {sum(session.snmp_sources.values()):,} packets from "
+                         f"{len(session.snmp_sources)} hosts")
+            if session.snmp_communities:
+                lines.append(f"  Communities: {', '.join(session.snmp_communities.keys())}")
+
+        # --- SSH Sessions ---
+        if hasattr(session, "ssh_sessions") and session.ssh_sessions:
+            lines.append(f"\nSSH: {len(session.ssh_sessions)} sessions detected")
+            banners = set(s.get("banner", "") for s in session.ssh_sessions if s.get("banner"))
+            if banners:
+                lines.append(f"  Banners: {', '.join(sorted(banners)[:5])}")
+
         # --- Standard IT hunts (beacons, lateral, exfil) ---
         hunter = PcapThreatHunter()
 
@@ -3581,6 +3629,67 @@ class PcapAiAnalyzer:
                 sn3, s3 = ranked[2]
                 lines.append(f"  ⚠️  THIRD: {sn3} (score={s3['total_score']}, "
                              f"{len(s3['ips_seen'])} IPs)")
+
+        # --- AD / Windows Protocol Activity ---
+        ad_sections = []
+        if hasattr(session, "kerberos_tickets") and session.kerberos_tickets:
+            kb = session.kerberos_tickets
+            failures = [t for t in kb if t.get("success") is False or t.get("success") == "false"]
+            ad_sections.append(f"Kerberos: {len(kb)} tickets ({len(failures)} failures)")
+            if failures:
+                fail_clients = Counter(t.get("client", "?") for t in failures)
+                for client, cnt in fail_clients.most_common(5):
+                    ad_sections.append(f"  Failed: {client} ({cnt}x)")
+
+        if hasattr(session, "ntlm_auths") and session.ntlm_auths:
+            nt = session.ntlm_auths
+            fails = [a for a in nt if a.get("success") is False or a.get("success") == "false"]
+            ad_sections.append(f"NTLM: {len(nt)} auths ({len(fails)} failures)")
+
+        if hasattr(session, "smb_mappings") and session.smb_mappings:
+            ad_sections.append(f"SMB tree connects: {len(session.smb_mappings)}")
+            shares = Counter(m.get("share", "?") for m in session.smb_mappings)
+            for share, cnt in shares.most_common(5):
+                ad_sections.append(f"  {share} ({cnt}x)")
+
+        if hasattr(session, "smb_files") and session.smb_files:
+            actions = Counter(f.get("action", "?") for f in session.smb_files)
+            ad_sections.append(f"SMB file ops: {len(session.smb_files)} — " +
+                               ", ".join(f"{a}={c}" for a, c in actions.most_common()))
+
+        if hasattr(session, "dce_rpc_calls") and session.dce_rpc_calls:
+            endpoints = Counter(c.get("endpoint", "?") for c in session.dce_rpc_calls)
+            ad_sections.append(f"DCE/RPC: {len(session.dce_rpc_calls)} calls — " +
+                               ", ".join(f"{e}={c}" for e, c in endpoints.most_common(5)))
+
+        if hasattr(session, "ldap_operations") and session.ldap_operations:
+            msg_types = Counter(o.get("message_type", "?") for o in session.ldap_operations)
+            ad_sections.append(f"LDAP: {len(session.ldap_operations)} ops — " +
+                               ", ".join(f"{t}={c}" for t, c in msg_types.most_common(5)))
+
+        if ad_sections:
+            lines.append(f"\n{'=' * 60}")
+            lines.append("ACTIVE DIRECTORY / WINDOWS PROTOCOL ACTIVITY")
+            lines.append(f"{'=' * 60}")
+            for s in ad_sections:
+                lines.append(s)
+
+        # --- Syslog Summary (if present in netops context) ---
+        if hasattr(session, "syslog_total") and session.syslog_total:
+            lines.append(f"\n{'=' * 60}")
+            lines.append("SYSLOG SUMMARY")
+            lines.append(f"{'=' * 60}")
+            lines.append(f"Total messages: {session.syslog_total:,}")
+            if session.syslog_sources:
+                lines.append(f"Sources: {', '.join(sorted(session.syslog_sources.keys())[:10])}")
+            if session.syslog_severity:
+                from plugins.network_forensics.pcap_metadata_summary.tool import _SYSLOG_SEVERITY
+                sev_strs = [f"{_SYSLOG_SEVERITY.get(k, str(k))}={v:,}"
+                            for k, v in session.syslog_severity.most_common()]
+                lines.append(f"Severity: {', '.join(sev_strs)}")
+            if session.syslog_patterns:
+                pat_strs = [f"{k}={v:,}" for k, v in session.syslog_patterns.most_common()]
+                lines.append(f"Patterns: {', '.join(pat_strs)}")
 
         return "\n".join(lines)
 
