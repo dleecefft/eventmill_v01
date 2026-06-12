@@ -76,7 +76,7 @@ gcloud run deploy "${SERVICE_NAME}" \
     --image="${IMAGE_NAME}" \
     --platform=managed \
     --port=8080 \
-    --memory=2Gi \
+    --memory=4Gi \
     --cpu=2 \
     --no-cpu-throttling \
     --min-instances=1 \
