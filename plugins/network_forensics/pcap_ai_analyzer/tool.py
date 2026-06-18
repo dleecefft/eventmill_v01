@@ -2217,14 +2217,13 @@ class PcapAiAnalyzer:
             else:
                 static_output = self._get_static_output(session, mode, payload)
 
-            # Step 1b: Inject BigQuery IP enrichment if available
+            # Step 1b: Inject BigQuery IP enrichment if available (for LLM only, not display)
+            enrichment_block = ""
             try:
                 from plugins.network_forensics.pcap_enrichment.tool import (
                     PcapEnrichment,
                 )
                 enrichment_block = PcapEnrichment.get_enrichment_for_prompt()
-                if enrichment_block:
-                    static_output += "\n\n" + enrichment_block
             except ImportError:
                 pass  # pcap_enrichment not installed — skip silently
 
@@ -2235,11 +2234,17 @@ class PcapAiAnalyzer:
             prompt_template, _, system_identity_override = MODE_CONFIG[mode]
             system_identity = system_identity_override or PCAP_SYSTEM_IDENTITY
             alert_condition = self._get_alert_condition(condition_orange)
+
+            # Combine static output + enrichment for LLM (enrichment is LLM-only context)
+            llm_data = static_output
+            if enrichment_block:
+                llm_data += "\n\n" + enrichment_block
+
             prompt = prompt_template.format(
                 system_identity=system_identity,
                 alert_condition=alert_condition,
                 investigation_context=investigation_context,
-                pcap_summary_data=static_output,
+                pcap_summary_data=llm_data,
             )
 
             # Pre-call token estimate:
@@ -2247,7 +2252,7 @@ class PcapAiAnalyzer:
             # which tokenizes at ~3 chars/token vs ~4 for plain English.
             # Split prompt into template prose vs injected PCAP data for a blended estimate,
             # then apply a 1.4x correction factor — empirically calibrated against actual usage.
-            pcap_data_len = len(static_output)
+            pcap_data_len = len(llm_data)
             prose_len = len(prompt) - pcap_data_len
             est_input_tokens = int(((prose_len // 4) + (pcap_data_len // 3)) * 1.4)
             # Output estimate: structured AI analysis responses run ~50% of input tokens
