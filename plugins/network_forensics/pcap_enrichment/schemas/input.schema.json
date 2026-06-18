@@ -19,6 +19,11 @@
     "ip": {
       "type": "string",
       "description": "Single IP to enrich (for run_single mode)."
+    },
+    "ip_column": {
+      "type": "string",
+      "default": "ip",
+      "description": "Name of the IP address column in the BQ table (e.g. ip_addr, ip_address, src_ip)."
     }
   },
   "required": ["mode"],

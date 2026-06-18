@@ -114,6 +114,13 @@ class PcapEnrichment:
         if mode == "run_single" and not payload.get("ip"):
             errors.append("'--ip' is required for run_single mode.")
 
+        if mode in ("run", "run_single"):
+            ip_col = payload.get("ip_column", "ip")
+            if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", ip_col):
+                errors.append(
+                    f"Invalid --ip-column '{ip_col}'. Must be a valid SQL identifier."
+                )
+
         if errors:
             return ValidationResult(ok=False, errors=errors)
         return ValidationResult(ok=True)
@@ -169,19 +176,22 @@ class PcapEnrichment:
 
         table = payload["table"]
         fields = [f.strip() for f in payload["fields"].split(",") if f.strip()]
+        ip_column = payload.get("ip_column", "ip")
 
-        return self._query_bq(list(all_ips), table, fields)
+        return self._query_bq(list(all_ips), table, fields, ip_column)
 
     def _run_single(self, payload: dict[str, Any]) -> ToolResult:
         """Enrich a single IP."""
         ip = payload["ip"].strip()
         table = payload["table"]
         fields = [f.strip() for f in payload["fields"].split(",") if f.strip()]
+        ip_column = payload.get("ip_column", "ip")
 
-        return self._query_bq([ip], table, fields)
+        return self._query_bq([ip], table, fields, ip_column)
 
     def _query_bq(
-        self, ip_list: list[str], table: str, fields: list[str]
+        self, ip_list: list[str], table: str, fields: list[str],
+        ip_column: str = "ip",
     ) -> ToolResult:
         """Execute the BigQuery enrichment query."""
         global _enrichment_cache
@@ -209,10 +219,10 @@ class PcapEnrichment:
             )
 
         # Build safe query — fields are validated as identifiers, table is validated
-        # ip is always included as the join key
-        select_fields = ["ip"] + [f for f in fields if f != "ip"]
+        # ip_column is always included as the join key, aliased to "ip" in output
+        select_fields = [ip_column] + [f for f in fields if f != ip_column]
         columns_sql = ", ".join(select_fields)
-        query = f"SELECT {columns_sql} FROM `{table}` WHERE ip IN UNNEST(@ip_list)"
+        query = f"SELECT {columns_sql} FROM `{table}` WHERE {ip_column} IN UNNEST(@ip_list)"
 
         # Batch if needed
         all_rows: list[dict[str, Any]] = []
@@ -233,6 +243,9 @@ class PcapEnrichment:
 
                 for row in results:
                     row_dict = dict(row.items())
+                    # Normalize ip column name to "ip" in output
+                    if ip_column != "ip" and ip_column in row_dict:
+                        row_dict["ip"] = row_dict.pop(ip_column)
                     all_rows.append(row_dict)
 
         except Exception as e:
