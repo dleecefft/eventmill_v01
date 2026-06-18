@@ -97,6 +97,29 @@ eventmill
 python -m framework.cli.shell
 ```
 
+### IP Enrichment (BigQuery)
+
+Enrich all IPs from a loaded PCAP with asset/threat data from BigQuery:
+
+```bash
+# After loading a PCAP, enrich IPs from a BQ table
+enrich --table <project.dataset.table> --fields <col1,col2,...> [--ip-column <column_name>]
+
+# Example: OT asset enrichment
+enrich --table ot-asset-inventory.ot2ai_inventory.gold_ot_assets_bqt --ip-column ip_address --fields ot_network,asset_type,criticality,host_name,purdue_level
+
+# Single IP lookup
+enrich --table myproj.dataset.assets --fields hostname,zone --ip 10.1.5.20
+
+# Show cached enrichment / clear cache
+enrich show
+enrich clear
+```
+
+Enrichment data is automatically injected into all `pcap_ai_analyzer` modes (triage, hunt, OT, netops, report).
+
+**Requires:** `pip install eventmill[gcp]` and `roles/bigquery.jobUser` + `roles/bigquery.dataViewer` on the service account.
+
 ---
 
 ## Directory Structure

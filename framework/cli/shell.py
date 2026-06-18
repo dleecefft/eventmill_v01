@@ -1665,8 +1665,31 @@ class EventMillShell(cmd.Cmd):
 
     def complete_enrich(self, text: str, line: str, begidx: int, endidx: int):
         """Tab completion for enrich command."""
-        options = ["--table", "--fields", "--ip-column", "--ip", "show", "clear"]
-        return [o for o in options if o.startswith(text)]
+        parts = line.split()
+
+        # First argument: suggest subcommands or flags
+        if len(parts) <= 1 or (len(parts) == 2 and not line.endswith(" ")):
+            options = ["--table", "--fields", "--ip-column", "--ip", "show", "clear"]
+            return [o for o in options if o.startswith(text)]
+
+        # If 'show' or 'clear' already typed, no further completion
+        if "show" in parts or "clear" in parts:
+            return []
+
+        # Don't suggest already-used flags
+        used_flags = {p for p in parts if p.startswith("--")}
+        all_flags = ["--table", "--fields", "--ip-column", "--ip"]
+        available = [f for f in all_flags if f not in used_flags]
+
+        # If previous token is a flag, don't suggest more flags (user needs to type value)
+        if line.endswith(" ") and parts[-1].startswith("--"):
+            return []
+
+        # Suggest remaining flags
+        if line.endswith(" ") or text.startswith("--"):
+            return [f for f in available if f.startswith(text)]
+
+        return []
 
     def do_artifacts(self, arg: str) -> None:
         """List loaded artifacts in the current session.
@@ -1919,6 +1942,13 @@ class EventMillShell(cmd.Cmd):
             "ioc_types": ["ip", "domain", "hash_md5", "hash_sha1", "hash_sha256",
                           "url", "email", "cve", "mitre_technique"],
             "confidence_threshold": ["low", "medium", "high"],
+        },
+        "pcap_enrichment": {
+            "mode": ["run", "run_single", "show", "clear"],
+            "table": [],
+            "fields": [],
+            "ip_column": [],
+            "ip": [],
         },
     }
 
