@@ -339,6 +339,9 @@ class PcapEnrichment:
         lines = [
             "═══ IP ENRICHMENT (from asset/threat intelligence database) ═══",
             "USE THIS DATA: Cross-reference every IP in your analysis with this enrichment.",
+            "When mentioning an IP, annotate it inline with key context from this table, e.g.:",
+            "  '10.1.5.20 (HMI-PLANT3, OT-L2, criticality: high) communicated with...'",
+            "DO NOT reproduce this table in your output. Use it as reference only.",
             "Identify each IP by its hostname/owner/zone when available. Flag IPs with high",
             "threat_score. IPs NOT FOUND below are unknown and should be treated as suspicious.",
             "Include in your report for each relevant IP: network/subnet, physical location,",

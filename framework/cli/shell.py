@@ -135,6 +135,17 @@ class EventMillShell(cmd.Cmd):
             plugins_path: Path to plugins directory.
         """
         super().__init__()
+
+        # Enable tab completion (readline on Linux/Mac, pyreadline3 on Windows)
+        try:
+            import readline
+            readline.set_completer_delims(" \t\n")
+            if "libedit" in readline.__doc__:
+                readline.parse_and_bind("bind ^I rl_complete")
+            else:
+                readline.parse_and_bind("tab: complete")
+        except (ImportError, AttributeError):
+            pass  # No readline available — completion disabled
         
         # Determine paths
         self.project_root = Path(__file__).resolve().parent.parent.parent
