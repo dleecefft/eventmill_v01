@@ -790,9 +790,52 @@ _ZONE_BG_COLORS = {
 
 
 def _classify_ip_zone(ip: str, session: Any) -> str:
-    """Classify an IP into a Purdue zone based on traffic patterns."""
+    """Classify an IP into a Purdue zone based on enrichment data or traffic patterns."""
     from plugins.network_forensics.pcap_metadata_summary.tool import is_internal
 
+    # Priority 1: Use enrichment data if available (authoritative)
+    try:
+        from plugins.network_forensics.pcap_enrichment.tool import get_enrichment_cache
+        cache = get_enrichment_cache()
+        if cache and ip in cache:
+            row = cache[ip]
+            # Check for purdue_level field (direct zone assignment)
+            purdue = row.get("purdue_level", "").strip().lower()
+            if purdue:
+                # Normalize enrichment values to our zone names
+                purdue_map = {
+                    "0": "CONTROL/FIELD", "1": "CONTROL/FIELD",
+                    "2": "SCADA", "3": "SCADA",
+                    "3.5": "DMZ", "dmz": "DMZ",
+                    "4": "Corporate", "5": "External",
+                    "control": "CONTROL/FIELD", "control/field": "CONTROL/FIELD",
+                    "field": "CONTROL/FIELD",
+                    "scada": "SCADA", "supervisory": "SCADA",
+                    "corporate": "Corporate", "enterprise": "Corporate",
+                    "external": "External", "internet": "External",
+                }
+                zone = purdue_map.get(purdue)
+                if zone:
+                    return zone
+                # Try partial match
+                for key, zone_name in purdue_map.items():
+                    if key in purdue:
+                        return zone_name
+            # Check for ot_network or zone field as fallback
+            ot_net = row.get("ot_network", "").strip().lower()
+            if ot_net:
+                if "scada" in ot_net or "hmi" in ot_net:
+                    return "SCADA"
+                if "control" in ot_net or "field" in ot_net or "plc" in ot_net:
+                    return "CONTROL/FIELD"
+                if "dmz" in ot_net:
+                    return "DMZ"
+                if "corporate" in ot_net or "it" in ot_net or "enterprise" in ot_net:
+                    return "Corporate"
+    except ImportError:
+        pass  # enrichment module not available — fall through to heuristics
+
+    # Priority 2: Port-based heuristics (fallback)
     if not is_internal(ip):
         return "External"
 
