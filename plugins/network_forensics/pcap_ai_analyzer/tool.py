@@ -1618,6 +1618,26 @@ def _export_pdf(
             is_lateral_section = "LATERAL" in sec_title.upper() or "CROSS-ZONE" in sec_title.upper()
             is_ot_activity = ("OT / ICS PROTOCOL ACTIVITY" in sec_title.upper()
                               or "OT/ICS PROTOCOL ACTIVITY" in sec_title.upper())
+            is_scada_tags = "SCADA MESSAGE BUS" in sec_title.upper()
+
+            # --- SCADA Message Bus Tag Data → compact table ---
+            if is_scada_tags:
+                # Render summary lines (Unique tags, Source hosts)
+                for ln in sec_lines:
+                    stripped = ln.strip()
+                    if not stripped:
+                        continue
+                    if stripped.startswith("─") or stripped.startswith("Tag Name"):
+                        continue  # skip text table markers
+                    if stripped.startswith("Unique tags") or stripped.startswith("Source hosts"):
+                        _body_line(stripped, font_size=9, bold=True)
+                        continue
+                    # Parse tabular tag lines
+                    parts = stripped.split()
+                    if len(parts) >= 3 and not stripped.startswith("─"):
+                        # Render as compact data line with smaller font
+                        _data_line(stripped)
+                continue
 
             # --- OT / ICS Protocol Activity → structured tables ---
             if is_ot_activity:
@@ -2662,14 +2682,19 @@ class PcapAiAnalyzer:
             lines.append(f"{'=' * 60}")
             lines.append(f"Unique tags: {len(session.scada_tags):,}")
             if hasattr(session, "scada_tag_sources") and session.scada_tag_sources:
-                lines.append(f"Source hosts: {', '.join(sorted(session.scada_tag_sources.keys())[:10])}")
+                src_hosts = sorted(session.scada_tag_sources.keys())[:10]
+                lines.append(f"Source hosts: {', '.join(src_hosts)}")
+            lines.append("")
+            # Table header
+            lines.append(f"  {'Tag Name':<55s} {'Msgs':>6s}  {'Quality':<8s}  {'Sample Values'}")
+            lines.append(f"  {'─' * 55} {'─' * 6}  {'─' * 8}  {'─' * 40}")
             for tag_name, info in sorted(session.scada_tags.items(),
                                          key=lambda x: x[1]["count"], reverse=True)[:30]:
                 vals = info.get("values_sample", [])
-                val_str = f" | samples: {', '.join(vals[:3])}" if vals else ""
+                val_str = ", ".join(str(v) for v in vals[:3]) if vals else "—"
+                quality = info.get("quality", "?")
                 lines.append(
-                    f"  {tag_name} — {info['count']:,} msgs | "
-                    f"quality={info.get('quality', '?')}{val_str}"
+                    f"  {tag_name:<55s} {info['count']:>6,}  {quality:<8s}  {val_str}"
                 )
 
         # --- Syslog Summary ---
