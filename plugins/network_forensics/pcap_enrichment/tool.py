@@ -337,7 +337,15 @@ class PcapEnrichment:
         separator = "─┼─".join("─" * col_widths[f] for f in all_fields)
 
         lines = [
-            f"═══ IP ENRICHMENT ({len(rows)} IPs matched) ═══",
+            "═══ IP ENRICHMENT (from asset/threat intelligence database) ═══",
+            "USE THIS DATA: Cross-reference every IP in your analysis with this enrichment.",
+            "Identify each IP by its hostname/owner/zone when available. Flag IPs with high",
+            "threat_score. IPs NOT FOUND below are unknown and should be treated as suspicious.",
+            "Include in your report for each relevant IP: network/subnet, physical location,",
+            "description/role, known vulnerabilities, and OS — when this data is present.",
+            "If enrichment provides vulnerability or OS data, always surface it in findings.",
+            "",
+            f"({len(rows)} IPs matched)",
             header,
             separator,
         ]
