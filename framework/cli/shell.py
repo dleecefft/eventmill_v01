@@ -1554,6 +1554,120 @@ class EventMillShell(cmd.Cmd):
         except Exception as e:
             print(f"  ✗ Failed to list Zeek outputs: {e}")
 
+    # -------------------------------------------------------------------
+    # Enrich Command — BigQuery IP Enrichment
+    # -------------------------------------------------------------------
+
+    def do_enrich(self, arg: str) -> None:
+        """Enrich loaded PCAP IPs with BigQuery table data.
+
+        Usage:
+          enrich --table <project.dataset.table> --fields <col1,col2,...> [--ip-column <name>]
+          enrich --table <project.dataset.table> --fields <col1,col2,...> --ip <single_ip>
+          enrich show                    Show cached enrichment
+          enrich clear                   Clear enrichment cache
+
+        Examples:
+          enrich --table myproj.dataset.assets --fields hostname,zone,threat_score
+          enrich --table myproj.dataset.assets --ip-column ip_addr --fields hostname,zone
+          enrich --table myproj.dataset.assets --fields hostname --ip 10.1.5.20
+          enrich show
+          enrich clear
+        """
+        import shlex as _shlex
+
+        arg = arg.strip()
+        if not arg:
+            print("  Usage: enrich --table <table> --fields <fields> [--ip-column <col>]")
+            print("         enrich show | enrich clear")
+            return
+
+        # Handle show/clear subcommands
+        if arg == "show":
+            payload = {"mode": "show"}
+        elif arg == "clear":
+            payload = {"mode": "clear"}
+        else:
+            # Parse flags
+            try:
+                parts = _shlex.split(arg)
+            except ValueError:
+                parts = arg.split()
+
+            payload: dict = {}
+            i = 0
+            while i < len(parts):
+                token = parts[i]
+                if token == "--table" and i + 1 < len(parts):
+                    payload["table"] = parts[i + 1]
+                    i += 2
+                elif token == "--fields" and i + 1 < len(parts):
+                    payload["fields"] = parts[i + 1]
+                    i += 2
+                elif token == "--ip-column" and i + 1 < len(parts):
+                    payload["ip_column"] = parts[i + 1]
+                    i += 2
+                elif token == "--ip" and i + 1 < len(parts):
+                    payload["ip"] = parts[i + 1]
+                    i += 2
+                else:
+                    print(f"  Unknown flag: {token}")
+                    return
+
+            # Determine mode
+            if "ip" in payload:
+                payload["mode"] = "run_single"
+            else:
+                payload["mode"] = "run"
+
+        # Execute via the pcap_enrichment tool
+        try:
+            from plugins.network_forensics.pcap_enrichment.tool import PcapEnrichment
+
+            tool = PcapEnrichment()
+            validation = tool.validate_inputs(payload)
+            if not validation.ok:
+                for err in (validation.errors or []):
+                    print(f"  ✗ {err}")
+                return
+
+            result = tool.execute(payload, context=None)
+
+            if not result.ok:
+                print(f"  ✗ {result.message}")
+                return
+
+            data = result.result or {}
+            mode = data.get("mode", "")
+
+            if mode == "clear":
+                print(f"  ✓ {data.get('message', 'Enrichment cache cleared.')}")
+            elif mode == "show":
+                if "message" in data:
+                    print(f"  {data['message']}")
+                else:
+                    print(data.get("formatted_output", "  No data."))
+            else:
+                total = data.get("total_ips", 0)
+                matched = data.get("matched_ips", 0)
+                unmatched_list = data.get("unmatched_ips", [])
+                print(f"  ✓ Enriched {total} IPs ({matched} matched, {len(unmatched_list)} unknown)")
+                print(f"    Table: {data.get('table', '?')}")
+                print(f"    Fields: {', '.join(data.get('fields', []))}")
+                print()
+                print(data.get("formatted_output", ""))
+
+        except ImportError as e:
+            print(f"  ✗ Missing dependency: {e}")
+            print("    Install with: pip install google-cloud-bigquery")
+        except Exception as e:
+            print(f"  ✗ Enrichment failed: {e}")
+
+    def complete_enrich(self, text: str, line: str, begidx: int, endidx: int):
+        """Tab completion for enrich command."""
+        options = ["--table", "--fields", "--ip-column", "--ip", "show", "clear"]
+        return [o for o in options if o.startswith(text)]
+
     def do_artifacts(self, arg: str) -> None:
         """List loaded artifacts in the current session.
         
