@@ -2154,6 +2154,17 @@ class PcapAiAnalyzer:
             else:
                 static_output = self._get_static_output(session, mode, payload)
 
+            # Step 1b: Inject BigQuery IP enrichment if available
+            try:
+                from plugins.network_forensics.pcap_enrichment.tool import (
+                    PcapEnrichment,
+                )
+                enrichment_block = PcapEnrichment.get_enrichment_for_prompt()
+                if enrichment_block:
+                    static_output += "\n\n" + enrichment_block
+            except ImportError:
+                pass  # pcap_enrichment not installed — skip silently
+
             # Step 2: Load investigation context from any markdown/text artifact
             investigation_context = self._load_investigation_context(context)
 
