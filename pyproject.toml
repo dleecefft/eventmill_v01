@@ -55,6 +55,7 @@ gcp = [
     "google-cloud-secret-manager>=2.16.0",
     "google-cloud-logging>=3.8.0",
     "google-cloud-build>=3.22.0",
+    "google-cloud-bigquery>=3.20.0",
 ]
 plugins-log-analysis = [
     "pdfplumber>=0.10.0",
