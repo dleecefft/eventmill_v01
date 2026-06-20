@@ -1097,6 +1097,8 @@ class EventMillShell(cmd.Cmd):
 
     # Persistent state for tracking Zeek jobs across commands
     _zeek_jobs: dict[str, dict] = {}
+    # Parallel batch tracking: batch_id → list of build_ids
+    _zeek_batches: dict[str, list[str]] = {}
 
     def do_zeek(self, arg: str) -> None:
         """Process a large PCAP with Zeek via Cloud Build.
@@ -1116,8 +1118,11 @@ class EventMillShell(cmd.Cmd):
         Usage:
           zeek <filename_or_gs_uri>                Submit Zeek job and wait
           zeek <filename_or_gs_uri> --async        Submit and return immediately
+          zeek <folder> --parallel                 Submit one job per PCAP in folder (all run at once)
           zeek status [build_id]                   Check job status
+          zeek status --batch [batch_id]           Check all jobs in a parallel batch
           zeek load [folder_name]                  Load Zeek logs (from bucket or gs://)
+          zeek load --merge                        Load and merge all Zeek outputs from latest batch
           zeek jobs                                List submitted jobs
           zeek list                                List available Zeek outputs
 
@@ -1125,15 +1130,19 @@ class EventMillShell(cmd.Cmd):
           zeek massive.pcap                        Resolve from network forensics bucket
           zeek gs://my-bucket/captures/big.pcap    Explicit URI
           zeek massive.pcap --async
+          zeek Dragos_report/ --parallel           Submit all PCAPs in parallel
+          zeek status --batch                      Check parallel batch progress
+          zeek load --merge                        Load all parallel outputs merged
           zeek status
           zeek load massive-20260514-abc12345      Load from zeek-output/ in bucket
           zeek load                                Load most recent Zeek output
           zeek list                                Show available Zeek output folders
         """
         if not arg.strip():
-            print("  Usage: zeek <filename_or_gs_uri> [--async]")
-            print("         zeek status [build_id]")
-            print("         zeek load [folder_name]")
+            print("  Usage: zeek <filename_or_gs_uri> [--async] [--parallel]")
+            print("         zeek <folder> --parallel")
+            print("         zeek status [build_id | --batch]")
+            print("         zeek load [folder_name | --merge]")
             print("         zeek list")
             print("         zeek jobs")
             return
@@ -1142,9 +1151,25 @@ class EventMillShell(cmd.Cmd):
         subcommand = parts[0]
 
         if subcommand == "status":
-            self._zeek_status(parts[1] if len(parts) > 1 else None)
+            if "--batch" in parts:
+                batch_id = None
+                for p in parts[1:]:
+                    if p != "--batch":
+                        batch_id = p
+                        break
+                self._zeek_batch_status(batch_id)
+            else:
+                self._zeek_status(parts[1] if len(parts) > 1 else None)
         elif subcommand == "load":
-            self._zeek_load(parts[1] if len(parts) > 1 else None)
+            if "--merge" in parts:
+                batch_id = None
+                for p in parts[1:]:
+                    if p != "--merge":
+                        batch_id = p
+                        break
+                self._zeek_load_merge(batch_id)
+            else:
+                self._zeek_load(parts[1] if len(parts) > 1 else None)
         elif subcommand == "list":
             self._zeek_list_outputs()
         elif subcommand == "jobs":
@@ -1152,10 +1177,15 @@ class EventMillShell(cmd.Cmd):
         else:
             # It's a PCAP reference — resolve it
             async_mode = "--async" in parts
+            parallel_mode = "--parallel" in parts
             pcap_ref = subcommand
-            pcap_uri = self._zeek_resolve_pcap(pcap_ref)
-            if pcap_uri:
-                self._zeek_submit(pcap_uri, async_mode=async_mode)
+
+            if parallel_mode:
+                self._zeek_submit_parallel(pcap_ref)
+            else:
+                pcap_uri = self._zeek_resolve_pcap(pcap_ref)
+                if pcap_uri:
+                    self._zeek_submit(pcap_uri, async_mode=async_mode)
 
     def _zeek_get_nf_bucket(self) -> str | None:
         """Get the network forensics bucket name from the storage resolver."""
@@ -1289,6 +1319,434 @@ class EventMillShell(cmd.Cmd):
         except Exception as e:
             print(f"  ✗ Failed to submit Zeek job: {e}")
             logger.exception("Zeek submit failed")
+
+    def _zeek_submit_parallel(self, folder_ref: str) -> None:
+        """Submit parallel Zeek jobs — one per PCAP in a folder.
+
+        Each PCAP gets its own Cloud Build machine (E2_HIGHCPU_32),
+        all running simultaneously. GCP quota limits concurrent builds
+        (default 10).
+        """
+        if not os.environ.get("K_SERVICE"):
+            print("  ⚠  Zeek Cloud Build integration requires Cloud Run (GCP).")
+            return
+
+        session = self.session_manager.get_current_session()
+        if not session:
+            print("  No active session. Use 'new' to create one first.")
+            return
+
+        try:
+            from google.cloud import storage as gcs_storage
+            from ..cloud.gcp.zeek import ZeekCloudBuildClient
+
+            gcs_client = gcs_storage.Client()
+            nf_bucket = self._zeek_get_nf_bucket()
+
+            # Resolve folder to a GCS prefix
+            if folder_ref.startswith("gs://"):
+                prefix_clean = folder_ref.replace("gs://", "").rstrip("/")
+                parts = prefix_clean.split("/", 1)
+                bucket_name = parts[0]
+                folder_prefix = (parts[1] + "/") if len(parts) > 1 else ""
+            else:
+                if not nf_bucket:
+                    print("  ✗ No network forensics bucket configured.")
+                    return
+                bucket_name = nf_bucket
+                # Check workspace folder first
+                ws = session.workspace_folder
+                if ws:
+                    folder_prefix = f"{ws}/{folder_ref.rstrip('/')}/"
+                else:
+                    folder_prefix = f"{folder_ref.rstrip('/')}/"
+
+            # List PCAPs in the folder
+            bucket_obj = gcs_client.bucket(bucket_name)
+            blobs = list(bucket_obj.list_blobs(prefix=folder_prefix))
+            pcap_blobs = [
+                b for b in blobs
+                if b.name.lower().endswith((".pcap", ".pcapng", ".cap"))
+                and not b.name.endswith("/")
+            ]
+
+            if not pcap_blobs:
+                print(f"  No PCAP files found in gs://{bucket_name}/{folder_prefix}")
+                if nf_bucket:
+                    print(f"  Check: gsutil ls gs://{nf_bucket}/{folder_prefix}")
+                return
+
+            print(f"  Found {len(pcap_blobs)} PCAPs in gs://{bucket_name}/{folder_prefix}")
+            print()
+
+            # Show what will be submitted
+            total_size = 0
+            for blob in pcap_blobs:
+                size_mb = blob.size / (1024 * 1024) if blob.size else 0
+                total_size += size_mb
+                name = blob.name.rsplit("/", 1)[-1]
+                print(f"    • {name} ({size_mb:.1f} MB)")
+            print(f"\n  Total: {total_size:.1f} MB across {len(pcap_blobs)} files")
+            print(f"  Each gets its own E2_HIGHCPU_32 machine (32 vCPU, 32 GB RAM)")
+            print()
+
+            # Submit all jobs
+            import uuid as _uuid
+            batch_id = _uuid.uuid4().hex[:8]
+            build_ids = []
+
+            zeek_client = ZeekCloudBuildClient()
+
+            for blob in pcap_blobs:
+                pcap_uri = f"gs://{bucket_name}/{blob.name}"
+                pcap_name = blob.name.rsplit("/", 1)[-1]
+
+                try:
+                    job = zeek_client.submit_zeek_job(pcap_uri=pcap_uri)
+                    build_id = job["build_id"]
+                    build_ids.append(build_id)
+                    self._zeek_jobs[build_id] = {**job, "batch_id": batch_id}
+                    print(f"  ✓ Submitted: {pcap_name} → {build_id[:12]}...")
+                except Exception as e:
+                    print(f"  ✗ Failed: {pcap_name} — {e}")
+
+            if build_ids:
+                self._zeek_batches[batch_id] = build_ids
+                print()
+                print(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                print(f"  ✓ Batch {batch_id}: {len(build_ids)}/{len(pcap_blobs)} jobs submitted")
+                print(f"  All running in parallel on separate machines.")
+                print(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                print()
+                print(f"  ⏳ Waiting for all {len(build_ids)} jobs to finish (polling every 30s)...")
+                print(f"  Press Ctrl+C to stop waiting (jobs continue in background).")
+                print()
+
+                log_user_activity("zeek_parallel_submit", {
+                    "batch_id": batch_id,
+                    "job_count": len(build_ids),
+                    "total_size_mb": round(total_size, 1),
+                    "folder": f"gs://{bucket_name}/{folder_prefix}",
+                })
+
+                # Wait for all jobs to complete, then auto-merge
+                try:
+                    self._zeek_wait_and_merge(batch_id, zeek_client)
+                except KeyboardInterrupt:
+                    print()
+                    print(f"  Stopped waiting. Jobs continue in background.")
+                    print(f"  Check progress:  zeek status --batch")
+                    print(f"  Merge later:     zeek load --merge")
+            else:
+                print("  ✗ No jobs submitted successfully.")
+
+        except ImportError as e:
+            print(f"  ✗ Missing dependency: {e}")
+        except Exception as e:
+            print(f"  ✗ Failed to submit parallel jobs: {e}")
+            logger.exception("Zeek parallel submit failed")
+
+    def _zeek_wait_and_merge(self, batch_id: str, zeek_client) -> None:
+        """Poll all jobs in a batch until complete, then auto-merge.
+
+        Raises KeyboardInterrupt if user presses Ctrl+C (caller handles).
+        """
+        import time as _time
+
+        build_ids = self._zeek_batches[batch_id]
+        pending = set(build_ids)
+        completed = set()
+        failed = set()
+        poll_interval = 30
+
+        while pending:
+            _time.sleep(poll_interval)
+
+            for bid in list(pending):
+                try:
+                    status = zeek_client.get_build_status(bid)
+                    s = status.get("status", "UNKNOWN")
+                    self._zeek_jobs[bid] = {**self._zeek_jobs.get(bid, {}), **status}
+
+                    if s == "SUCCESS":
+                        pending.discard(bid)
+                        completed.add(bid)
+                        pcap = self._zeek_jobs[bid].get("pcap_uri", "?").rsplit("/", 1)[-1]
+                        duration = status.get("duration", "?")
+                        print(f"  ✓ Done: {pcap} ({duration})")
+                    elif s in ("FAILURE", "TIMEOUT", "CANCELLED"):
+                        pending.discard(bid)
+                        failed.add(bid)
+                        pcap = self._zeek_jobs[bid].get("pcap_uri", "?").rsplit("/", 1)[-1]
+                        print(f"  ✗ Failed: {pcap} — {s}")
+                except Exception:
+                    pass  # retry next poll cycle
+
+            # Progress line
+            total = len(build_ids)
+            done = len(completed)
+            fail = len(failed)
+            active = len(pending)
+            print(
+                f"\r  Progress: {done}/{total} complete, "
+                f"{active} running, {fail} failed   ",
+                end="", flush=True,
+            )
+
+        print()  # newline after progress
+        print()
+
+        if completed:
+            print(f"  ✓ {len(completed)}/{len(build_ids)} jobs finished successfully.")
+            if failed:
+                print(f"  ⚠  {len(failed)} jobs failed.")
+            print(f"  Merging results...")
+            print()
+            self._zeek_load_merge(batch_id)
+        else:
+            print(f"  ✗ All {len(build_ids)} jobs failed. Check logs:")
+            for bid in failed:
+                log_url = self._zeek_jobs.get(bid, {}).get("log_url", "")
+                if log_url:
+                    print(f"    {bid[:12]}: {log_url}")
+
+    def _zeek_batch_status(self, batch_id: str | None = None) -> None:
+        """Show status of all jobs in a parallel batch."""
+        if not batch_id:
+            if not self._zeek_batches:
+                print("  No parallel batches submitted this session.")
+                return
+            batch_id = list(self._zeek_batches.keys())[-1]
+
+        if batch_id not in self._zeek_batches:
+            print(f"  Batch '{batch_id}' not found.")
+            if self._zeek_batches:
+                print(f"  Available: {', '.join(self._zeek_batches.keys())}")
+            return
+
+        build_ids = self._zeek_batches[batch_id]
+        print(f"  Batch {batch_id}: {len(build_ids)} jobs")
+        print(f"  {'PCAP':35s} {'Status':12s} {'Duration':10s} {'Build ID':15s}")
+        print(f"  {'─' * 35} {'─' * 12} {'─' * 10} {'─' * 15}")
+
+        try:
+            from ..cloud.gcp.zeek import ZeekCloudBuildClient
+
+            client = ZeekCloudBuildClient()
+            completed = 0
+            failed = 0
+
+            for bid in build_ids:
+                job = self._zeek_jobs.get(bid, {})
+                pcap = job.get("pcap_uri", "?").rsplit("/", 1)[-1]
+                if len(pcap) > 35:
+                    pcap = pcap[:32] + "..."
+
+                try:
+                    status = client.get_build_status(bid)
+                    s = status.get("status", "UNKNOWN")
+                    d = status.get("duration", "—")
+                    self._zeek_jobs[bid] = {**job, **status}
+
+                    if s == "SUCCESS":
+                        completed += 1
+                    elif s in ("FAILURE", "TIMEOUT", "CANCELLED"):
+                        failed += 1
+                except Exception:
+                    s = "ERROR"
+                    d = "—"
+
+                print(f"  {pcap:35s} {s:12s} {d:10s} {bid[:15]}")
+
+            print()
+            active = len(build_ids) - completed - failed
+            print(f"  Summary: {completed} done, {active} running, {failed} failed")
+
+            if completed == len(build_ids):
+                print()
+                print(f"  ✓ All jobs complete! Merge results with:")
+                print(f"    zeek load --merge")
+            elif completed + failed == len(build_ids) and failed > 0:
+                print()
+                print(f"  ⚠  Batch finished with {failed} failures.")
+                print(f"  Load successful results: zeek load --merge")
+
+        except ImportError:
+            print("  ✗ google-cloud-build not installed.")
+        except Exception as e:
+            print(f"  ✗ Failed to check batch status: {e}")
+
+    def _zeek_load_merge(self, batch_id: str | None = None) -> None:
+        """Load and merge Zeek logs from all jobs in a parallel batch."""
+        if not self.session_manager.get_current_session():
+            print("  No active session. Use 'new' to create one first.")
+            return
+
+        if not batch_id:
+            if not self._zeek_batches:
+                print("  No parallel batches submitted this session.")
+                print("  Use 'zeek load <folder>' to load a single output.")
+                return
+            batch_id = list(self._zeek_batches.keys())[-1]
+
+        if batch_id not in self._zeek_batches:
+            print(f"  Batch '{batch_id}' not found.")
+            return
+
+        build_ids = self._zeek_batches[batch_id]
+        output_prefixes = []
+
+        for bid in build_ids:
+            job = self._zeek_jobs.get(bid, {})
+            status = job.get("status", "UNKNOWN")
+            output = job.get("output_prefix")
+            if status == "SUCCESS" and output:
+                output_prefixes.append(output)
+
+        if not output_prefixes:
+            print(f"  No completed jobs with outputs found in batch {batch_id}.")
+            print(f"  Check progress: zeek status --batch")
+            return
+
+        print(f"  Merging Zeek logs from {len(output_prefixes)} completed jobs...")
+        print()
+
+        try:
+            from google.cloud import storage as gcs_storage
+            from plugins.network_forensics.pcap_metadata_summary.zeek_loader import parse_zeek_logs
+            from plugins.network_forensics.pcap_metadata_summary.tool import (
+                set_pcap_session, get_pcap_session, is_internal, _format_duration,
+            )
+            import tempfile
+            from pathlib import Path
+
+            gcs_client = gcs_storage.Client()
+            merged_session = None
+
+            for i, output_prefix in enumerate(output_prefixes, 1):
+                prefix_clean = output_prefix.rstrip("/").replace("gs://", "")
+                parts = prefix_clean.split("/", 1)
+                bucket_name = parts[0]
+                prefix_path = (parts[1] + "/") if len(parts) > 1 else ""
+
+                bucket_obj = gcs_client.bucket(bucket_name)
+                blobs = list(bucket_obj.list_blobs(prefix=prefix_path))
+                log_files = [b for b in blobs if b.name.endswith(".log")]
+
+                if not log_files:
+                    print(f"  [{i}/{len(output_prefixes)}] No logs at {output_prefix} — skipping")
+                    continue
+
+                # Download to temp dir
+                local_dir = Path(tempfile.mkdtemp(prefix="eventmill_zeek_merge_"))
+                for blob in log_files:
+                    filename = blob.name.rsplit("/", 1)[-1]
+                    blob.download_to_filename(str(local_dir / filename))
+
+                # Parse this set
+                session = parse_zeek_logs(local_dir)
+
+                # Get PCAP name from job info
+                bid = build_ids[i - 1] if i - 1 < len(build_ids) else None
+                pcap_name = "?"
+                if bid and bid in self._zeek_jobs:
+                    pcap_uri = self._zeek_jobs[bid].get("pcap_uri", "")
+                    pcap_name = pcap_uri.rsplit("/", 1)[-1] if pcap_uri else "?"
+
+                conns = len(session.conversations)
+                ips = len(session.unique_ips)
+                print(f"  [{i}/{len(output_prefixes)}] {pcap_name}: {conns:,} connections, {ips} IPs")
+
+                # Merge into cumulative session
+                if merged_session is None:
+                    merged_session = session
+                else:
+                    # Merge conversations, IPs, DNS, etc.
+                    merged_session.conversations.extend(session.conversations)
+                    merged_session.unique_ips.update(session.unique_ips)
+                    merged_session.unique_macs.update(session.unique_macs)
+                    if hasattr(session, "dns_queries") and session.dns_queries:
+                        merged_session.dns_queries.extend(session.dns_queries)
+                    if hasattr(session, "tls_handshakes") and session.tls_handshakes:
+                        merged_session.tls_handshakes.extend(session.tls_handshakes)
+                    if hasattr(session, "http_requests") and session.http_requests:
+                        merged_session.http_requests.extend(session.http_requests)
+                    if hasattr(session, "ot_transactions") and session.ot_transactions:
+                        merged_session.ot_transactions.extend(session.ot_transactions)
+                    if hasattr(session, "cleartext_creds") and session.cleartext_creds:
+                        merged_session.cleartext_creds.extend(session.cleartext_creds)
+                    if hasattr(session, "stp_bpdus") and session.stp_bpdus:
+                        merged_session.stp_bpdus.extend(session.stp_bpdus)
+                    if hasattr(session, "cdp_neighbors") and session.cdp_neighbors:
+                        merged_session.cdp_neighbors.extend(session.cdp_neighbors)
+                    if hasattr(session, "lldp_neighbors") and session.lldp_neighbors:
+                        merged_session.lldp_neighbors.extend(session.lldp_neighbors)
+                    # Accumulate byte counts
+                    merged_session.bytes_transferred += session.bytes_transferred
+                    # Use the widest time range
+                    if session.start_time and (
+                        not merged_session.start_time
+                        or session.start_time < merged_session.start_time
+                    ):
+                        merged_session.start_time = session.start_time
+                    if session.end_time and (
+                        not merged_session.end_time
+                        or session.end_time > merged_session.end_time
+                    ):
+                        merged_session.end_time = session.end_time
+
+            if not merged_session:
+                print("  ✗ No Zeek logs could be loaded from the batch.")
+                return
+
+            # Recalculate duration
+            if merged_session.start_time and merged_session.end_time:
+                merged_session.duration_seconds = (
+                    merged_session.end_time - merged_session.start_time
+                ).total_seconds()
+
+            merged_session.filename = f"parallel-batch-{batch_id} ({len(output_prefixes)} PCAPs)"
+            set_pcap_session(merged_session)
+
+            # Print merged summary
+            internal = sum(1 for ip in merged_session.unique_ips if is_internal(ip))
+            external = len(merged_session.unique_ips) - internal
+            duration = merged_session.duration_seconds
+
+            print()
+            print(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            print(
+                f"  ✓ Merged: {len(merged_session.conversations):,} connections, "
+                f"{len(merged_session.unique_ips)} IPs ({internal} internal, {external} external)"
+            )
+            print(f"  Duration span: {_format_duration(duration)}")
+            if merged_session.dns_queries:
+                print(f"  DNS queries: {len(merged_session.dns_queries):,}")
+            if merged_session.tls_handshakes:
+                print(f"  TLS handshakes: {len(merged_session.tls_handshakes):,}")
+            if merged_session.ot_transactions:
+                from collections import Counter as _Counter
+                ot_protos = _Counter(t["protocol"] for t in merged_session.ot_transactions)
+                ot_summary = ", ".join(f"{p}:{c}" for p, c in ot_protos.most_common(5))
+                print(f"  OT/ICS protocols: {ot_summary}")
+            print(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            print()
+            print(f"  PCAP session ready — use any pcap tool:")
+            print(f"    run pcap_threat_hunter")
+            print(f"    run pcap_ai_analyzer {{\"mode\": \"threat_hunt\"}}")
+
+            log_user_activity("zeek_load_merge", {
+                "batch_id": batch_id,
+                "jobs_merged": len(output_prefixes),
+                "total_connections": len(merged_session.conversations),
+                "unique_ips": len(merged_session.unique_ips),
+            })
+
+        except ImportError as e:
+            print(f"  ✗ Missing dependency: {e}")
+        except Exception as e:
+            print(f"  ✗ Failed to merge Zeek outputs: {e}")
+            logger.exception("Zeek load merge failed")
 
     def _zeek_status(self, build_id: str | None = None) -> None:
         """Check Zeek job status."""
