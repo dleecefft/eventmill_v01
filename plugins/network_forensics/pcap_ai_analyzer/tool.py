@@ -3053,6 +3053,49 @@ class PcapAiAnalyzer:
             or session.eigrp_total_count > 0
         )
 
+        # Helper: resolve MAC to switch identity from CDP/LLDP
+        def _resolve_switch(mac: str) -> str:
+            """Look up a MAC in CDP/LLDP neighbors; return annotation string or ''."""
+            # CDP/LLDP store by eth source MAC; bridge IDs use format "prio:mac"
+            lookup_mac = mac.split(':', 1)[1] if ':' in mac and len(mac.split(':')) > 6 else mac
+            # Normalize to lowercase for comparison
+            lookup_mac = lookup_mac.lower()
+            # Check CDP neighbors
+            for cdp_mac, info in session.cdp_neighbors.items():
+                if cdp_mac.lower() == lookup_mac:
+                    parts = []
+                    if info.get('device_id'):
+                        parts.append(info['device_id'])
+                    if info.get('platform'):
+                        parts.append(info['platform'])
+                    if info.get('port_id'):
+                        parts.append(info['port_id'])
+                    if info.get('mgmt_ip'):
+                        parts.append(info['mgmt_ip'])
+                    return f" — {', '.join(parts)}" if parts else ''
+            # Check LLDP neighbors
+            for lldp_mac, info in session.lldp_neighbors.items():
+                if lldp_mac.lower() == lookup_mac:
+                    parts = []
+                    if info.get('system_name'):
+                        parts.append(info['system_name'])
+                    if info.get('system_desc'):
+                        parts.append(info['system_desc'])
+                    if info.get('port_id'):
+                        parts.append(info['port_id'])
+                    if info.get('mgmt_ip'):
+                        parts.append(info['mgmt_ip'])
+                    return f" — {', '.join(parts)}" if parts else ''
+            return ''
+
+        def _resolve_bridge_key(bridge_key: str) -> str:
+            """Resolve a bridge key (prio:mac) to switch name."""
+            # Bridge key format: "32769:00:aa:bb:cc:dd:ee" or "8000:00:aa:bb:cc:dd:ee"
+            parts = bridge_key.split(':', 1)
+            if len(parts) == 2:
+                return _resolve_switch(parts[1])
+            return _resolve_switch(bridge_key)
+
         lines.append(f"\n{'=' * 60}")
         lines.append("CONTROL PLANE & TOPOLOGY")
         lines.append(f"{'=' * 60}")
@@ -3157,11 +3200,15 @@ class PcapAiAnalyzer:
                         if len(entry) == 4:
                             ts, vlan, old_root, new_root = entry
                             dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%H:%M:%S.%f')[:-3]
-                            lines.append(f"    {dt} VLAN {vlan}: {old_root} → {new_root}")
+                            old_id = _resolve_bridge_key(old_root)
+                            new_id = _resolve_bridge_key(new_root)
+                            lines.append(f"    {dt} VLAN {vlan}: {old_root}{old_id} → {new_root}{new_id}")
                         else:
                             ts, old_root, new_root = entry
                             dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%H:%M:%S.%f')[:-3]
-                            lines.append(f"    {dt}: {old_root} → {new_root}")
+                            old_id = _resolve_bridge_key(old_root)
+                            new_id = _resolve_bridge_key(new_root)
+                            lines.append(f"    {dt}: {old_root}{old_id} → {new_root}{new_id}")
 
                 if session.stp_tcn_count > 10:
                     lines.append(f"  ⚠️  HIGH TCN COUNT: {session.stp_tcn_count} topology "
@@ -3214,13 +3261,15 @@ class PcapAiAnalyzer:
                 if session.stp_bridges:
                     lines.append(f"  Bridges seen: {len(session.stp_bridges)}")
                     for bridge, count in session.stp_bridges.most_common(10):
-                        lines.append(f"    {bridge}: {count:,} BPDUs")
+                        identity = _resolve_bridge_key(bridge)
+                        lines.append(f"    {bridge}: {count:,} BPDUs{identity}")
 
                 # Source MACs (which switches send BPDUs)
                 if session.stp_src_macs:
                     lines.append(f"  Source switch MACs ({len(session.stp_src_macs)}):")
                     for mac, count in session.stp_src_macs.most_common(10):
-                        lines.append(f"    {mac}: {count:,} BPDUs")
+                        identity = _resolve_switch(mac)
+                        lines.append(f"    {mac}: {count:,} BPDUs{identity}")
 
                 # VLANs
                 if session.stp_vlans:
@@ -3257,7 +3306,8 @@ class PcapAiAnalyzer:
                     for src_mac, gap_start, gap_secs in session.stp_bpdu_gaps[:15]:
                         from datetime import datetime, timezone
                         dt = datetime.fromtimestamp(gap_start, tz=timezone.utc).strftime('%H:%M:%S')
-                        lines.append(f"    {dt}: {src_mac} — {gap_secs}s silence "
+                        identity = _resolve_switch(src_mac)
+                        lines.append(f"    {dt}: {src_mac}{identity} — {gap_secs}s silence "
                                      f"(>{int(gap_secs // 20)}x max_age)")
 
                 # MAC mismatch (spoofing / misconfiguration)
@@ -3270,6 +3320,69 @@ class PcapAiAnalyzer:
                         from datetime import datetime, timezone
                         dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%H:%M:%S.%f')[:-3]
                         lines.append(f"    {dt}: Ethernet src={eth_mac}  BPDU bridge={bpdu_mac}")
+
+                # CDP/LLDP Switch Inventory (from capture)
+                if session.cdp_neighbors or session.lldp_neighbors:
+                    lines.append(f"\n  CDP/LLDP SWITCH INVENTORY (from capture)")
+                    lines.append(f"  {'─' * 40}")
+                    lines.append(f"  CDP frames: {session.cdp_frame_count:,}  |  "
+                                 f"LLDP frames: {session.lldp_frame_count:,}")
+                    # Merge CDP and LLDP into unified view
+                    all_switches: dict[str, dict[str, str]] = {}
+                    for mac, info in session.cdp_neighbors.items():
+                        all_switches[mac] = {
+                            'name': info.get('device_id', ''),
+                            'platform': info.get('platform', ''),
+                            'mgmt_ip': info.get('mgmt_ip', ''),
+                            'port': info.get('port_id', ''),
+                            'software': info.get('software_version', ''),
+                            'capabilities': info.get('capabilities', ''),
+                            'native_vlan': str(info.get('native_vlan', '')),
+                            'source': 'CDP',
+                        }
+                    for mac, info in session.lldp_neighbors.items():
+                        if mac not in all_switches:
+                            all_switches[mac] = {
+                                'name': info.get('system_name', ''),
+                                'platform': info.get('system_desc', ''),
+                                'mgmt_ip': info.get('mgmt_ip', ''),
+                                'port': info.get('port_id', ''),
+                                'software': '',
+                                'capabilities': info.get('capabilities', ''),
+                                'native_vlan': '',
+                                'source': 'LLDP',
+                            }
+                        else:
+                            # Merge LLDP into existing CDP entry (fill gaps)
+                            existing = all_switches[mac]
+                            if not existing['name'] and info.get('system_name'):
+                                existing['name'] = info['system_name']
+                            if not existing['platform'] and info.get('system_desc'):
+                                existing['platform'] = info['system_desc']
+                            if not existing['mgmt_ip'] and info.get('mgmt_ip'):
+                                existing['mgmt_ip'] = info['mgmt_ip']
+                            existing['source'] = 'CDP+LLDP'
+
+                    for mac, sw in all_switches.items():
+                        parts = [f"{mac}"]
+                        if sw['name']:
+                            parts[0] += f" ({sw['name']})"
+                        detail_parts = []
+                        if sw['platform']:
+                            detail_parts.append(f"Platform: {sw['platform']}")
+                        if sw['mgmt_ip']:
+                            detail_parts.append(f"Mgmt: {sw['mgmt_ip']}")
+                        if sw['port']:
+                            detail_parts.append(f"Port: {sw['port']}")
+                        if sw['software']:
+                            detail_parts.append(f"SW: {sw['software']}")
+                        if sw['capabilities']:
+                            detail_parts.append(f"Caps: {sw['capabilities']}")
+                        if sw['native_vlan']:
+                            detail_parts.append(f"Native VLAN: {sw['native_vlan']}")
+                        lines.append(f"    {parts[0]} [{sw['source']}]")
+                        if detail_parts:
+                            lines.append(f"      {' | '.join(detail_parts)}")
 
             # --- HSRP ---
             if session.hsrp_hello_count > 0:

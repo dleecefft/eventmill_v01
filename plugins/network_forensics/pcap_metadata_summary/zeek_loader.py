@@ -131,6 +131,14 @@ def parse_zeek_logs(log_dir: str | Path) -> "PcapSession":
     if stp_path.exists():
         _parse_stp_log(stp_path, session)
 
+    # --- CDP / LLDP switch identity logs ---
+    cdp_path = log_dir / "cdp.log"
+    if cdp_path.exists():
+        _parse_cdp_log(cdp_path, session)
+    lldp_path = log_dir / "lldp.log"
+    if lldp_path.exists():
+        _parse_lldp_log(lldp_path, session)
+
     # --- OT/ICS dedicated protocol logs (icsnpp packages) ---
     _ot_log_parsers: Dict[str, Any] = {
         "modbus.log": _parse_modbus_log,
@@ -678,6 +686,78 @@ def _parse_stp_log(path: Path, session) -> None:
                 if gap > max_age:
                     session.stp_bpdu_gaps.append((mac, ts_sorted[i - 1], round(gap, 1)))
         logger.info("Parsed %d STP BPDUs from Zeek stp.log", count)
+
+
+def _parse_cdp_log(path: Path, session) -> None:
+    """Parse cdp.log — CDP neighbor identity from Zeek (if available).
+
+    Expected fields: ts, src_mac, device_id, platform, port_id,
+    software_version, mgmt_ip, capabilities, native_vlan, vtp_domain, duplex.
+    """
+    count = 0
+    for entry in _read_zeek_json(path):
+        count += 1
+        session.cdp_frame_count += 1
+        src_mac = entry.get("src_mac", "")
+        if not src_mac:
+            continue
+        info = session.cdp_neighbors.get(src_mac, {})
+        if entry.get("device_id"):
+            info['device_id'] = entry["device_id"]
+        if entry.get("platform"):
+            info['platform'] = entry["platform"]
+        if entry.get("port_id"):
+            info['port_id'] = entry["port_id"]
+        if entry.get("software_version"):
+            raw_ver = entry["software_version"]
+            info['software_version'] = raw_ver.split('\n')[0].strip()
+        if entry.get("mgmt_ip"):
+            info['mgmt_ip'] = entry["mgmt_ip"]
+        if entry.get("capabilities"):
+            info['capabilities'] = entry["capabilities"]
+        if entry.get("native_vlan"):
+            info['native_vlan'] = entry["native_vlan"]
+        if entry.get("vtp_domain"):
+            info['vtp_domain'] = entry["vtp_domain"]
+        if entry.get("duplex"):
+            info['duplex'] = entry["duplex"]
+        session.cdp_neighbors[src_mac] = info
+    if count:
+        logger.info("Parsed %d CDP frames from Zeek cdp.log", count)
+
+
+def _parse_lldp_log(path: Path, session) -> None:
+    """Parse lldp.log — LLDP neighbor identity from Zeek (if available).
+
+    Expected fields: ts, src_mac, system_name, system_desc, chassis_id,
+    port_id, port_desc, mgmt_ip, capabilities.
+    """
+    count = 0
+    for entry in _read_zeek_json(path):
+        count += 1
+        session.lldp_frame_count += 1
+        src_mac = entry.get("src_mac", "")
+        if not src_mac:
+            continue
+        info = session.lldp_neighbors.get(src_mac, {})
+        if entry.get("system_name"):
+            info['system_name'] = entry["system_name"]
+        if entry.get("system_desc"):
+            raw_desc = entry["system_desc"]
+            info['system_desc'] = raw_desc.split('\n')[0].strip()
+        if entry.get("chassis_id"):
+            info['chassis_id'] = entry["chassis_id"]
+        if entry.get("port_id"):
+            info['port_id'] = entry["port_id"]
+        if entry.get("port_desc"):
+            info['port_desc'] = entry["port_desc"]
+        if entry.get("mgmt_ip"):
+            info['mgmt_ip'] = entry["mgmt_ip"]
+        if entry.get("capabilities"):
+            info['capabilities'] = entry["capabilities"]
+        session.lldp_neighbors[src_mac] = info
+    if count:
+        logger.info("Parsed %d LLDP frames from Zeek lldp.log", count)
 
 
 # ---------------------------------------------------------------------------

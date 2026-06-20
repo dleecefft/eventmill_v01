@@ -231,6 +231,13 @@ class PcapSession:
         self.stp_bpdu_gaps: List[tuple] = []                 # (src_mac, gap_start_ts, gap_seconds) gaps > max_age
         self.stp_mac_mismatches: List[tuple] = []            # (ts, eth_src_mac, bpdu_bridge_mac) spoofing indicator
 
+        # Control plane — CDP / LLDP (switch identity from PCAP)
+        # Key = source MAC, Value = dict with device details
+        self.cdp_neighbors: Dict[str, Dict[str, Any]] = {}   # mac -> {device_id, platform, mgmt_ip, port_id, software_version, capabilities, native_vlan, vtp_domain, duplex}
+        self.lldp_neighbors: Dict[str, Dict[str, Any]] = {}  # mac -> {system_name, system_desc, mgmt_ip, port_id, port_desc, chassis_id, capabilities}
+        self.cdp_frame_count: int = 0
+        self.lldp_frame_count: int = 0
+
         # Control plane — HSRP
         self.hsrp_hello_count: int = 0
         self.hsrp_events: List[Dict] = []
@@ -577,6 +584,29 @@ try:
     from scapy.packet import Raw
     SCAPY_AVAILABLE = True
 
+    # CDP/LLDP contrib layers for switch identity extraction
+    try:
+        from scapy.contrib.cdp import (CDPv2_HDR, CDPMsgDeviceID, CDPMsgAddr,
+                                        CDPMsgPlatform, CDPMsgPortID,
+                                        CDPMsgSoftwareVersion, CDPMsgCapabilities,
+                                        CDPMsgNativeVLAN, CDPMsgVTPMgmtDomain,
+                                        CDPMsgDuplex)
+        SCAPY_CDP_AVAILABLE = True
+    except ImportError:
+        SCAPY_CDP_AVAILABLE = False
+
+    try:
+        from scapy.contrib.lldp import (LLDPDU, LLDPDUChassisID,
+                                         LLDPDUPortID, LLDPDUTimeToLive,
+                                         LLDPDUSystemName,
+                                         LLDPDUSystemDescription,
+                                         LLDPDUSystemCapabilities,
+                                         LLDPDUManagementAddress,
+                                         LLDPDUPortDescription)
+        SCAPY_LLDP_AVAILABLE = True
+    except ImportError:
+        SCAPY_LLDP_AVAILABLE = False
+
     try:
         from scapy.layers.tls.record import TLS
         from scapy.layers.tls.handshake import TLSClientHello, TLSServerHello
@@ -760,6 +790,116 @@ def parse_pcap_file(file_path: str) -> PcapSession:
                         session.stp_port_states['Learning'] += 1
                     elif not forwarding and not learning:
                         session.stp_port_states['Blocking/Discarding'] += 1
+                except Exception:
+                    pass
+
+            # --- CDP extraction (Cisco Discovery Protocol, L2) ---
+            # CDP dst MAC: 01:00:0c:cc:cc:cc, sent as SNAP with OUI 0x00000c, type 0x2000
+            if SCAPY_CDP_AVAILABLE and pkt.haslayer(CDPv2_HDR):
+                try:
+                    session.cdp_frame_count += 1
+                    eth_src = pkt.src if hasattr(pkt, 'src') else ''
+                    if eth_src:
+                        info: Dict[str, Any] = session.cdp_neighbors.get(eth_src, {})
+                        cdp = pkt[CDPv2_HDR]
+                        if cdp.haslayer(CDPMsgDeviceID):
+                            info['device_id'] = cdp[CDPMsgDeviceID].val.decode('utf-8', errors='replace').strip('\x00')
+                        if cdp.haslayer(CDPMsgPlatform):
+                            info['platform'] = cdp[CDPMsgPlatform].val.decode('utf-8', errors='replace').strip('\x00')
+                        if cdp.haslayer(CDPMsgPortID):
+                            info['port_id'] = cdp[CDPMsgPortID].iface.decode('utf-8', errors='replace').strip('\x00')
+                        if cdp.haslayer(CDPMsgSoftwareVersion):
+                            raw_ver = cdp[CDPMsgSoftwareVersion].val.decode('utf-8', errors='replace').strip('\x00')
+                            # Condense multi-line IOS version to first meaningful line
+                            info['software_version'] = raw_ver.split('\n')[0].strip() if raw_ver else ''
+                        if cdp.haslayer(CDPMsgAddr):
+                            # Extract first IP address from address list
+                            addr_layer = cdp[CDPMsgAddr]
+                            if hasattr(addr_layer, 'addr') and addr_layer.addr:
+                                try:
+                                    first_addr = addr_layer.addr[0]
+                                    if hasattr(first_addr, 'addr'):
+                                        ip_bytes = bytes(first_addr.addr)
+                                        if len(ip_bytes) == 4:
+                                            import socket as _sock
+                                            info['mgmt_ip'] = _sock.inet_ntoa(ip_bytes)
+                                except (IndexError, Exception):
+                                    pass
+                        if cdp.haslayer(CDPMsgCapabilities):
+                            cap_val = cdp[CDPMsgCapabilities].cap
+                            caps = []
+                            if cap_val & 0x01: caps.append('Router')
+                            if cap_val & 0x02: caps.append('TB-Bridge')
+                            if cap_val & 0x04: caps.append('SR-Bridge')
+                            if cap_val & 0x08: caps.append('Switch')
+                            if cap_val & 0x10: caps.append('Host')
+                            if cap_val & 0x20: caps.append('IGMP')
+                            if cap_val & 0x40: caps.append('Repeater')
+                            info['capabilities'] = ', '.join(caps) if caps else ''
+                        if cdp.haslayer(CDPMsgNativeVLAN):
+                            info['native_vlan'] = cdp[CDPMsgNativeVLAN].vlan
+                        if cdp.haslayer(CDPMsgVTPMgmtDomain):
+                            info['vtp_domain'] = cdp[CDPMsgVTPMgmtDomain].val.decode('utf-8', errors='replace').strip('\x00')
+                        if cdp.haslayer(CDPMsgDuplex):
+                            info['duplex'] = 'Full' if cdp[CDPMsgDuplex].duplex else 'Half'
+                        session.cdp_neighbors[eth_src] = info
+                except Exception:
+                    pass
+
+            # --- LLDP extraction (Link Layer Discovery Protocol, L2) ---
+            # LLDP dst MAC: 01:80:c2:00:00:0e, EtherType 0x88cc
+            if SCAPY_LLDP_AVAILABLE and pkt.haslayer(LLDPDU):
+                try:
+                    session.lldp_frame_count += 1
+                    eth_src = pkt.src if hasattr(pkt, 'src') else ''
+                    if eth_src:
+                        info = session.lldp_neighbors.get(eth_src, {})
+                        if pkt.haslayer(LLDPDUSystemName):
+                            info['system_name'] = pkt[LLDPDUSystemName].system_name.decode('utf-8', errors='replace') if isinstance(pkt[LLDPDUSystemName].system_name, bytes) else str(pkt[LLDPDUSystemName].system_name)
+                        if pkt.haslayer(LLDPDUSystemDescription):
+                            raw_desc = pkt[LLDPDUSystemDescription].description.decode('utf-8', errors='replace') if isinstance(pkt[LLDPDUSystemDescription].description, bytes) else str(pkt[LLDPDUSystemDescription].description)
+                            info['system_desc'] = raw_desc.split('\n')[0].strip()
+                        if pkt.haslayer(LLDPDUChassisID):
+                            chassis = pkt[LLDPDUChassisID]
+                            if hasattr(chassis, 'id') and chassis.id:
+                                cid = chassis.id
+                                if isinstance(cid, bytes):
+                                    if len(cid) == 6:
+                                        info['chassis_id'] = ':'.join(f'{b:02x}' for b in cid)
+                                    else:
+                                        info['chassis_id'] = cid.decode('utf-8', errors='replace')
+                                else:
+                                    info['chassis_id'] = str(cid)
+                        if pkt.haslayer(LLDPDUPortID):
+                            port = pkt[LLDPDUPortID]
+                            if hasattr(port, 'id') and port.id:
+                                pid = port.id
+                                info['port_id'] = pid.decode('utf-8', errors='replace') if isinstance(pid, bytes) else str(pid)
+                        if pkt.haslayer(LLDPDUPortDescription):
+                            pd = pkt[LLDPDUPortDescription].description
+                            info['port_desc'] = pd.decode('utf-8', errors='replace') if isinstance(pd, bytes) else str(pd)
+                        if pkt.haslayer(LLDPDUManagementAddress):
+                            mgmt = pkt[LLDPDUManagementAddress]
+                            if hasattr(mgmt, 'management_address'):
+                                addr_bytes = bytes(mgmt.management_address)
+                                if len(addr_bytes) == 4:
+                                    import socket as _sock
+                                    info['mgmt_ip'] = _sock.inet_ntoa(addr_bytes)
+                                elif len(addr_bytes) == 5 and addr_bytes[0] == 1:
+                                    # Subtype 1 (IPv4) prefix
+                                    import socket as _sock
+                                    info['mgmt_ip'] = _sock.inet_ntoa(addr_bytes[1:5])
+                        if pkt.haslayer(LLDPDUSystemCapabilities):
+                            cap_layer = pkt[LLDPDUSystemCapabilities]
+                            if hasattr(cap_layer, 'system_capabilities'):
+                                cap_val = cap_layer.system_capabilities
+                                caps = []
+                                if cap_val & 0x0002: caps.append('Repeater')
+                                if cap_val & 0x0004: caps.append('Bridge')
+                                if cap_val & 0x0010: caps.append('Router')
+                                if cap_val & 0x0040: caps.append('Station')
+                                info['capabilities'] = ', '.join(caps) if caps else ''
+                        session.lldp_neighbors[eth_src] = info
                 except Exception:
                     pass
 
@@ -1301,6 +1441,127 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
                                     session.stp_timers['hello'][hello_time] += 1
                                     session.stp_timers['max_age'][max_age] += 1
                                     session.stp_timers['fwd_delay'][fwd_delay] += 1
+            except Exception:
+                pass
+
+            # --- CDP extraction (dpkt, L2) ---
+            # CDP: 802.3 frame with SNAP, OUI 0x00000c, type 0x2000
+            # Destination MAC: 01:00:0c:cc:cc:cc
+            try:
+                raw = bytes(eth.data) if not isinstance(eth.data, bytes) else eth.data
+                dst_mac_bytes = eth.dst if isinstance(eth.dst, bytes) else b''
+                _cdp_dst = b'\x01\x00\x0c\xcc\xcc\xcc'
+                if dst_mac_bytes == _cdp_dst and len(raw) >= 12 and eth.type <= 1500:
+                    # SNAP header: AA-AA-03 OUI(3) Type(2)
+                    if raw[0:3] == b'\xaa\xaa\x03' and raw[3:6] == b'\x00\x00\x0c' and raw[6:8] == b'\x20\x00':
+                        cdp_data = raw[8:]  # Skip SNAP header
+                        if len(cdp_data) >= 4:
+                            session.cdp_frame_count += 1
+                            src_mac = ':'.join(f'{b:02x}' for b in eth.src)
+                            info: Dict[str, Any] = session.cdp_neighbors.get(src_mac, {})
+                            # CDP format: version(1) + ttl(1) + checksum(2) + TLVs
+                            offset = 4  # skip version, ttl, checksum
+                            while offset + 4 <= len(cdp_data):
+                                tlv_type = int.from_bytes(cdp_data[offset:offset+2], 'big')
+                                tlv_len = int.from_bytes(cdp_data[offset+2:offset+4], 'big')
+                                if tlv_len < 4:
+                                    break
+                                tlv_val = cdp_data[offset+4:offset+tlv_len]
+                                if tlv_type == 0x0001:  # Device ID
+                                    info['device_id'] = tlv_val.decode('utf-8', errors='replace').strip('\x00')
+                                elif tlv_type == 0x0002:  # Addresses
+                                    # Parse first address: num_addrs(4) + proto_type(1) + proto_len(1) + proto(n) + addr_len(2) + addr(4)
+                                    if len(tlv_val) >= 13:
+                                        try:
+                                            proto_len = tlv_val[5]
+                                            addr_offset = 6 + proto_len
+                                            if addr_offset + 2 <= len(tlv_val):
+                                                addr_len = int.from_bytes(tlv_val[addr_offset:addr_offset+2], 'big')
+                                                if addr_len == 4 and addr_offset + 2 + 4 <= len(tlv_val):
+                                                    info['mgmt_ip'] = socket.inet_ntoa(tlv_val[addr_offset+2:addr_offset+6])
+                                        except Exception:
+                                            pass
+                                elif tlv_type == 0x0003:  # Port ID
+                                    info['port_id'] = tlv_val.decode('utf-8', errors='replace').strip('\x00')
+                                elif tlv_type == 0x0004:  # Capabilities
+                                    if len(tlv_val) >= 4:
+                                        cap_val = int.from_bytes(tlv_val[:4], 'big')
+                                        caps = []
+                                        if cap_val & 0x01: caps.append('Router')
+                                        if cap_val & 0x02: caps.append('TB-Bridge')
+                                        if cap_val & 0x04: caps.append('SR-Bridge')
+                                        if cap_val & 0x08: caps.append('Switch')
+                                        if cap_val & 0x10: caps.append('Host')
+                                        if cap_val & 0x20: caps.append('IGMP')
+                                        if cap_val & 0x40: caps.append('Repeater')
+                                        info['capabilities'] = ', '.join(caps) if caps else ''
+                                elif tlv_type == 0x0005:  # Software Version
+                                    raw_ver = tlv_val.decode('utf-8', errors='replace').strip('\x00')
+                                    info['software_version'] = raw_ver.split('\n')[0].strip()
+                                elif tlv_type == 0x0006:  # Platform
+                                    info['platform'] = tlv_val.decode('utf-8', errors='replace').strip('\x00')
+                                elif tlv_type == 0x0009:  # VTP Management Domain
+                                    info['vtp_domain'] = tlv_val.decode('utf-8', errors='replace').strip('\x00')
+                                elif tlv_type == 0x000a:  # Native VLAN
+                                    if len(tlv_val) >= 2:
+                                        info['native_vlan'] = int.from_bytes(tlv_val[:2], 'big')
+                                elif tlv_type == 0x000b:  # Duplex
+                                    info['duplex'] = 'Full' if (tlv_val and tlv_val[0]) else 'Half'
+                                offset += tlv_len
+                            session.cdp_neighbors[src_mac] = info
+            except Exception:
+                pass
+
+            # --- LLDP extraction (dpkt, L2) ---
+            # LLDP: EtherType 0x88cc, dst MAC 01:80:c2:00:00:0e
+            try:
+                if eth.type == 0x88cc:
+                    lldp_data = bytes(eth.data) if not isinstance(eth.data, bytes) else eth.data
+                    if len(lldp_data) >= 2:
+                        session.lldp_frame_count += 1
+                        src_mac = ':'.join(f'{b:02x}' for b in eth.src)
+                        info = session.lldp_neighbors.get(src_mac, {})
+                        # Parse LLDP TLVs: 7-bit type + 9-bit length in first 2 bytes
+                        offset = 0
+                        while offset + 2 <= len(lldp_data):
+                            type_len = int.from_bytes(lldp_data[offset:offset+2], 'big')
+                            tlv_type = type_len >> 9
+                            tlv_len = type_len & 0x01FF
+                            if tlv_type == 0:  # End of LLDPDU
+                                break
+                            tlv_val = lldp_data[offset+2:offset+2+tlv_len]
+                            if tlv_type == 1 and tlv_len > 1:  # Chassis ID
+                                subtype = tlv_val[0]
+                                cid = tlv_val[1:]
+                                if subtype == 4 and len(cid) == 6:  # MAC address
+                                    info['chassis_id'] = ':'.join(f'{b:02x}' for b in cid)
+                                else:
+                                    info['chassis_id'] = cid.decode('utf-8', errors='replace')
+                            elif tlv_type == 2 and tlv_len > 1:  # Port ID
+                                info['port_id'] = tlv_val[1:].decode('utf-8', errors='replace')
+                            elif tlv_type == 4:  # Port Description
+                                info['port_desc'] = tlv_val.decode('utf-8', errors='replace')
+                            elif tlv_type == 5:  # System Name
+                                info['system_name'] = tlv_val.decode('utf-8', errors='replace')
+                            elif tlv_type == 6:  # System Description
+                                raw_desc = tlv_val.decode('utf-8', errors='replace')
+                                info['system_desc'] = raw_desc.split('\n')[0].strip()
+                            elif tlv_type == 7 and tlv_len >= 4:  # System Capabilities
+                                cap_val = int.from_bytes(tlv_val[0:2], 'big')
+                                caps = []
+                                if cap_val & 0x0002: caps.append('Repeater')
+                                if cap_val & 0x0004: caps.append('Bridge')
+                                if cap_val & 0x0010: caps.append('Router')
+                                if cap_val & 0x0040: caps.append('Station')
+                                info['capabilities'] = ', '.join(caps) if caps else ''
+                            elif tlv_type == 8 and tlv_len >= 2:  # Management Address
+                                # Format: addr_len(1) + subtype(1) + addr(n) + ...
+                                addr_str_len = tlv_val[0]
+                                if addr_str_len >= 5 and tlv_val[1] == 1:  # IPv4 subtype
+                                    if len(tlv_val) >= 6:
+                                        info['mgmt_ip'] = socket.inet_ntoa(tlv_val[2:6])
+                            offset += 2 + tlv_len
+                        session.lldp_neighbors[src_mac] = info
             except Exception:
                 pass
 
