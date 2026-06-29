@@ -2174,6 +2174,18 @@ class EventMillShell(cmd.Cmd):
         print()
         print(f"  Coverage: {covered}/{len(all_ips)} IPs mapped to a network")
 
+        # Hint if all networks are assumed (no protocol evidence)
+        if all(e.get("source") == "assumed" for e in sorted_evidence):
+            print()
+            print(f"  ⚠  All networks inferred by default /{session.network_default_mask} assumption.")
+            print(f"  No ARP/DHCP/OSPF/broadcast evidence found in this capture.")
+            print(f"  Possible reasons:")
+            print(f"    - Zeek doesn't produce arp.log by default (L2 protocols not captured)")
+            print(f"    - PCAP captured at L3 (routed SPAN, no L2 headers)")
+            print(f"    - No DHCP/OSPF traffic in the capture window")
+            print(f"  To add your known subnets:")
+            print(f"    networks enrich --table <bq_table> --network-column <col> --fields <fields>")
+
     def _networks_enrich(self, session, args: list) -> None:
         """Enrich networks from a BigQuery table containing subnet info."""
         import shlex as _shlex

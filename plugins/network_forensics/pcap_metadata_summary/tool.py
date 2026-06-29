@@ -1378,6 +1378,16 @@ def _infer_networks_from_evidence(session) -> None:
             ip_obj = ipaddress.IPv4Address(ip_str)
         except Exception:
             continue
+        # Skip non-routable / special addresses
+        if (
+            ip_obj.is_multicast          # 224.0.0.0/4, 239.x.x.x
+            or ip_obj.is_unspecified     # 0.0.0.0
+            or ip_obj.is_loopback        # 127.x.x.x
+            or ip_obj.is_link_local      # 169.254.x.x
+            or ip_str == "255.255.255.255"
+            or ip_str.endswith(".255")   # broadcast addresses
+        ):
+            continue
         # Skip if already covered
         covered = any(ip_obj in net for net in discovered_nets)
         if not covered:
