@@ -2424,6 +2424,54 @@ class EventMillShell(cmd.Cmd):
         except Exception as e:
             print(f"  ✗ Enrichment failed: {e}")
 
+    def complete_networks(self, text: str, line: str, begidx: int, endidx: int):
+        """Tab completion for networks command."""
+        parts = line.split()
+
+        if len(parts) <= 1 or (len(parts) == 2 and not line.endswith(" ")):
+            options = ["enrich", "assume", "export", "clear"]
+            return [o for o in options if o.startswith(text)]
+
+        subcmd = parts[1] if len(parts) > 1 else ""
+
+        if subcmd == "enrich":
+            used_flags = {p for p in parts if p.startswith("--")}
+            all_flags = ["--table", "--network-column", "--fields"]
+            available = [f for f in all_flags if f not in used_flags]
+            if line.endswith(" ") and parts[-1].startswith("--"):
+                return []
+            return [f for f in available if f.startswith(text)]
+
+        if subcmd == "assume":
+            if len(parts) == 2 and line.endswith(" "):
+                return ["/24", "/22", "/16", "/25"]
+            return [m for m in ["/24", "/22", "/16", "/25"] if m.startswith(text)]
+
+        if subcmd == "export":
+            if len(parts) == 2 and line.endswith(" "):
+                return ["json", "csv"]
+            return [f for f in ["json", "csv"] if f.startswith(text)]
+
+        return []
+
+    def complete_zeek(self, text: str, line: str, begidx: int, endidx: int):
+        """Tab completion for zeek command."""
+        parts = line.split()
+
+        if len(parts) <= 1 or (len(parts) == 2 and not line.endswith(" ")):
+            options = ["status", "load", "list", "jobs", "--async", "--parallel"]
+            return [o for o in options if o.startswith(text)]
+
+        subcmd = parts[1] if len(parts) > 1 else ""
+
+        if subcmd == "status" and "--batch" not in parts:
+            return [f for f in ["--batch"] if f.startswith(text)]
+
+        if subcmd == "load" and "--merge" not in parts:
+            return [f for f in ["--merge"] if f.startswith(text)]
+
+        return []
+
     def complete_enrich(self, text: str, line: str, begidx: int, endidx: int):
         """Tab completion for enrich command."""
         parts = line.split()
