@@ -139,6 +139,14 @@ def parse_zeek_logs(log_dir: str | Path) -> "PcapSession":
     if lldp_path.exists():
         _parse_lldp_log(lldp_path, session)
 
+    # --- Network discovery: ARP and DHCP logs ---
+    arp_path = log_dir / "arp.log"
+    if arp_path.exists():
+        _parse_arp_log_networks(arp_path, session)
+    dhcp_path = log_dir / "dhcp.log"
+    if dhcp_path.exists():
+        _parse_dhcp_log_networks(dhcp_path, session)
+
     # --- OT/ICS dedicated protocol logs (icsnpp packages) ---
     _ot_log_parsers: Dict[str, Any] = {
         "modbus.log": _parse_modbus_log,
@@ -207,6 +215,10 @@ def parse_zeek_logs(log_dir: str | Path) -> "PcapSession":
         len(session.unique_ips),
         session.duration_str,
     )
+
+    # --- Post-process: infer networks from collected evidence ---
+    from plugins.network_forensics.pcap_metadata_summary.tool import _infer_networks_from_evidence
+    _infer_networks_from_evidence(session)
 
     return session
 
@@ -1347,3 +1359,95 @@ def _safe_int(val) -> Optional[int]:
         return int(val)
     except (ValueError, TypeError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# Network discovery: ARP and DHCP log parsing for subnet inference
+# ---------------------------------------------------------------------------
+
+
+def _parse_arp_log_networks(path: Path, session) -> None:
+    """Parse arp.log for network evidence.
+
+    Zeek's arp.log (if present) has fields:
+      ts, src_mac, dst_mac, src_addr (IP), dst_addr (IP), who_has, is_at, operation
+
+    We use ARP request/reply IPs to infer broadcast domains. IPs that ARP
+    for each other are on the same L2 segment (same subnet).
+    """
+    arp_ips: set = set()
+    count = 0
+    for entry in _read_zeek_json(path):
+        count += 1
+        src_addr = entry.get("src_addr") or entry.get("orig_h", "")
+        dst_addr = entry.get("dst_addr") or entry.get("who_has", "")
+        if src_addr and src_addr != "0.0.0.0":
+            arp_ips.add(src_addr)
+        if dst_addr and dst_addr != "0.0.0.0":
+            arp_ips.add(dst_addr)
+
+    # Group ARP IPs into inferred subnets based on common /24
+    import ipaddress
+    seen_nets: set = set()
+    for ip_str in arp_ips:
+        try:
+            iface = ipaddress.IPv4Interface(f"{ip_str}/24")
+            net_key = str(iface.network)
+            if net_key not in seen_nets:
+                seen_nets.add(net_key)
+                session.network_evidence.append({
+                    "network": str(iface.network.network_address),
+                    "mask": 24,
+                    "source": "arp",
+                    "evidence": f"ARP activity in {net_key} ({count} ARP frames)",
+                    "confidence": "medium",
+                })
+        except Exception:
+            pass
+
+    if count:
+        logger.info("Parsed ARP log for network discovery: %d frames, %d IPs", count, len(arp_ips))
+
+
+def _parse_dhcp_log_networks(path: Path, session) -> None:
+    """Parse dhcp.log for explicit subnet mask evidence.
+
+    Zeek's dhcp.log fields include:
+      ts, uids, client_addr, server_addr, mac, host_name, assigned_addr,
+      lease_time, subnet_mask, ...
+
+    The subnet_mask field gives us authoritative subnet information.
+    """
+    import ipaddress
+    count = 0
+    for entry in _read_zeek_json(path):
+        subnet_mask = entry.get("subnet_mask", "")
+        assigned_addr = entry.get("assigned_addr", "")
+        msg_types = entry.get("msg_types", [])
+
+        # Only trust Offer/ACK (not Request/Discover)
+        is_server_response = False
+        if isinstance(msg_types, list):
+            is_server_response = any(t in ("OFFER", "ACK") for t in msg_types)
+        elif isinstance(msg_types, str):
+            is_server_response = "OFFER" in msg_types or "ACK" in msg_types
+
+        if subnet_mask and assigned_addr and assigned_addr != "0.0.0.0" and is_server_response:
+            try:
+                mask_int = int(ipaddress.IPv4Address(subnet_mask))
+                prefix_len = bin(mask_int).count('1')
+                iface = ipaddress.IPv4Interface(f"{assigned_addr}/{prefix_len}")
+                net_str = str(iface.network.network_address)
+                session.network_evidence.append({
+                    "network": net_str,
+                    "mask": prefix_len,
+                    "source": "dhcp",
+                    "evidence": f"DHCP mask={subnet_mask} for {assigned_addr}",
+                    "confidence": "high",
+                })
+                count += 1
+            except Exception:
+                pass
+
+    if count:
+        logger.info("Parsed DHCP log for network discovery: %d subnet assignments", count)

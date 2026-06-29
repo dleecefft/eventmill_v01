@@ -2024,6 +2024,286 @@ class EventMillShell(cmd.Cmd):
             print(f"  ✗ Failed to list Zeek outputs: {e}")
 
     # -------------------------------------------------------------------
+    # Networks Command — Subnet Discovery & Inventory
+    # -------------------------------------------------------------------
+
+    def do_networks(self, arg: str) -> None:
+        """Show discovered networks (subnets) from loaded PCAP data.
+
+        Networks are automatically discovered during PCAP parsing from:
+          - OSPF Hello packets (explicit network mask — high confidence)
+          - DHCP Offer/ACK (explicit subnet mask — high confidence)
+          - Directed broadcasts (x.x.x.255 → /24 — medium confidence)
+          - ARP activity (broadcast domain — medium confidence)
+          - Default assumption (/24 for uncovered IPs — low confidence)
+
+        Usage:
+          networks                      Show all discovered networks
+          networks enrich --table <project.dataset.table> --network-column <col> --fields <f1,f2,...>
+          networks assume /<mask>       Change default mask assumption (default: /24)
+          networks export [json|csv]    Export network list
+          networks clear                Clear BQ enrichment overlay
+
+        Examples:
+          networks
+          networks enrich --table ot-asset-inventory.nets.subnets --network-column subnet_cidr --fields site,zone,vlan_id
+          networks assume /22
+          networks export json
+        """
+        from plugins.network_forensics.pcap_metadata_summary.tool import get_pcap_session
+
+        arg = arg.strip()
+        session = get_pcap_session()
+
+        if not session:
+            print("  No PCAP loaded. Use 'load <file>' first.")
+            return
+
+        if not arg:
+            self._networks_show(session)
+            return
+
+        parts = shlex.split(arg)
+        subcmd = parts[0]
+
+        if subcmd == "enrich":
+            self._networks_enrich(session, parts[1:])
+        elif subcmd == "assume":
+            if len(parts) < 2:
+                print(f"  Current default: /{session.network_default_mask}")
+                print(f"  Usage: networks assume /24")
+                return
+            mask_str = parts[1].lstrip("/")
+            try:
+                mask = int(mask_str)
+                if mask < 8 or mask > 30:
+                    print(f"  Invalid mask: /{mask} (must be 8-30)")
+                    return
+                session.network_default_mask = mask
+                # Re-run inference with new assumption
+                from plugins.network_forensics.pcap_metadata_summary.tool import _infer_networks_from_evidence
+                # Clear old assumed entries and re-infer
+                session.network_evidence = [
+                    e for e in session.network_evidence if e.get("source") != "assumed"
+                ]
+                _infer_networks_from_evidence(session)
+                print(f"  ✓ Default mask set to /{mask}. Networks re-inferred.")
+                self._networks_show(session)
+            except ValueError:
+                print(f"  Invalid mask: {parts[1]}")
+        elif subcmd == "export":
+            fmt = parts[1] if len(parts) > 1 else "json"
+            self._networks_export(session, fmt)
+        elif subcmd == "clear":
+            session.network_enrichment = []
+            print("  ✓ Network enrichment cleared.")
+        else:
+            print(f"  Unknown subcommand: {subcmd}")
+            print(f"  Usage: networks [enrich|assume|export|clear]")
+
+    def _networks_show(self, session) -> None:
+        """Display discovered networks in a table."""
+        evidence = session.network_evidence
+        enrichment = session.network_enrichment
+
+        if not evidence:
+            print("  No networks discovered. Load a PCAP first.")
+            return
+
+        # Build enrichment lookup: network/mask → enrichment fields
+        enrich_map: dict[str, dict] = {}
+        if enrichment:
+            import ipaddress
+            for entry in enrichment:
+                cidr = entry.get("cidr", "")
+                if cidr:
+                    enrich_map[cidr] = entry
+
+        # Sort: high confidence first, then medium, then low
+        confidence_order = {"high": 0, "medium": 1, "low": 2}
+        sorted_evidence = sorted(
+            evidence,
+            key=lambda e: (confidence_order.get(e.get("confidence", "low"), 3), e.get("network", "")),
+        )
+
+        # Count by source
+        from collections import Counter
+        source_counts = Counter(e["source"] for e in sorted_evidence)
+
+        print(f"  Discovered {len(sorted_evidence)} networks:")
+        print(f"  Sources: {', '.join(f'{s}:{c}' for s, c in source_counts.most_common())}")
+        print()
+        print(f"  {'Network':20s} {'Mask':5s} {'Source':10s} {'Confidence':10s} Evidence / Enrichment")
+        print(f"  {'─' * 20} {'─' * 5} {'─' * 10} {'─' * 10} {'─' * 45}")
+
+        for entry in sorted_evidence:
+            net = entry.get("network", "?")
+            mask = f"/{entry.get('mask', '?')}"
+            source = entry.get("source", "?")
+            conf = entry.get("confidence", "?")
+            ev = entry.get("evidence", "")
+
+            # Check for enrichment
+            cidr_key = f"{net}{mask}"
+            enrich_info = enrich_map.get(cidr_key, {})
+            if enrich_info:
+                enrich_fields = [f"{k}={v}" for k, v in enrich_info.items() if k != "cidr"]
+                ev = "; ".join(enrich_fields) + f" | {ev}"
+
+            # Truncate evidence for display
+            if len(ev) > 45:
+                ev = ev[:42] + "..."
+
+            print(f"  {net:20s} {mask:5s} {source:10s} {conf:10s} {ev}")
+
+        # Coverage summary
+        import ipaddress
+        all_ips = session.unique_ips
+        covered = 0
+        for ip_str in all_ips:
+            try:
+                ip_obj = ipaddress.IPv4Address(ip_str)
+                for entry in sorted_evidence:
+                    net = ipaddress.IPv4Network(f"{entry['network']}/{entry['mask']}", strict=False)
+                    if ip_obj in net:
+                        covered += 1
+                        break
+            except Exception:
+                pass
+
+        print()
+        print(f"  Coverage: {covered}/{len(all_ips)} IPs mapped to a network")
+
+    def _networks_enrich(self, session, args: list) -> None:
+        """Enrich networks from a BigQuery table containing subnet info."""
+        import shlex as _shlex
+
+        # Parse flags
+        table_name = None
+        network_column = None
+        fields = []
+
+        i = 0
+        while i < len(args):
+            if args[i] == "--table" and i + 1 < len(args):
+                table_name = args[i + 1]
+                i += 2
+            elif args[i] == "--network-column" and i + 1 < len(args):
+                network_column = args[i + 1]
+                i += 2
+            elif args[i] == "--fields" and i + 1 < len(args):
+                fields = [f.strip() for f in args[i + 1].split(",")]
+                i += 2
+            else:
+                i += 1
+
+        if not table_name:
+            print("  Usage: networks enrich --table <project.dataset.table> --network-column <col> --fields <f1,f2>")
+            return
+        if not network_column:
+            print("  --network-column is required (the column containing CIDR like '10.1.5.0/24')")
+            return
+        if not fields:
+            print("  --fields is required (columns to fetch, e.g. site,zone,vlan_id)")
+            return
+
+        try:
+            from google.cloud import bigquery
+
+            client = bigquery.Client()
+
+            # Build query — select network column + requested fields
+            all_columns = [network_column] + fields
+            columns_str = ", ".join(f"`{c}`" for c in all_columns)
+            query = f"SELECT {columns_str} FROM `{table_name}` LIMIT 10000"
+
+            print(f"  Querying BQ: {table_name}...")
+            results = client.query(query).result()
+
+            import ipaddress
+            enrichment_entries = []
+            for row in results:
+                cidr_val = getattr(row, network_column, None) or row[0]
+                if not cidr_val:
+                    continue
+                # Normalize CIDR
+                try:
+                    net = ipaddress.IPv4Network(cidr_val, strict=False)
+                    entry = {"cidr": str(net)}
+                    for field_name in fields:
+                        val = getattr(row, field_name, None)
+                        if val is not None:
+                            entry[field_name] = str(val)
+                    enrichment_entries.append(entry)
+                except Exception:
+                    pass
+
+            session.network_enrichment = enrichment_entries
+            print(f"  ✓ Loaded {len(enrichment_entries)} network entries from BQ")
+            print(f"  Run 'networks' to see enriched view.")
+
+        except ImportError:
+            print("  ✗ google-cloud-bigquery not installed.")
+        except Exception as e:
+            print(f"  ✗ BQ enrichment failed: {e}")
+
+    def _networks_export(self, session, fmt: str) -> None:
+        """Export discovered networks as JSON or CSV."""
+        import json
+
+        evidence = session.network_evidence
+        enrichment = session.network_enrichment
+
+        if not evidence:
+            print("  No networks to export.")
+            return
+
+        # Build enrichment map
+        enrich_map = {}
+        if enrichment:
+            for entry in enrichment:
+                cidr = entry.get("cidr", "")
+                if cidr:
+                    enrich_map[cidr] = entry
+
+        # Merge evidence + enrichment
+        export_data = []
+        for entry in evidence:
+            row = {**entry}
+            cidr_key = f"{entry['network']}/{entry['mask']}"
+            enrich = enrich_map.get(cidr_key, {})
+            if enrich:
+                row["enrichment"] = {k: v for k, v in enrich.items() if k != "cidr"}
+            export_data.append(row)
+
+        if fmt == "json":
+            output = json.dumps(export_data, indent=2)
+            print(output)
+        elif fmt == "csv":
+            # Header
+            base_fields = ["network", "mask", "source", "confidence", "evidence"]
+            # Collect all enrichment fields
+            enrich_fields = set()
+            for row in export_data:
+                if "enrichment" in row:
+                    enrich_fields.update(row["enrichment"].keys())
+            enrich_fields_sorted = sorted(enrich_fields)
+            all_fields = base_fields + enrich_fields_sorted
+
+            print(",".join(all_fields))
+            for row in export_data:
+                values = []
+                for f in base_fields:
+                    v = str(row.get(f, "")).replace(",", ";")
+                    values.append(v)
+                for f in enrich_fields_sorted:
+                    v = str(row.get("enrichment", {}).get(f, "")).replace(",", ";")
+                    values.append(v)
+                print(",".join(values))
+        else:
+            print(f"  Unknown format: {fmt}. Use 'json' or 'csv'.")
+
+    # -------------------------------------------------------------------
     # Enrich Command — BigQuery IP Enrichment
     # -------------------------------------------------------------------
 

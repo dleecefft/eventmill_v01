@@ -272,6 +272,16 @@ class PcapSession:
         self.ip_fragment_count: int = 0
         self.ttl_distribution: Counter = Counter()
 
+        # Network discovery — passive evidence collected during parsing
+        # Each entry: {network: str, mask: int, source: str, evidence: str, confidence: str}
+        # source: "arp", "dhcp", "ospf", "eigrp", "broadcast", "assumed"
+        # confidence: "high" (OSPF/DHCP explicit mask), "medium" (ARP boundary), "low" (assumed)
+        self.network_evidence: List[Dict[str, Any]] = []
+        # BQ enrichment overlay (populated by `networks enrich` command)
+        self.network_enrichment: List[Dict[str, Any]] = []
+        # Default subnet assumption
+        self.network_default_mask: int = 24
+
     @property
     def unique_ips(self) -> set:
         """All unique IPs seen (src + dst)."""
@@ -444,6 +454,10 @@ class PcapSession:
         # IP fragmentation & TTL
         self.ip_fragment_count += other.ip_fragment_count
         self.ttl_distribution += other.ttl_distribution
+
+        # Network discovery evidence
+        self.network_evidence.extend(other.network_evidence)
+        self.network_enrichment.extend(other.network_enrichment)
 
         # --- New protocol fields ---
 
@@ -1132,6 +1146,55 @@ def parse_pcap_file(file_path: str) -> PcapSession:
             # ---------------------------------------------------------------
             # Netops: HSRP extraction (UDP port 1985)
             # ---------------------------------------------------------------
+            # --- Network discovery: DHCP subnet mask (UDP 67/68) ---
+            if proto == "UDP" and dport in (67, 68):
+                try:
+                    from scapy.layers.dhcp import DHCP as ScapyDHCP, BOOTP
+                    if pkt.haslayer(ScapyDHCP):
+                        opts = pkt[ScapyDHCP].options
+                        subnet_mask = None
+                        msg_type = None
+                        for opt in opts:
+                            if isinstance(opt, tuple):
+                                if opt[0] == 'subnet_mask':
+                                    subnet_mask = opt[1]
+                                elif opt[0] == 'message-type':
+                                    msg_type = opt[1]
+                        if subnet_mask and msg_type in (2, 5):  # Offer or ACK
+                            bootp = pkt[BOOTP] if pkt.haslayer(BOOTP) else None
+                            assigned_ip = bootp.yiaddr if bootp else None
+                            if assigned_ip and assigned_ip != "0.0.0.0":
+                                import ipaddress as _ipaddress
+                                mask_int = int(_ipaddress.IPv4Address(subnet_mask))
+                                prefix_len = bin(mask_int).count('1')
+                                iface = _ipaddress.IPv4Interface(f"{assigned_ip}/{prefix_len}")
+                                net_str = str(iface.network.network_address)
+                                session.network_evidence.append({
+                                    "network": net_str,
+                                    "mask": prefix_len,
+                                    "source": "dhcp",
+                                    "evidence": f"DHCP {'Offer' if msg_type == 2 else 'ACK'} mask={subnet_mask} for {assigned_ip}",
+                                    "confidence": "high",
+                                })
+                except Exception:
+                    pass
+
+            # --- Network discovery: directed broadcast detection ---
+            if dst_ip.endswith(".255") and not dst_ip == "255.255.255.255":
+                # x.x.x.255 implies a /24 broadcast
+                import ipaddress as _ipaddress
+                try:
+                    net_str = str(_ipaddress.IPv4Interface(f"{dst_ip}/24").network.network_address)
+                    session.network_evidence.append({
+                        "network": net_str,
+                        "mask": 24,
+                        "source": "broadcast",
+                        "evidence": f"Directed broadcast to {dst_ip}",
+                        "confidence": "medium",
+                    })
+                except Exception:
+                    pass
+
             if pkt.haslayer(ScapyHSRP):
                 try:
                     hsrp = pkt[ScapyHSRP]
@@ -1185,6 +1248,26 @@ def parse_pcap_file(file_path: str) -> PcapSession:
                             session.ospf_hello_count += 1
                             neighbor_key = (src_ip, dst_ip)
                             session.ospf_neighbor_hellos[neighbor_key].append(ts)
+                            # Extract network mask from OSPF Hello (bytes 24-27)
+                            if len(ospf_data) >= 28:
+                                mask_bytes = ospf_data[24:28]
+                                mask_int = int.from_bytes(mask_bytes, 'big')
+                                if mask_int > 0:
+                                    prefix_len = bin(mask_int).count('1')
+                                    # Derive network from src_ip + mask
+                                    import ipaddress as _ipaddress
+                                    try:
+                                        iface = _ipaddress.IPv4Interface(f"{src_ip}/{prefix_len}")
+                                        net_str = str(iface.network.network_address)
+                                        session.network_evidence.append({
+                                            "network": net_str,
+                                            "mask": prefix_len,
+                                            "source": "ospf",
+                                            "evidence": f"OSPF Hello from {router_id} on {src_ip}",
+                                            "confidence": "high",
+                                        })
+                                    except Exception:
+                                        pass
                         elif ospf_type == 2:  # DB Description
                             session.ospf_dbd_count += 1
                         elif ospf_type == 3:  # LS Request
@@ -1224,6 +1307,9 @@ def parse_pcap_file(file_path: str) -> PcapSession:
     # --- Post-process: detect BPDU starvation (gaps > max_age per source port) ---
     _compute_stp_bpdu_gaps(session)
 
+    # --- Post-process: infer networks from collected evidence ---
+    _infer_networks_from_evidence(session)
+
     return session
 
 
@@ -1247,6 +1333,70 @@ def _compute_stp_bpdu_gaps(session) -> None:
             gap = ts_sorted[i] - ts_sorted[i - 1]
             if gap > max_age:
                 session.stp_bpdu_gaps.append((src_mac, ts_sorted[i - 1], round(gap, 1)))
+
+
+def _infer_networks_from_evidence(session) -> None:
+    """Deduplicate network evidence and infer /24 for uncovered IPs.
+
+    Processes raw evidence (from OSPF, DHCP, broadcasts) into a deduplicated
+    set. Then for any IP in session.unique_ips not covered by discovered
+    networks, assumes the configured default mask (/24 by default).
+    """
+    import ipaddress
+
+    if not session.network_evidence and not session.unique_ips:
+        return
+
+    # Deduplicate: keep highest-confidence evidence per network
+    confidence_rank = {"high": 3, "medium": 2, "low": 1}
+    seen: dict[str, dict] = {}  # "network/mask" → best evidence entry
+
+    for entry in session.network_evidence:
+        key = f"{entry['network']}/{entry['mask']}"
+        existing = seen.get(key)
+        if not existing or confidence_rank.get(entry.get("confidence", "low"), 0) > confidence_rank.get(existing.get("confidence", "low"), 0):
+            seen[key] = entry
+
+    # Replace with deduplicated list
+    session.network_evidence = list(seen.values())
+
+    # Build set of discovered networks for coverage check
+    discovered_nets = []
+    for entry in session.network_evidence:
+        try:
+            net = ipaddress.IPv4Network(f"{entry['network']}/{entry['mask']}", strict=False)
+            discovered_nets.append(net)
+        except Exception:
+            pass
+
+    # Find IPs not covered by any discovered network → assume default mask
+    default_mask = session.network_default_mask
+    assumed_nets: set[str] = set()
+
+    for ip_str in session.unique_ips:
+        try:
+            ip_obj = ipaddress.IPv4Address(ip_str)
+        except Exception:
+            continue
+        # Skip if already covered
+        covered = any(ip_obj in net for net in discovered_nets)
+        if not covered:
+            # Assume default mask
+            try:
+                iface = ipaddress.IPv4Interface(f"{ip_str}/{default_mask}")
+                net_key = str(iface.network)
+                if net_key not in assumed_nets:
+                    assumed_nets.add(net_key)
+                    net_addr = str(iface.network.network_address)
+                    session.network_evidence.append({
+                        "network": net_addr,
+                        "mask": default_mask,
+                        "source": "assumed",
+                        "evidence": f"Default /{default_mask} assumption",
+                        "confidence": "low",
+                    })
+            except Exception:
+                pass
 
 
 DPKT_AVAILABLE = False
@@ -1783,6 +1933,69 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
                     })
 
             # ---------------------------------------------------------------
+            # Network discovery: DHCP subnet mask (UDP 67/68) — dpkt
+            # ---------------------------------------------------------------
+            if proto == "UDP" and dport in (67, 68):
+                try:
+                    dhcp_data = bytes(ip.data.data) if hasattr(ip.data, 'data') else b''
+                    # BOOTP header is 236 bytes, then magic cookie (4), then options
+                    if len(dhcp_data) >= 240:
+                        # Check magic cookie
+                        if dhcp_data[236:240] == b'\x63\x82\x53\x63':
+                            yiaddr = socket.inet_ntoa(dhcp_data[16:20])
+                            # Parse DHCP options
+                            opts_data = dhcp_data[240:]
+                            subnet_mask = None
+                            msg_type = None
+                            i = 0
+                            while i < len(opts_data):
+                                opt_code = opts_data[i]
+                                if opt_code == 255:  # End
+                                    break
+                                if opt_code == 0:  # Pad
+                                    i += 1
+                                    continue
+                                if i + 1 >= len(opts_data):
+                                    break
+                                opt_len = opts_data[i + 1]
+                                opt_val = opts_data[i + 2:i + 2 + opt_len]
+                                if opt_code == 1 and opt_len == 4:  # Subnet mask
+                                    subnet_mask = socket.inet_ntoa(opt_val)
+                                elif opt_code == 53 and opt_len == 1:  # Message type
+                                    msg_type = opt_val[0]
+                                i += 2 + opt_len
+                            if subnet_mask and msg_type in (2, 5) and yiaddr != "0.0.0.0":
+                                import ipaddress as _ipaddress
+                                mask_int = int(_ipaddress.IPv4Address(subnet_mask))
+                                prefix_len = bin(mask_int).count('1')
+                                iface = _ipaddress.IPv4Interface(f"{yiaddr}/{prefix_len}")
+                                net_str = str(iface.network.network_address)
+                                session.network_evidence.append({
+                                    "network": net_str,
+                                    "mask": prefix_len,
+                                    "source": "dhcp",
+                                    "evidence": f"DHCP {'Offer' if msg_type == 2 else 'ACK'} mask={subnet_mask} for {yiaddr}",
+                                    "confidence": "high",
+                                })
+                except Exception:
+                    pass
+
+            # --- Network discovery: directed broadcast detection (dpkt) ---
+            if dst_ip.endswith(".255") and dst_ip != "255.255.255.255":
+                import ipaddress as _ipaddress
+                try:
+                    net_str = str(_ipaddress.IPv4Interface(f"{dst_ip}/24").network.network_address)
+                    session.network_evidence.append({
+                        "network": net_str,
+                        "mask": 24,
+                        "source": "broadcast",
+                        "evidence": f"Directed broadcast to {dst_ip}",
+                        "confidence": "medium",
+                    })
+                except Exception:
+                    pass
+
+            # ---------------------------------------------------------------
             # Netops: HSRP extraction (UDP port 1985)
             # ---------------------------------------------------------------
             if proto == "UDP" and dport == 1985:
@@ -1840,6 +2053,25 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
                             session.ospf_hello_count += 1
                             neighbor_key = (src_ip, dst_ip)
                             session.ospf_neighbor_hellos[neighbor_key].append(ts)
+                            # Extract network mask from OSPF Hello (bytes 24-27)
+                            if len(ospf_data) >= 28:
+                                mask_bytes = ospf_data[24:28]
+                                mask_int = int.from_bytes(mask_bytes, 'big')
+                                if mask_int > 0:
+                                    prefix_len = bin(mask_int).count('1')
+                                    import ipaddress as _ipaddress
+                                    try:
+                                        iface = _ipaddress.IPv4Interface(f"{src_ip}/{prefix_len}")
+                                        net_str = str(iface.network.network_address)
+                                        session.network_evidence.append({
+                                            "network": net_str,
+                                            "mask": prefix_len,
+                                            "source": "ospf",
+                                            "evidence": f"OSPF Hello from {router_id} on {src_ip}",
+                                            "confidence": "high",
+                                        })
+                                    except Exception:
+                                        pass
                         elif ospf_type == 2:  # DB Description
                             session.ospf_dbd_count += 1
                         elif ospf_type == 3:  # LS Request
@@ -1877,6 +2109,9 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
 
     # --- Post-process: detect BPDU starvation (gaps > max_age per source port) ---
     _compute_stp_bpdu_gaps(session)
+
+    # --- Post-process: infer networks from collected evidence ---
+    _infer_networks_from_evidence(session)
 
     return session
 
