@@ -2208,6 +2208,16 @@ class PcapAiAnalyzer:
             condition_orange = context.config.get("condition_orange", False)
 
         try:
+            # Step 0: If focus_ips specified, create a filtered session view
+            focus_ips_raw = payload.get("focus_ips", "")
+            if focus_ips_raw:
+                focus_ips = set(
+                    ip.strip() for ip in focus_ips_raw.split(",") if ip.strip()
+                )
+                session = self._filter_session_by_ips(session, focus_ips)
+                logger.info("Focus IPs filter: %d IPs → %d conversations",
+                            len(focus_ips), len(session.conversations))
+
             # Step 1: Get static output (OT modes get OT-enriched summary,
             #         NetOps modes get network health summary)
             if is_ot_mode:
@@ -2387,6 +2397,112 @@ class PcapAiAnalyzer:
     # -------------------------------------------------------------------
     # Helpers
     # -------------------------------------------------------------------
+
+    @staticmethod
+    def _filter_session_by_ips(session, focus_ips: set[str]):
+        """Create a filtered copy of the session containing only data involving focus_ips.
+
+        Returns a shallow-copied PcapSession where conversations, DNS, TLS, HTTP,
+        OT transactions, and other per-IP data are filtered to only include entries
+        where at least one of the focus_ips is involved.
+        """
+        import copy
+        from plugins.network_forensics.pcap_metadata_summary.tool import PcapSession
+
+        filtered = copy.copy(session)
+
+        # Conversations: keep only flows where src or dst is in focus_ips
+        filtered.conversations = {}
+        for key, stats in session.conversations.items():
+            src, dst = key[0], key[1]
+            if src in focus_ips or dst in focus_ips:
+                filtered.conversations[key] = stats
+
+        # Recalculate IP counters from filtered conversations
+        from collections import Counter, defaultdict
+        filtered.src_ips = Counter()
+        filtered.dst_ips = Counter()
+        for (src, dst, dport, proto), stats in filtered.conversations.items():
+            filtered.src_ips[src] += stats.get("packets", 1)
+            filtered.dst_ips[dst] += stats.get("packets", 1)
+
+        # DNS queries/responses
+        filtered.dns_queries = [
+            q for q in session.dns_queries
+            if q.get("src") in focus_ips or q.get("dst") in focus_ips
+        ]
+        filtered.dns_responses = [
+            r for r in session.dns_responses
+            if r.get("src") in focus_ips or r.get("dst") in focus_ips
+        ]
+
+        # TLS handshakes
+        filtered.tls_handshakes = [
+            t for t in session.tls_handshakes
+            if t.get("src") in focus_ips or t.get("dst") in focus_ips
+        ]
+
+        # HTTP requests
+        filtered.http_requests = [
+            h for h in session.http_requests
+            if h.get("src") in focus_ips or h.get("dst") in focus_ips
+        ]
+
+        # OT transactions
+        filtered.ot_transactions = [
+            t for t in session.ot_transactions
+            if t.get("src") in focus_ips or t.get("dst") in focus_ips
+        ]
+
+        # Cleartext credentials
+        filtered.cleartext_creds = [
+            c for c in session.cleartext_creds
+            if c.get("src") in focus_ips or c.get("dst") in focus_ips
+        ]
+
+        # ICMP errors
+        filtered.icmp_errors = [
+            e for e in session.icmp_errors
+            if e.get("src") in focus_ips or e.get("dst") in focus_ips
+        ]
+
+        # HSRP / VRRP events
+        filtered.hsrp_events = [
+            e for e in session.hsrp_events if e.get("src") in focus_ips
+        ]
+        filtered.vrrp_events = [
+            e for e in session.vrrp_events if e.get("src") in focus_ips
+        ]
+
+        # SSH sessions
+        filtered.ssh_sessions = [
+            s for s in session.ssh_sessions
+            if s.get("src") in focus_ips or s.get("dst") in focus_ips
+        ]
+
+        # Kerberos / NTLM / SMB / LDAP / DCE-RPC
+        for attr in ("kerberos_tickets", "ntlm_auths", "smb_mappings",
+                      "smb_files", "dce_rpc_calls", "ldap_operations"):
+            filtered_list = [
+                e for e in getattr(session, attr, [])
+                if e.get("src") in focus_ips or e.get("dst") in focus_ips
+            ]
+            setattr(filtered, attr, filtered_list)
+
+        # Conv health
+        filtered.conv_health = defaultdict(lambda: {"rst": 0, "retransmit": 0, "zero_window": 0})
+        for key, health in session.conv_health.items():
+            src, dst = key[0], key[1]
+            if src in focus_ips or dst in focus_ips:
+                filtered.conv_health[key] = health
+
+        # Update filename to indicate filtering
+        ip_list = ", ".join(sorted(focus_ips)[:5])
+        if len(focus_ips) > 5:
+            ip_list += f" (+{len(focus_ips) - 5} more)"
+        filtered.filename = f"{session.filename} [focus: {ip_list}]"
+
+        return filtered
 
     @staticmethod
     def _load_investigation_context(context: Any) -> str:

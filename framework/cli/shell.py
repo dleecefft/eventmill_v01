@@ -2706,6 +2706,7 @@ class EventMillShell(cmd.Cmd):
             ],
             "export_type": ["pdf"],
             "condition_orange": ["true", "false"],
+            "focus_ips": [],
         },
         "pcap_metadata_summary": {
             "mode": ["load", "summary", "conversations", "dns", "http", "tls", "timeline", "ioc", "networks"],
