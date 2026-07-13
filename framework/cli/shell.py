@@ -1674,11 +1674,8 @@ class EventMillShell(cmd.Cmd):
                 print("  ✗ No Zeek logs could be loaded from the batch.")
                 return
 
-            # Recalculate duration (start_time/end_time are epoch floats)
-            if merged_session.start_time and merged_session.end_time:
-                merged_session.duration_seconds = (
-                    merged_session.end_time - merged_session.start_time
-                )
+            # duration_seconds is a @property computed from start_time/end_time
+            # merge_into() already sets the correct time range
 
             merged_session.filename = f"parallel-batch-{batch_id} ({len(output_prefixes)} PCAPs)"
             set_pcap_session(merged_session)
