@@ -48,9 +48,9 @@ steps:
       - '--port'
       - '8080'
       - '--memory'
-      - '2Gi'
+      - '32Gi'
       - '--cpu'
-      - '2'
+      - '8'
       - '--no-cpu-throttling'
       - '--timeout'
       - '3600'
@@ -75,7 +75,7 @@ images:
 
 substitutions:
   _REGION: northamerica-northeast2
-  _BUCKET_PREFIX: ''   # set at submit time: --substitutions=_BUCKET_PREFIX=${GOOGLE_CLOUD_PROJECT}-eventmill
+  _BUCKET_PREFIX: apm0008778-dev-othunt-88-eventmill
 
 options:
   logging: CLOUD_LOGGING_ONLY
