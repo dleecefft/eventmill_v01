@@ -2246,14 +2246,14 @@ class PcapAiAnalyzer:
             alert_condition = self._get_alert_condition(condition_orange)
 
             # Combine static output + enrichment for LLM (enrichment is LLM-only context)
-            llm_data = static_output
+            llm_data = static_output or ""
             if enrichment_block:
                 llm_data += "\n\n" + enrichment_block
 
             prompt = prompt_template.format(
-                system_identity=system_identity,
-                alert_condition=alert_condition,
-                investigation_context=investigation_context,
+                system_identity=system_identity or "",
+                alert_condition=alert_condition or "",
+                investigation_context=investigation_context or "",
                 pcap_summary_data=llm_data,
             )
 
@@ -4011,23 +4011,24 @@ class PcapAiAnalyzer:
         """Build a PCAP context header with key metadata."""
         from plugins.network_forensics.pcap_metadata_summary.tool import is_internal, _format_bytes
 
-        duration = session.duration_seconds
+        duration = session.duration_seconds or 0.0
         internal_ips = [ip for ip in session.unique_ips if is_internal(ip)]
         external_ips = [ip for ip in session.unique_ips if not is_internal(ip)]
 
         lines = [
             "=" * 60,
-            f"PCAP ANALYSIS: {session.filename}",
+            f"PCAP ANALYSIS: {session.filename or 'unknown'}",
             "=" * 60,
         ]
+        packet_count = session.packet_count or 0
         if session.file_size:
             lines.append(
                 f"Size: {_format_bytes(session.file_size)} | "
-                f"Packets: {session.packet_count:,} | Duration: {duration:.1f}s"
+                f"Packets: {packet_count:,} | Duration: {duration:.1f}s"
             )
         else:
             lines.append(
-                f"Packets: {session.packet_count:,} | Duration: {duration:.1f}s"
+                f"Packets: {packet_count:,} | Duration: {duration:.1f}s"
             )
         if getattr(session, "bytes_transferred", 0):
             lines.append(f"Network bytes transferred: {_format_bytes(session.bytes_transferred)}")
