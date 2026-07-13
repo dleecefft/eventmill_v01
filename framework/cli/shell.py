@@ -1178,7 +1178,13 @@ class EventMillShell(cmd.Cmd):
             # It's a PCAP reference — resolve it
             async_mode = "--async" in parts
             parallel_mode = "--parallel" in parts
-            pcap_ref = subcommand
+            # Extract the actual file/folder reference (skip flags)
+            non_flag_parts = [p for p in parts if not p.startswith("--")]
+            pcap_ref = non_flag_parts[0] if non_flag_parts else ""
+
+            if not pcap_ref:
+                print("  Usage: zeek <filename_or_folder> [--parallel] [--async]")
+                return
 
             if parallel_mode:
                 self._zeek_submit_parallel(pcap_ref)
