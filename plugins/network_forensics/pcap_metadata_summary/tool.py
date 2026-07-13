@@ -481,34 +481,19 @@ class PcapSession:
         self.syslog_patterns += other.syslog_patterns
         self.syslog_total += other.syslog_total
 
-        # SSH sessions (cap at 500)
-        remaining = max(0, 500 - len(self.ssh_sessions))
-        self.ssh_sessions.extend(other.ssh_sessions[:remaining])
+        # SSH sessions
+        self.ssh_sessions.extend(other.ssh_sessions)
 
         # SNMP
         self.snmp_communities += other.snmp_communities
         self.snmp_sources += other.snmp_sources
 
-        # AD / Windows protocols (cap at 1000 each)
-        for attr, cap in (
-            ("kerberos_tickets", 1000),
-            ("smb_mappings", 1000),
-            ("smb_files", 1000),
-            ("dce_rpc_calls", 1000),
-            ("ldap_operations", 1000),
-            ("ntlm_auths", 1000),
-        ):
-            mine = getattr(self, attr)
-            remaining = max(0, cap - len(mine))
-            mine.extend(getattr(other, attr)[:remaining])
+        # AD / Windows protocols
+        for attr in ("kerberos_tickets", "smb_mappings", "smb_files",
+                     "dce_rpc_calls", "ldap_operations", "ntlm_auths"):
+            getattr(self, attr).extend(getattr(other, attr))
 
-        # Cap unbounded lists accumulated across files
-        _LIST_CAP = 50_000
-        for attr in ("dns_queries", "dns_responses", "http_requests",
-                      "tls_handshakes", "ot_transactions", "icmp_errors"):
-            lst = getattr(self, attr)
-            if len(lst) > _LIST_CAP:
-                setattr(self, attr, lst[:_LIST_CAP])
+        # No caps — 32GB RAM available on Cloud Run
 
 
 # ---------------------------------------------------------------------------
