@@ -1110,10 +1110,7 @@ def _parse_kerberos_log(path: Path, session) -> None:
     Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
     request_type, client, service, success, error_msg, cipher, ...
     """
-    cap = 500
     for entry in _read_zeek_json(path):
-        if len(session.kerberos_tickets) >= cap:
-            break
         ts = _ts_to_epoch(entry.get("ts"))
         _update_time_range(session, ts)
         id_info = entry.get("id", {})
@@ -1137,10 +1134,7 @@ def _parse_smb_mapping_log(path: Path, session) -> None:
     Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
     path, share_type, native_file_system, ...
     """
-    cap = 500
     for entry in _read_zeek_json(path):
-        if len(session.smb_mappings) >= cap:
-            break
         ts = _ts_to_epoch(entry.get("ts"))
         _update_time_range(session, ts)
         id_info = entry.get("id", {})
@@ -1160,10 +1154,7 @@ def _parse_smb_files_log(path: Path, session) -> None:
 
     Fields: ts, uid, id.orig_h, id.resp_h, action, path, name, size, ...
     """
-    cap = 500
     for entry in _read_zeek_json(path):
-        if len(session.smb_files) >= cap:
-            break
         ts = _ts_to_epoch(entry.get("ts"))
         _update_time_range(session, ts)
         id_info = entry.get("id", {})
@@ -1185,10 +1176,7 @@ def _parse_dce_rpc_log(path: Path, session) -> None:
     Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
     rtt, named_pipe, endpoint, operation, ...
     """
-    cap = 500
     for entry in _read_zeek_json(path):
-        if len(session.dce_rpc_calls) >= cap:
-            break
         ts = _ts_to_epoch(entry.get("ts"))
         _update_time_range(session, ts)
         id_info = entry.get("id", {})
@@ -1252,10 +1240,7 @@ def _parse_ldap_log(path: Path, session) -> None:
     Fields: ts, uid, id.orig_h, id.resp_h, message_type,
     base_object, result_code, result, diagnostic_message, ...
     """
-    cap = 500
     for entry in _read_zeek_json(path):
-        if len(session.ldap_operations) >= cap:
-            break
         ts = _ts_to_epoch(entry.get("ts"))
         _update_time_range(session, ts)
         id_info = entry.get("id", {})
@@ -1276,10 +1261,7 @@ def _parse_ntlm_log(path: Path, session) -> None:
     Fields: ts, uid, id.orig_h, id.resp_h, username, hostname,
     domainname, success, status, ...
     """
-    cap = 500
     for entry in _read_zeek_json(path):
-        if len(session.ntlm_auths) >= cap:
-            break
         ts = _ts_to_epoch(entry.get("ts"))
         _update_time_range(session, ts)
         id_info = entry.get("id", {})
@@ -1301,10 +1283,7 @@ def _parse_ssh_log(path: Path, session) -> None:
     Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
     version, auth_success, auth_attempts, direction, client, server, ...
     """
-    cap = 200
     for entry in _read_zeek_json(path):
-        if len(session.ssh_sessions) >= cap:
-            break
         ts = _ts_to_epoch(entry.get("ts"))
         _update_time_range(session, ts)
         id_info = entry.get("id", {})
