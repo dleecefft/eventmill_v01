@@ -2385,8 +2385,11 @@ class PcapAiAnalyzer:
             )
 
         except Exception as e:
-            logger.error("AI analysis failed: %s", e, exc_info=True)
-            return ToolResult(ok=False, error_code="INTERNAL_ERROR", message=str(e))
+            import traceback as _tb
+            tb_str = _tb.format_exc()
+            logger.error("AI analysis failed: %s\n%s", e, tb_str)
+            # Include traceback in the message so the CLI shows the exact location
+            return ToolResult(ok=False, error_code="INTERNAL_ERROR", message=f"{e}\n{tb_str}")
 
     def summarize_for_llm(self, result: ToolResult) -> str:
         if not result.ok:
