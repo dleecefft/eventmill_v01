@@ -1667,39 +1667,8 @@ class EventMillShell(cmd.Cmd):
                 if merged_session is None:
                     merged_session = session
                 else:
-                    # Merge conversations, IPs, DNS, etc.
-                    merged_session.conversations.extend(session.conversations)
-                    merged_session.unique_ips.update(session.unique_ips)
-                    merged_session.unique_macs.update(session.unique_macs)
-                    if hasattr(session, "dns_queries") and session.dns_queries:
-                        merged_session.dns_queries.extend(session.dns_queries)
-                    if hasattr(session, "tls_handshakes") and session.tls_handshakes:
-                        merged_session.tls_handshakes.extend(session.tls_handshakes)
-                    if hasattr(session, "http_requests") and session.http_requests:
-                        merged_session.http_requests.extend(session.http_requests)
-                    if hasattr(session, "ot_transactions") and session.ot_transactions:
-                        merged_session.ot_transactions.extend(session.ot_transactions)
-                    if hasattr(session, "cleartext_creds") and session.cleartext_creds:
-                        merged_session.cleartext_creds.extend(session.cleartext_creds)
-                    if hasattr(session, "stp_bpdus") and session.stp_bpdus:
-                        merged_session.stp_bpdus.extend(session.stp_bpdus)
-                    if hasattr(session, "cdp_neighbors") and session.cdp_neighbors:
-                        merged_session.cdp_neighbors.extend(session.cdp_neighbors)
-                    if hasattr(session, "lldp_neighbors") and session.lldp_neighbors:
-                        merged_session.lldp_neighbors.extend(session.lldp_neighbors)
-                    # Accumulate byte counts
-                    merged_session.bytes_transferred += session.bytes_transferred
-                    # Use the widest time range
-                    if session.start_time and (
-                        not merged_session.start_time
-                        or session.start_time < merged_session.start_time
-                    ):
-                        merged_session.start_time = session.start_time
-                    if session.end_time and (
-                        not merged_session.end_time
-                        or session.end_time > merged_session.end_time
-                    ):
-                        merged_session.end_time = session.end_time
+                    # Use PcapSession.merge_into() which handles all field types correctly
+                    merged_session.merge_into(session)
 
             if not merged_session:
                 print("  ✗ No Zeek logs could be loaded from the batch.")
