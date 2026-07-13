@@ -2761,7 +2761,7 @@ class PcapAiAnalyzer:
                     )
 
             # Per-protocol function code distribution (Modbus detail)
-            modbus_txns = [t for t in ot if t["protocol"] == "Modbus" and "function_code" in t]
+            modbus_txns = [t for t in ot if t["protocol"] == "Modbus" and t.get("function_code") is not None]
             if modbus_txns:
                 lines.append(f"\nModbus Function Code Distribution ({len(modbus_txns):,} parsed):")
                 func_dist = Counter(
