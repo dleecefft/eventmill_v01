@@ -75,7 +75,7 @@ images:
 
 substitutions:
   _REGION: northamerica-northeast2
-  _BUCKET_PREFIX: apm0008778-dev-othunt-88-eventmill
+  _BUCKET_PREFIX: ''
 
 options:
   logging: CLOUD_LOGGING_ONLY
