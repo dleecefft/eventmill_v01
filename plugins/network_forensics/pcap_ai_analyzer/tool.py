@@ -2250,6 +2250,14 @@ class PcapAiAnalyzer:
             if enrichment_block:
                 llm_data += "\n\n" + enrichment_block
 
+            # Debug: log None variables to diagnose format errors
+            for _vname, _vval in [("system_identity", system_identity),
+                                   ("alert_condition", alert_condition),
+                                   ("investigation_context", investigation_context),
+                                   ("static_output", static_output)]:
+                if _vval is None:
+                    logger.warning("Prompt variable '%s' is None — using empty string", _vname)
+
             prompt = prompt_template.format(
                 system_identity=system_identity or "",
                 alert_condition=alert_condition or "",
