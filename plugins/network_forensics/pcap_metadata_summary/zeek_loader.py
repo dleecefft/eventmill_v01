@@ -813,10 +813,18 @@ def _parse_modbus_log(path: Path, session) -> None:
             func_name = _MODBUS_FUNC_NAMES.get(func_code, f"FC-{func_code}")
         elif isinstance(func_raw, str) and func_raw.strip():
             # icsnpp often stores the function name as a string
+            # e.g. "READ_HOLDING_REGISTERS" or "READ_HOLDING_REGISTERS_EXCEPTION"
             func_name = func_raw
-            # Try to reverse-map to a code for is_write/is_diagnostic
+
+            # Strip _EXCEPTION suffix for lookup (still flag as exception separately)
+            lookup_str = func_raw
+            if lookup_str.upper().endswith("_EXCEPTION"):
+                lookup_str = lookup_str[:-10]  # remove "_EXCEPTION"
+
+            # Try to reverse-map to a numeric code
+            normalized = lookup_str.lower().replace("_", " ")
             for code, name in _MODBUS_FUNC_NAMES.items():
-                if name.lower() == func_raw.lower().replace("_", " "):
+                if name.lower() == normalized:
                     func_code = code
                     break
 
@@ -824,11 +832,15 @@ def _parse_modbus_log(path: Path, session) -> None:
         ot["function_name"] = func_name
         ot["unit_id"] = _safe_int(entry.get("unit_id"))
 
-        # Exception detection
+        # Exception detection — from explicit field OR from _EXCEPTION suffix in func name
         exception_raw = entry.get("exception", "")
-        ot["is_exception"] = bool(exception_raw and exception_raw != "-")
-        if ot["is_exception"]:
+        has_exception_field = bool(exception_raw and exception_raw != "-")
+        has_exception_suffix = isinstance(func_raw, str) and func_raw.upper().endswith("_EXCEPTION")
+        ot["is_exception"] = has_exception_field or has_exception_suffix
+        if has_exception_field:
             ot["exception_code"] = exception_raw
+        elif has_exception_suffix:
+            ot["exception_code"] = "EXCEPTION (from func name)"
 
         ot["is_write"] = func_code in _MODBUS_WRITE_FUNCS if func_code else False
         ot["is_diagnostic"] = func_code in _MODBUS_DIAG_FUNCS if func_code else False
