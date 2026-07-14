@@ -210,9 +210,15 @@ End with:
 
 OT_TRIAGE_PROMPT = """{system_identity}
 {alert_condition}
-{investigation_context}CURRENT TASK:
+{investigation_context}
+CURRENT TASK:
 You are an OT Security Analyst conducting initial triage on a network capture from an
 industrial control system (ICS) / SCADA environment.
+
+CRITICAL MINDSET RULES:
+- Be highly objective. Do not assume "compromise", "attack", or "malice" without definitive proof.
+- In OT, misconfigurations, hardware failures, and network loops are overwhelmingly more common than cyberattacks. You must consider these benign operational causes.
+- Separate observable facts in the PCAP from hypotheses.
 
 SUMMARY DATA:
 {pcap_summary_data}
@@ -220,7 +226,8 @@ SUMMARY DATA:
 ANALYSIS TASKS:
 1. OT PROTOCOL BASELINE: Review ICS protocol transactions (Modbus, DNP3, S7, CIP, OPC-UA,
    BACnet, IEC-104). Identify unexpected function codes, write operations from unusual sources,
-   diagnostic/restart commands, and exception responses.
+   diagnostic/restart commands, and exception responses. (Be sure to correctly identify protocol
+   roles, e.g., master vs. slave, based on traffic flow).
 2. ZONE VIOLATION CHECK: Identify any traffic crossing Purdue Model boundaries — IT subnet
    IPs communicating with control network devices, external IPs reaching ICS ports, or
    unexpected internal-to-internal OT lateral movement.
@@ -229,17 +236,20 @@ ANALYSIS TASKS:
    enable IT-to-OT pivot.
 4. DEVICE INVENTORY ANOMALY: Check for rogue devices — IPs that appear as OT protocol
    sources/destinations but seem unusual (e.g., workstation IPs sending Modbus writes).
-5. PRIORITIZATION: Rank the top 3 findings by severity using OT-specific criteria:
+5. PRIORITIZATION: Rank the top 3 findings by severity using OT-specific criteria (Note: You
+   must evaluate whether anomalies are malicious OR benign operational failures/misconfigurations):
    - CRITICAL: Direct process impact risk (unauthorized writes to PLCs, safety system commands)
    - HIGH: Zone violations, credential exposure, unauthorized access to ICS protocols
-   - MEDIUM: Reconnaissance activity, unusual polling patterns
+   - MEDIUM: Reconnaissance activity, unusual polling patterns, malfunctioning devices
    - LOW: Minor anomalies, informational
-6. SAFETY ASSESSMENT: Could any observed activity lead to physical process manipulation?
+6. SAFETY ASSESSMENT: Assess the risk to the physical process. State clearly whether the
+   evidence points to intentional physical process manipulation, or if it is more likely a
+   benign operational issue (e.g., failed device, misconfiguration, network error).
 
 End with:
 ⚡ TL;DR
-- One-line safety/risk verdict
-- Top 1-3 bullet points: most critical OT-specific findings
+- One-line safety/risk verdict (Must be objective: explicitly state if the cause appears malicious or operational/benign)
+- Top 1-3 bullet points: most critical OT-specific findings (Stick strictly to observable facts, not assumptions)
 """
 
 OT_THREAT_HUNT_PROMPT = """{system_identity}
