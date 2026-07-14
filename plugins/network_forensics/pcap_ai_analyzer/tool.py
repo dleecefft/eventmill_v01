@@ -2275,6 +2275,19 @@ class PcapAiAnalyzer:
                 pcap_summary_data=llm_data,
             )
 
+            # Inject focus scope instruction when --focus-ips is active
+            if focus_ips_raw:
+                focus_instruction = (
+                    f"\n\n⚠️ SCOPE RESTRICTION: This analysis is STRICTLY limited to the following "
+                    f"IP addresses: {focus_ips_raw}\n"
+                    f"Do NOT discuss, reference, or analyze any other IPs. "
+                    f"All findings, conclusions, and recommendations must relate ONLY to these "
+                    f"specific hosts. If an IP not in this list appears in the data, ignore it "
+                    f"unless it is a direct communication partner of a focus IP (and even then, "
+                    f"frame the finding from the perspective of the focus IP).\n"
+                )
+                prompt = focus_instruction + prompt
+
             # Pre-call token estimate:
             # PCAP summaries contain dense structured data (IPs, ports, numbers, JSON)
             # which tokenizes at ~3 chars/token vs ~4 for plain English.
