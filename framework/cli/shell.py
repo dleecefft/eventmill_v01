@@ -1099,6 +1099,8 @@ class EventMillShell(cmd.Cmd):
     _zeek_jobs: dict[str, dict] = {}
     # Parallel batch tracking: batch_id → list of build_ids
     _zeek_batches: dict[str, list[str]] = {}
+    # Zeek list cache: numbered ID → folder path (populated by zeek list)
+    _zeek_list_cache: list[str] = []
 
     def do_zeek(self, arg: str) -> None:
         """Process a large PCAP with Zeek via Cloud Build.
@@ -1162,14 +1164,21 @@ class EventMillShell(cmd.Cmd):
                 self._zeek_status(parts[1] if len(parts) > 1 else None)
         elif subcommand == "load":
             if "--merge" in parts:
-                batch_id = None
-                for p in parts[1:]:
-                    if p != "--merge":
-                        batch_id = p
-                        break
-                self._zeek_load_merge(batch_id)
+                # Collect the selector (IDs or "latest") — everything after "load" that isn't --merge
+                selector_parts = [p for p in parts[1:] if p != "--merge"]
+                selector = selector_parts[0] if selector_parts else None
+                self._zeek_load_merge(selector)
             else:
-                self._zeek_load(parts[1] if len(parts) > 1 else None)
+                ref = parts[1] if len(parts) > 1 else None
+                # Support numeric ID from zeek list
+                if ref and ref.isdigit():
+                    idx = int(ref)
+                    if self._zeek_list_cache and 1 <= idx <= len(self._zeek_list_cache):
+                        ref = self._zeek_list_cache[idx - 1]
+                    else:
+                        print(f"  ID #{idx} not in cache. Run 'zeek list' first.")
+                        return
+                self._zeek_load(ref)
         elif subcommand == "list":
             self._zeek_list_outputs()
         elif subcommand == "jobs":
@@ -1582,39 +1591,90 @@ class EventMillShell(cmd.Cmd):
         except Exception as e:
             print(f"  ✗ Failed to check batch status: {e}")
 
-    def _zeek_load_merge(self, batch_id: str | None = None) -> None:
-        """Load and merge Zeek logs from all jobs in a parallel batch."""
+    def _zeek_load_merge(self, selector: str | None = None) -> None:
+        """Load and merge Zeek logs from selected outputs.
+
+        Selector can be:
+          - None / "latest": auto-pick the most recent set (same timestamp)
+          - "1,2,3,4": comma-separated IDs from 'zeek list'
+          - "1-4": range of IDs
+          - A batch_id (from parallel submission, in-memory)
+        """
         if not self.session_manager.get_current_session():
             print("  No active session. Use 'new' to create one first.")
             return
 
-        if not batch_id:
-            if not self._zeek_batches:
-                print("  No parallel batches submitted this session.")
-                print("  Use 'zeek load <folder>' to load a single output.")
-                return
-            batch_id = list(self._zeek_batches.keys())[-1]
-
-        if batch_id not in self._zeek_batches:
-            print(f"  Batch '{batch_id}' not found.")
-            return
-
-        build_ids = self._zeek_batches[batch_id]
+        # Resolve output prefixes from selector
         output_prefixes = []
+        nf_bucket = self._zeek_get_nf_bucket()
 
-        for bid in build_ids:
-            job = self._zeek_jobs.get(bid, {})
-            status = job.get("status", "UNKNOWN")
-            output = job.get("output_prefix")
-            if status == "SUCCESS" and output:
-                output_prefixes.append(output)
+        # Case 1: In-memory batch state (from parallel submission this session)
+        if selector and selector in self._zeek_batches:
+            build_ids = self._zeek_batches[selector]
+            for bid in build_ids:
+                job = self._zeek_jobs.get(bid, {})
+                if job.get("status") == "SUCCESS" and job.get("output_prefix"):
+                    output_prefixes.append(job["output_prefix"])
+            if not output_prefixes:
+                print(f"  No completed jobs in batch {selector}.")
+                return
+
+        # Case 2: IDs from zeek list cache
+        elif selector and selector not in ("latest", None):
+            # Parse IDs: "1,2,3,4" or "1-4"
+            ids = self._parse_id_selector(selector)
+            if not ids:
+                print(f"  Invalid selector: {selector}")
+                print(f"  Use: zeek load --merge 1,2,3,4  or  zeek load --merge 1-4  or  zeek load --merge latest")
+                return
+
+            # Ensure cache is populated
+            if not self._zeek_list_cache:
+                print("  Run 'zeek list' first to populate the output list.")
+                return
+
+            for idx in ids:
+                if idx < 1 or idx > len(self._zeek_list_cache):
+                    print(f"  Invalid ID #{idx}. Valid range: 1-{len(self._zeek_list_cache)}")
+                    return
+
+            for idx in ids:
+                folder = self._zeek_list_cache[idx - 1]
+                output_prefixes.append(f"gs://{nf_bucket}/zeek-output/{folder}")
+
+        # Case 3: "latest" or no selector — auto-pick most recent set
+        else:
+            if not self._zeek_list_cache:
+                # Try to populate cache
+                self._zeek_list_outputs_silent()
+            if not self._zeek_list_cache:
+                print("  No Zeek outputs found. Run 'zeek list' or submit jobs first.")
+                return
+
+            # Group by timestamp (YYYYMMDD-HHMMSS portion) and pick newest group
+            from collections import defaultdict
+            ts_groups: dict[str, list[str]] = defaultdict(list)
+            for folder in self._zeek_list_cache:
+                parts = folder.rsplit("-", 3)
+                if len(parts) >= 4:
+                    ts_key = f"{parts[1]}-{parts[2]}"  # YYYYMMDD-HHMMSS
+                    ts_groups[ts_key].append(folder)
+                else:
+                    ts_groups["unknown"].append(folder)
+
+            # Pick the group with the most recent timestamp
+            latest_ts = sorted(ts_groups.keys(), reverse=True)[0]
+            latest_folders = ts_groups[latest_ts]
+            for folder in latest_folders:
+                output_prefixes.append(f"gs://{nf_bucket}/zeek-output/{folder}")
+
+            print(f"  Auto-selected latest batch ({latest_ts}): {len(latest_folders)} outputs")
 
         if not output_prefixes:
-            print(f"  No completed jobs with outputs found in batch {batch_id}.")
-            print(f"  Check progress: zeek status --batch")
+            print("  No outputs to merge.")
             return
 
-        print(f"  Merging Zeek logs from {len(output_prefixes)} completed jobs...")
+        print(f"  Merging Zeek logs from {len(output_prefixes)} outputs...")
         print()
 
         try:
@@ -1652,12 +1712,10 @@ class EventMillShell(cmd.Cmd):
                 # Parse this set
                 session = parse_zeek_logs(local_dir)
 
-                # Get PCAP name from job info
-                bid = build_ids[i - 1] if i - 1 < len(build_ids) else None
-                pcap_name = "?"
-                if bid and bid in self._zeek_jobs:
-                    pcap_uri = self._zeek_jobs[bid].get("pcap_uri", "")
-                    pcap_name = pcap_uri.rsplit("/", 1)[-1] if pcap_uri else "?"
+                # Extract PCAP name from folder
+                folder_name = prefix_path.replace("zeek-output/", "").rstrip("/")
+                folder_parts = folder_name.rsplit("-", 3)
+                pcap_name = folder_parts[0] if len(folder_parts) >= 4 else folder_name
 
                 conns = len(session.conversations)
                 ips = len(session.unique_ips)
@@ -1667,17 +1725,13 @@ class EventMillShell(cmd.Cmd):
                 if merged_session is None:
                     merged_session = session
                 else:
-                    # Use PcapSession.merge_into() which handles all field types correctly
                     merged_session.merge_into(session)
 
             if not merged_session:
-                print("  ✗ No Zeek logs could be loaded from the batch.")
+                print("  ✗ No Zeek logs could be loaded.")
                 return
 
-            # duration_seconds is a @property computed from start_time/end_time
-            # merge_into() already sets the correct time range
-
-            merged_session.filename = f"parallel-batch-{batch_id} ({len(output_prefixes)} PCAPs)"
+            merged_session.filename = f"zeek-merge ({len(output_prefixes)} PCAPs)"
             set_pcap_session(merged_session)
 
             # Print merged summary
@@ -1708,8 +1762,7 @@ class EventMillShell(cmd.Cmd):
             print(f"    run pcap_ai_analyzer {{\"mode\": \"threat_hunt\"}}")
 
             log_user_activity("zeek_load_merge", {
-                "batch_id": batch_id,
-                "jobs_merged": len(output_prefixes),
+                "outputs_merged": len(output_prefixes),
                 "total_connections": len(merged_session.conversations),
                 "unique_ips": len(merged_session.unique_ips),
             })
@@ -1717,8 +1770,47 @@ class EventMillShell(cmd.Cmd):
         except ImportError as e:
             print(f"  ✗ Missing dependency: {e}")
         except Exception as e:
+            import traceback as _tb
             print(f"  ✗ Failed to merge Zeek outputs: {e}")
-            logger.exception("Zeek load merge failed")
+            logger.error("Zeek load merge failed: %s", _tb.format_exc())
+
+    def _parse_id_selector(self, selector: str) -> list[int]:
+        """Parse '1,2,3,4' or '1-4' or '1,3-5' into a list of ints."""
+        ids = []
+        for part in selector.split(","):
+            part = part.strip()
+            if "-" in part:
+                try:
+                    start, end = part.split("-", 1)
+                    ids.extend(range(int(start), int(end) + 1))
+                except ValueError:
+                    return []
+            else:
+                try:
+                    ids.append(int(part))
+                except ValueError:
+                    return []
+        return ids
+
+    def _zeek_list_outputs_silent(self) -> None:
+        """Populate _zeek_list_cache without printing (for auto-merge)."""
+        nf_bucket = self._zeek_get_nf_bucket()
+        if not nf_bucket:
+            return
+        try:
+            from google.cloud import storage as gcs_storage
+            client = gcs_storage.Client()
+            bucket = client.bucket(nf_bucket)
+            iterator = bucket.list_blobs(prefix="zeek-output/", delimiter="/")
+            _ = list(iterator)
+            prefixes = sorted(iterator.prefixes, reverse=True)
+            self._zeek_list_cache = []
+            for p in prefixes:
+                folder = p.replace("zeek-output/", "").rstrip("/")
+                if folder:
+                    self._zeek_list_cache.append(folder)
+        except Exception:
+            pass
 
     def _zeek_status(self, build_id: str | None = None) -> None:
         """Check Zeek job status."""
@@ -1959,7 +2051,7 @@ class EventMillShell(cmd.Cmd):
             print(f"  {build_id:40s} {status:12s} {pcap:40s}")
 
     def _zeek_list_outputs(self) -> None:
-        """List available Zeek output folders in the network forensics bucket."""
+        """List available Zeek output folders in the network forensics bucket with IDs."""
         nf_bucket = self._zeek_get_nf_bucket()
         if not nf_bucket:
             print("  ✗ No network forensics bucket configured.")
@@ -1975,20 +2067,46 @@ class EventMillShell(cmd.Cmd):
             iterator = bucket.list_blobs(prefix="zeek-output/", delimiter="/")
             # Consume iterator to populate prefixes
             _ = list(iterator)
-            prefixes = sorted(iterator.prefixes)
+            prefixes = sorted(iterator.prefixes, reverse=True)  # newest first
 
             if not prefixes:
                 print(f"  No Zeek outputs in gs://{nf_bucket}/zeek-output/")
                 print(f"  Submit a job: zeek <filename.pcap>")
                 return
 
-            print(f"  Zeek outputs in gs://{nf_bucket}/zeek-output/:")
-            print(f"  {'Folder':50s} Load command")
-            print(f"  {'─' * 50} {'─' * 40}")
+            # Cache for merge by ID
+            self._zeek_list_cache = []
             for p in prefixes:
                 folder = p.replace("zeek-output/", "").rstrip("/")
                 if folder:
-                    print(f"  {folder:50s} zeek load {folder}")
+                    self._zeek_list_cache.append(folder)
+
+            print(f"  Zeek outputs in gs://{nf_bucket}/zeek-output/ ({len(self._zeek_list_cache)} total):")
+            print(f"  {'#':>3s}  {'PCAP Name':40s} {'Timestamp':18s} Folder")
+            print(f"  {'─' * 3}  {'─' * 40} {'─' * 18} {'─' * 30}")
+
+            for idx, folder in enumerate(self._zeek_list_cache, 1):
+                # Parse folder name: <pcap_name>-<YYYYMMDD>-<HHMMSS>-<hash>
+                parts = folder.rsplit("-", 3)
+                if len(parts) >= 4:
+                    pcap_name = parts[0]
+                    date_str = parts[1]
+                    time_str = parts[2]
+                    ts_display = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]} {time_str[:2]}:{time_str[2:4]}"
+                else:
+                    pcap_name = folder
+                    ts_display = "?"
+
+                if len(pcap_name) > 40:
+                    pcap_name = pcap_name[:37] + "..."
+
+                print(f"  {idx:>3}  {pcap_name:40s} {ts_display:18s} {folder[:30]}")
+
+            print()
+            print(f"  Load single:  zeek load <#>           e.g. zeek load 1")
+            print(f"  Merge multi:  zeek load --merge 1,2,3,4")
+            print(f"  Merge range:  zeek load --merge 1-4")
+            print(f"  Merge latest: zeek load --merge latest")
 
         except ImportError:
             print("  ✗ google-cloud-storage not installed.")
