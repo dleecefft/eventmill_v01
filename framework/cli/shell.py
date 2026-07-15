@@ -2412,16 +2412,35 @@ class EventMillShell(cmd.Cmd):
     def do_enrich(self, arg: str) -> None:
         """Enrich loaded PCAP IPs with BigQuery table data.
 
-        Usage:
-          enrich --table <project.dataset.table> --fields <col1,col2,...> [--ip-column <name>]
-          enrich --table <project.dataset.table> --fields <col1,col2,...> --ip <single_ip>
-          enrich show                    Show cached enrichment
+        Usage (enrich all IPs from loaded PCAP):
+          enrich --table <project.dataset.table> --fields <col1,col2,...> [--ip-column <col>]
+
+        Usage (enrich single IP):
+          enrich --table <project.dataset.table> --fields <col1,col2,...> --ip <address>
+
+        Field mapping (optional — tells the analyzer which column serves which purpose):
+          --name-field <col>     Device hostname/name column (e.g. host_name)
+          --zone-field <col>     Network zone/segment column (e.g. ot_network)
+          --purdue-field <col>   Purdue Model level column  (e.g. purdue_level)
+          --os-field <col>       OS / firmware version column (e.g. os_version)
+          --role-field <col>     Device role/function column (e.g. device_role)
+
+        Subcommands:
+          enrich show                    Show cached enrichment results
           enrich clear                   Clear enrichment cache
 
+        Notes:
+          - --ip-column (default: 'ip') specifies the IP column name in BigQuery table
+          - --ip provides a single IP to enrich (one-off lookups)
+          - Field mappings are optional — without them the LLM still sees all data,
+            but with them the static report sections can annotate IPs with device context
+
         Examples:
-          enrich --table myproj.dataset.assets --fields hostname,zone,threat_score
-          enrich --table myproj.dataset.assets --ip-column ip_addr --fields hostname,zone
-          enrich --table myproj.dataset.assets --fields hostname --ip 10.1.5.20
+          enrich --table proj.dataset.assets --fields hostname,zone --ip-column ip_addr
+          enrich --table proj.dataset.assets --fields ot_network,host_name,os_version,purdue_level \
+                 --ip-column ip_address --name-field host_name --zone-field ot_network \
+                 --purdue-field purdue_level --os-field os_version
+          enrich --table proj.dataset.assets --fields hostname --ip 10.1.5.20
           enrich show
           enrich clear
         """
@@ -2429,8 +2448,9 @@ class EventMillShell(cmd.Cmd):
 
         arg = arg.strip()
         if not arg:
-            print("  Usage: enrich --table <table> --fields <fields> [--ip-column <col>]")
-            print("         enrich show | enrich clear")
+            print("  Usage (all IPs):  enrich --table <table> --fields <fields> [--ip-column <col>]")
+            print("         (single IP): enrich --table <table> --fields <fields> --ip <address>")
+            print("         (cache):    enrich show | enrich clear")
             return
 
         # Handle show/clear subcommands
@@ -2446,6 +2466,7 @@ class EventMillShell(cmd.Cmd):
                 parts = arg.split()
 
             payload: dict = {}
+            field_mappings: dict = {}
             i = 0
             while i < len(parts):
                 token = parts[i]
@@ -2460,6 +2481,21 @@ class EventMillShell(cmd.Cmd):
                     i += 2
                 elif token == "--ip" and i + 1 < len(parts):
                     payload["ip"] = parts[i + 1]
+                    i += 2
+                elif token == "--name-field" and i + 1 < len(parts):
+                    field_mappings["name"] = parts[i + 1]
+                    i += 2
+                elif token == "--zone-field" and i + 1 < len(parts):
+                    field_mappings["zone"] = parts[i + 1]
+                    i += 2
+                elif token == "--purdue-field" and i + 1 < len(parts):
+                    field_mappings["purdue"] = parts[i + 1]
+                    i += 2
+                elif token == "--os-field" and i + 1 < len(parts):
+                    field_mappings["os"] = parts[i + 1]
+                    i += 2
+                elif token == "--role-field" and i + 1 < len(parts):
+                    field_mappings["role"] = parts[i + 1]
                     i += 2
                 else:
                     print(f"  Unknown flag: {token}")
@@ -2488,6 +2524,11 @@ class EventMillShell(cmd.Cmd):
                 print(f"  ✗ {result.message}")
                 return
 
+            # Store field mappings if enrichment succeeded
+            if field_mappings and payload.get("mode") in ("run", "run_single", None):
+                from plugins.network_forensics.pcap_enrichment.tool import set_field_mappings
+                set_field_mappings(field_mappings)
+
             data = result.result or {}
             mode = data.get("mode", "")
 
@@ -2498,6 +2539,13 @@ class EventMillShell(cmd.Cmd):
                     print(f"  {data['message']}")
                 else:
                     print(data.get("formatted_output", "  No data."))
+                # Show active field mappings
+                from plugins.network_forensics.pcap_enrichment.tool import get_field_mappings
+                fm = get_field_mappings()
+                if fm:
+                    print(f"\n  Field mappings:")
+                    for role, col in sorted(fm.items()):
+                        print(f"    --{role}-field → {col}")
             else:
                 total = data.get("total_ips", 0)
                 matched = data.get("matched_ips", 0)
@@ -2505,6 +2553,9 @@ class EventMillShell(cmd.Cmd):
                 print(f"  ✓ Enriched {total} IPs ({matched} matched, {len(unmatched_list)} unknown)")
                 print(f"    Table: {data.get('table', '?')}")
                 print(f"    Fields: {', '.join(data.get('fields', []))}")
+                if field_mappings:
+                    parts_fm = [f"{r}={c}" for r, c in sorted(field_mappings.items())]
+                    print(f"    Mappings: {', '.join(parts_fm)}")
                 print()
                 print(data.get("formatted_output", ""))
 
@@ -2526,7 +2577,7 @@ class EventMillShell(cmd.Cmd):
 
         if subcmd == "enrich":
             used_flags = {p for p in parts if p.startswith("--")}
-            all_flags = ["--table", "--network-column", "--fields"]
+            all_flags = ["--table", "--ip-column", "--ip", "--fields"]
             available = [f for f in all_flags if f not in used_flags]
             if line.endswith(" ") and parts[-1].startswith("--"):
                 return []
@@ -2568,7 +2619,12 @@ class EventMillShell(cmd.Cmd):
 
         # First argument: suggest subcommands or flags
         if len(parts) <= 1 or (len(parts) == 2 and not line.endswith(" ")):
-            options = ["--table", "--fields", "--ip-column", "--ip", "show", "clear"]
+            options = [
+                "--table", "--fields", "--ip-column", "--ip",
+                "--name-field", "--zone-field", "--purdue-field",
+                "--os-field", "--role-field",
+                "show", "clear",
+            ]
             return [o for o in options if o.startswith(text)]
 
         # If 'show' or 'clear' already typed, no further completion
@@ -2577,7 +2633,11 @@ class EventMillShell(cmd.Cmd):
 
         # Don't suggest already-used flags
         used_flags = {p for p in parts if p.startswith("--")}
-        all_flags = ["--table", "--fields", "--ip-column", "--ip"]
+        all_flags = [
+            "--table", "--fields", "--ip-column", "--ip",
+            "--name-field", "--zone-field", "--purdue-field",
+            "--os-field", "--role-field",
+        ]
         available = [f for f in all_flags if f not in used_flags]
 
         # If previous token is a flag, don't suggest more flags (user needs to type value)

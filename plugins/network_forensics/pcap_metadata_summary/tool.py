@@ -272,6 +272,13 @@ class PcapSession:
         self.ip_fragment_count: int = 0
         self.ttl_distribution: Counter = Counter()
 
+        # VLAN 802.1Q tagging analysis
+        self.vlan_ids: Counter = Counter()              # vlan_id -> count of tagged frames
+        self.vlan_to_ips: Dict[int, set] = defaultdict(set)  # vlan_id -> {ips in that vlan}
+        self.vlan_to_ports: Dict[int, set] = defaultdict(set)  # vlan_id -> {(src_mac, dst_mac) pairs}
+        self.untagged_frame_count: int = 0              # frames without 802.1Q tag
+        self.vlan_1_detected: bool = False              # flag if native VLAN 1 in use (config issue)
+
         # Network discovery — passive evidence collected during parsing
         # Each entry: {network: str, mask: int, source: str, evidence: str, confidence: str}
         # source: "arp", "dhcp", "ospf", "eigrp", "broadcast", "assumed"
@@ -454,6 +461,15 @@ class PcapSession:
         # IP fragmentation & TTL
         self.ip_fragment_count += other.ip_fragment_count
         self.ttl_distribution += other.ttl_distribution
+
+        # VLAN tagging analysis
+        self.vlan_ids += other.vlan_ids
+        self.untagged_frame_count += other.untagged_frame_count
+        self.vlan_1_detected = self.vlan_1_detected or other.vlan_1_detected
+        for vlan_id, ips in other.vlan_to_ips.items():
+            self.vlan_to_ips[vlan_id].update(ips)
+        for vlan_id, pairs in other.vlan_to_ports.items():
+            self.vlan_to_ports[vlan_id].update(pairs)
 
         # Network discovery evidence
         self.network_evidence.extend(other.network_evidence)
@@ -901,6 +917,34 @@ def parse_pcap_file(file_path: str) -> PcapSession:
                         session.lldp_neighbors[eth_src] = info
                 except Exception:
                     pass
+
+            # --- 802.1Q VLAN tag extraction (L2) ---
+            vlan_id = None
+            if pkt.haslayer(Dot1Q):
+                try:
+                    dot1q = pkt[Dot1Q]
+                    vlan_id = dot1q.vlan
+                    session.vlan_ids[vlan_id] += 1
+                    
+                    # Flag if VLAN 1 is in use (native VLAN, potential misconfiguration in OT)
+                    if vlan_id == 1:
+                        session.vlan_1_detected = True
+                    
+                    # Track which IPs appear on which VLANs
+                    if pkt.haslayer(IP):
+                        ip_layer_vlan = pkt[IP]
+                        session.vlan_to_ips[vlan_id].add(ip_layer_vlan.src)
+                        session.vlan_to_ips[vlan_id].add(ip_layer_vlan.dst)
+                    
+                    # Track MAC pairs on VLANs
+                    if hasattr(pkt, 'src') and hasattr(pkt, 'dst'):
+                        mac_pair = (pkt.src, pkt.dst)
+                        session.vlan_to_ports[vlan_id].add(mac_pair)
+                except Exception:
+                    pass
+            else:
+                # No VLAN tag detected
+                session.untagged_frame_count += 1
 
             if not pkt.haslayer(IP):
                 continue

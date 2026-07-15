@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -805,13 +806,26 @@ def _classify_ip_zone(ip: str, session: Any) -> str:
 
     # Priority 1: Use enrichment data if available (authoritative)
     try:
-        from plugins.network_forensics.pcap_enrichment.tool import get_enrichment_cache
+        from plugins.network_forensics.pcap_enrichment.tool import (
+            get_enrichment_cache, get_field, get_field_mappings,
+        )
         cache = get_enrichment_cache()
         if cache and ip in cache:
             row = cache[ip]
-            # Check for purdue_level field (direct zone assignment)
-            purdue = row.get("purdue_level", "").strip().lower()
-            if purdue:
+            mappings = get_field_mappings()
+
+            # Use explicit purdue mapping if available, else try common column names
+            purdue_val = get_field(ip, "purdue")
+            if not purdue_val:
+                # Fallback: try common column names when no explicit mapping
+                for col in ("purdue_level", "purdue", "purdue_zone"):
+                    v = row.get(col, "")
+                    if v and str(v).strip():
+                        purdue_val = str(v).strip()
+                        break
+
+            if purdue_val:
+                purdue = purdue_val.lower()
                 # Normalize enrichment values to our zone names
                 purdue_map = {
                     "0": "CONTROL/FIELD", "1": "CONTROL/FIELD",
@@ -831,9 +845,18 @@ def _classify_ip_zone(ip: str, session: Any) -> str:
                 for key, zone_name in purdue_map.items():
                     if key in purdue:
                         return zone_name
-            # Check for ot_network or zone field as fallback
-            ot_net = row.get("ot_network", "").strip().lower()
-            if ot_net:
+
+            # Use explicit zone mapping if available, else try common column names
+            zone_val = get_field(ip, "zone")
+            if not zone_val:
+                for col in ("ot_network", "zone", "network_zone", "segment"):
+                    v = row.get(col, "")
+                    if v and str(v).strip():
+                        zone_val = str(v).strip()
+                        break
+
+            if zone_val:
+                ot_net = zone_val.lower()
                 if "scada" in ot_net or "hmi" in ot_net:
                     return "SCADA"
                 if "control" in ot_net or "field" in ot_net or "plc" in ot_net:
@@ -2706,6 +2729,93 @@ class PcapAiAnalyzer:
         header = PcapAiAnalyzer._build_pcap_header(session)
         lines.append(header)
 
+        # --- Asset Inventory & Device Classification (from enrichment) ---
+        try:
+            from plugins.network_forensics.pcap_enrichment.tool import (
+                get_enrichment_cache, get_field, get_field_mappings,
+            )
+            cache = get_enrichment_cache()
+            mappings = get_field_mappings()
+            if cache and mappings:
+                lines.append(f"\n{'=' * 60}")
+                lines.append("ASSET INVENTORY & DEVICE CLASSIFICATION")
+                lines.append(f"{'=' * 60}")
+                lines.append(f"  Source: BigQuery enrichment ({len(cache)} IPs matched)")
+                has_name = "name" in mappings
+                has_zone = "zone" in mappings
+                has_purdue = "purdue" in mappings
+                has_os = "os" in mappings
+                has_role = "role" in mappings
+                active_roles = [
+                    r for r in ("name", "zone", "purdue", "os", "role")
+                    if r in mappings
+                ]
+                lines.append(f"  Mapped fields: {', '.join(f'{r}={mappings[r]}' for r in active_roles)}")
+
+                # Build header row dynamically based on available mappings
+                hdr_parts = [f"{'IP':<18}"]
+                if has_name:
+                    hdr_parts.append(f"{'Name':<22}")
+                if has_zone:
+                    hdr_parts.append(f"{'Zone/Network':<20}")
+                if has_purdue:
+                    hdr_parts.append(f"{'Purdue':<10}")
+                if has_os:
+                    hdr_parts.append(f"{'OS':<18}")
+                if has_role:
+                    hdr_parts.append(f"{'Role':<18}")
+                lines.append(f"\n  {' '.join(hdr_parts)}")
+                lines.append(f"  {'-' * (len(' '.join(hdr_parts)) + 2)}")
+
+                # Sort by Purdue level (field devices first) then by IP
+                def _sort_key(ip_row):
+                    ip, row = ip_row
+                    purdue = get_field(ip, "purdue") or ""
+                    try:
+                        pval = float(purdue)
+                    except (ValueError, TypeError):
+                        pval = 99.0
+                    return (pval, ip)
+
+                for ip, row in sorted(cache.items(), key=_sort_key):
+                    if not is_internal(ip):
+                        continue
+                    row_parts = [f"{ip:<18}"]
+                    if has_name:
+                        name = get_field(ip, "name") or "—"
+                        row_parts.append(f"{name[:21]:<22}")
+                    if has_zone:
+                        zone = get_field(ip, "zone") or "—"
+                        row_parts.append(f"{zone[:19]:<20}")
+                    if has_purdue:
+                        purdue = get_field(ip, "purdue") or "—"
+                        row_parts.append(f"{purdue[:9]:<10}")
+                    if has_os:
+                        os_val = get_field(ip, "os") or "—"
+                        row_parts.append(f"{os_val[:17]:<18}")
+                    if has_role:
+                        role = get_field(ip, "role") or "—"
+                        row_parts.append(f"{role[:17]:<18}")
+                    lines.append(f"  {' '.join(row_parts)}")
+
+                # Flag any OT endpoints without enrichment data
+                ot_ips = set()
+                for t in (session.ot_transactions or []):
+                    ot_ips.add(t["src"])
+                    ot_ips.add(t["dst"])
+                unenriched_ot = sorted(
+                    ip for ip in ot_ips
+                    if ip not in cache and is_internal(ip)
+                )
+                if unenriched_ot:
+                    lines.append(f"\n  \u26a0\ufe0f  OT ENDPOINTS WITHOUT ASSET DATA: {len(unenriched_ot)}")
+                    for ip in unenriched_ot[:15]:
+                        lines.append(f"    {ip}  (unknown device \u2014 verify against asset register)")
+                    if len(unenriched_ot) > 15:
+                        lines.append(f"    ... +{len(unenriched_ot) - 15} more")
+        except ImportError:
+            pass  # enrichment module not available
+
         # --- OT Protocol Summary ---
         ot = session.ot_transactions
         if ot:
@@ -2883,6 +2993,30 @@ class PcapAiAnalyzer:
             if banners:
                 lines.append(f"  Banners: {', '.join(sorted(banners)[:5])}")
 
+        # --- VLAN Tagging Analysis ---
+        vlan_analysis = PcapAiAnalyzer._analyze_vlan_configuration(session)
+        if vlan_analysis:
+            lines.append(f"\n{'=' * 60}")
+            lines.append("VLAN CONFIGURATION ANALYSIS")
+            lines.append(f"{'=' * 60}")
+            lines.append(vlan_analysis)
+
+        # --- Protocol Security Analysis ---
+        protocol_sec = PcapAiAnalyzer._analyze_protocol_security(session)
+        if protocol_sec:
+            lines.append(f"\n{'=' * 60}")
+            lines.append("PROTOCOL SECURITY ANALYSIS")
+            lines.append(f"{'=' * 60}")
+            lines.append(protocol_sec)
+
+        # --- Cryptographic Weakness Detection ---
+        crypto_weak = PcapAiAnalyzer._analyze_cryptographic_weaknesses(session)
+        if crypto_weak:
+            lines.append(f"\n{'=' * 60}")
+            lines.append("CRYPTOGRAPHIC WEAKNESS DETECTION")
+            lines.append(f"{'=' * 60}")
+            lines.append(crypto_weak)
+
         # --- Standard IT hunts (beacons, lateral, exfil) ---
         hunter = PcapThreatHunter()
 
@@ -2914,6 +3048,170 @@ class PcapAiAnalyzer:
                 lines.append(port_text)
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _analyze_protocol_security(session: Any) -> str:
+        """Detect weak and deprecated protocol versions (SMBv1, TLS 1.0, etc.)."""
+        from collections import Counter, defaultdict
+        findings = []
+
+        # --- SMB Protocol Detection ---
+        if hasattr(session, "smb_mappings") and session.smb_mappings:
+            smb_count = len(session.smb_mappings)
+            # Flag SMBv1 (we don't parse SMB version in detail, but SMB on port 445 pre-2016 is likely v1)
+            findings.append(f"\n⚠️  SMB Traffic Detected: {smb_count} SMB operations")
+            findings.append(f"  Risk: Verify SMB protocol version (SMBv1 is DEPRECATED and HIGH RISK)")
+            # Show unique SMB servers
+            smb_servers = set(s["dst"] for s in session.smb_mappings)
+            findings.append(f"  SMB Servers: {', '.join(sorted(smb_servers)[:5])}")
+            if len(smb_servers) > 5:
+                findings.append(f"  ... and {len(smb_servers) - 5} more")
+
+        # --- TLS/SSL Protocol Version Detection ---
+        if hasattr(session, "tls_handshakes") and session.tls_handshakes:
+            tls_count = len(session.tls_handshakes)
+            findings.append(f"\n🔒 TLS/SSL Handshakes Detected: {tls_count} sessions")
+            findings.append(f"  Note: Verify protocol versions (TLS 1.0/1.1 are DEPRECATED, use TLS 1.2+)")
+            # Extract unique destinations
+            tls_dests = set()
+            for th in session.tls_handshakes:
+                if th.get("dport") in (443, 8443, 636):
+                    tls_dests.add((th.get("dst"), th.get("dport")))
+            if tls_dests:
+                findings.append(f"  HTTPS/TLS Services: {len(tls_dests)} servers detected")
+                for dst, port in sorted(tls_dests)[:5]:
+                    findings.append(f"    {dst}:{port}")
+
+        # --- RDP Detection (port 3389) ---
+        rdp_ports = set()
+        for conv in session.conversations:
+            if conv[1] == 3389 or conv[2] == 3389:
+                rdp_ports.add(conv[1] if conv[1] == 3389 else conv[2])
+        if rdp_ports:
+            findings.append(f"\n⚠️  RDP (Remote Desktop) Traffic Detected")
+            findings.append(f"  Risk: RDP port 3389 should be restricted; verify encryption levels")
+
+        # --- HTTP (Cleartext) Detection ---
+        if hasattr(session, "http_requests") and session.http_requests:
+            findings.append(f"\n⚠️  Cleartext HTTP Traffic: {len(session.http_requests)} requests")
+            findings.append(f"  Risk: Credentials and sensitive data may be visible in cleartext")
+            hosts = set(r.get("host", "") for r in session.http_requests if r.get("host"))
+            if hosts:
+                findings.append(f"  HTTP Hosts: {', '.join(sorted(hosts)[:5])}")
+
+        if not findings:
+            return ""
+        return "\n".join(findings)
+
+    @staticmethod
+    def _analyze_cryptographic_weaknesses(session: Any) -> str:
+        """Detect weak ciphers, deprecated algorithms, and crypto risks."""
+        findings = []
+
+        # --- TLS Cipher Analysis ---
+        if hasattr(session, "tls_handshakes") and session.tls_handshakes:
+            # Note: Full cipher suite extraction requires deep PCAP parsing (TLSServerHello inspection)
+            # For now, we flag the presence of TLS and recommend cipher audit
+            findings.append(f"\n🔍 TLS Cipher Suite Analysis (Requires Deep Packet Inspection):")
+            findings.append(f"  {len(session.tls_handshakes)} TLS handshakes detected")
+            findings.append(f"\n  ⚠️  RECOMMENDATIONS:")
+            findings.append(f"  • Verify NO weak ciphers: RC4, DES, MD5-based, NULL ciphers, ANON ciphers")
+            findings.append(f"  • Enforce TLS 1.2+ (deprecated: TLS 1.0, 1.1, SSL 3.0)")
+            findings.append(f"  • Prefer modern ciphers: ChaCha20-Poly1305, ECDHE, AES-GCM")
+            findings.append(f"  • Disable: MD5 hashes, DH with <2048 bits, RSA <2048 bits")
+
+        # --- SNMP Community Strings (Cleartext) ---
+        if hasattr(session, "snmp_communities") and session.snmp_communities:
+            findings.append(f"\n⚠️  SNMP Cleartext Community Strings Exposed:")
+            findings.append(f"  {len(session.snmp_communities)} unique communities detected")
+            findings.append(f"  Communities: {', '.join(list(session.snmp_communities.keys())[:5])}")
+            findings.append(f"  Risk: SNMPv1/v2c transmit credentials in CLEARTEXT")
+            findings.append(f"  Recommendation: Migrate to SNMPv3 with authentication and encryption")
+
+        # --- Kerberos Cipher Detection ---
+        if hasattr(session, "kerberos_tickets") and session.kerberos_tickets:
+            cipher_types = set()
+            for kt in session.kerberos_tickets:
+                if kt.get("cipher"):
+                    cipher_types.add(kt.get("cipher"))
+            if cipher_types:
+                findings.append(f"\n🔐 Kerberos Ciphers Detected: {', '.join(sorted(cipher_types))}")
+                # Weak Kerberos ciphers: RC4, DES, MD5
+                weak_ciphers = [c for c in cipher_types if any(x in c.upper() for x in ["RC4", "DES", "MD5"])]
+                if weak_ciphers:
+                    findings.append(f"  ⚠️  WEAK KERBEROS CIPHERS DETECTED: {', '.join(weak_ciphers)}")
+                    findings.append(f"  Recommendation: Disable weak ciphers; prefer AES-SHA256")
+
+        # --- Cleartext Credentials Risk ---
+        if hasattr(session, "cleartext_creds") and session.cleartext_creds:
+            findings.append(f"\n🔓 CLEARTEXT CREDENTIALS: {len(session.cleartext_creds)} detections")
+            findings.append(f"  Crypto Risk: Credentials visible in plaintext protocol traffic")
+            findings.append(f"  Recommendation: Enforce encrypted protocols (SSH, HTTPS, TLS)")
+
+        if not findings:
+            findings.append("\nNo obvious cryptographic weaknesses detected in baseline analysis.")
+            findings.append("Recommend performing full TLS handshake inspection with deep packet analysis.")
+
+        return "\n".join(findings)
+
+    @staticmethod
+    def _analyze_vlan_configuration(session: Any) -> str:
+        """Analyze VLAN tagging configuration for OT/ICS security issues."""
+        findings = []
+
+        # Check if any VLAN tags were detected
+        if not hasattr(session, "vlan_ids") or not session.vlan_ids:
+            findings.append("No 802.1Q VLAN tags detected (untagged network or traffic capture limitation).")
+            return "\n".join(findings)
+
+        # VLAN 1 Detection (Critical in OT environments)
+        if hasattr(session, "vlan_1_detected") and session.vlan_1_detected:
+            findings.append("⚠️  CRITICAL: VLAN 1 (Native VLAN) In Use")
+            findings.append("  Risk: Native VLAN usage on OT networks indicates potential misconfiguration")
+            findings.append("  - VLAN 1 should not carry production traffic in OT networks")
+            findings.append("  - Suggests lack of VLAN segmentation between management/control planes")
+            vlan_1_ips = session.vlan_to_ips.get(1, set())
+            if vlan_1_ips:
+                ips_str = ", ".join(sorted(vlan_1_ips)[:10])
+                findings.append(f"  - IPs on VLAN 1: {ips_str}")
+                if len(vlan_1_ips) > 10:
+                    findings.append(f"    ... and {len(vlan_1_ips) - 10} more")
+
+        # VLAN distribution analysis
+        findings.append(f"\n📊 VLAN Distribution: {len(session.vlan_ids)} VLAN(s) detected")
+        total_tagged = sum(session.vlan_ids.values())
+        untagged_pct = (session.untagged_frame_count / (total_tagged + session.untagged_frame_count) * 100) if (total_tagged + session.untagged_frame_count) > 0 else 0
+
+        findings.append(f"  Tagged frames: {total_tagged:,}")
+        findings.append(f"  Untagged frames: {session.untagged_frame_count:,} ({untagged_pct:.1f}%)")
+
+        # Show top VLANs
+        top_vlans = session.vlan_ids.most_common(10)
+        if top_vlans:
+            findings.append("\n  Top VLANs by traffic volume:")
+            for vlan_id, count in top_vlans:
+                ips_in_vlan = session.vlan_to_ips.get(vlan_id, set())
+                internal_ips = [ip for ip in ips_in_vlan if ip]
+                marker = "⚠️  " if vlan_id == 1 else "ℹ️  "
+                findings.append(f"    {marker}VLAN {vlan_id}: {count:,} frames, {len(internal_ips)} unique IPs")
+                if internal_ips:
+                    ips_sample = ", ".join(sorted(internal_ips)[:5])
+                    findings.append(f"        IPs: {ips_sample}")
+                    if len(internal_ips) > 5:
+                        findings.append(f"        ... and {len(internal_ips) - 5} more")
+
+        # Purdue Model VLAN assessment
+        findings.append("\n  Security Recommendations (Purdue Model):")
+        findings.append("  • Each Purdue zone (L0-L3, L3.5) should use separate VLAN ranges")
+        findings.append("  • Avoid VLAN 1 for production traffic")
+        findings.append("  • Use voice/management VLANs (e.g., 10-99) separate from data")
+        findings.append("  • Implement inter-VLAN routing with firewall policies (no direct bridging)")
+        findings.append("  • Validate VLAN design matches network architecture documentation")
+
+        if not findings:
+            findings.append("No VLAN configuration issues detected.")
+
+        return "\n".join(findings)
 
     @staticmethod
     def _get_netops_static_output(session: Any) -> str:
@@ -4037,6 +4335,36 @@ class PcapAiAnalyzer:
             if session.syslog_patterns:
                 pat_strs = [f"{k}={v:,}" for k, v in session.syslog_patterns.most_common()]
                 lines.append(f"Patterns: {', '.join(pat_strs)}")
+
+        # --- VLAN Configuration Analysis (Network Ops Focus) ---
+        if session.vlan_ids or session.untagged_frame_count > 0:
+            lines.append(f"\n{'=' * 60}")
+            lines.append("VLAN CONFIGURATION")
+            lines.append(f"{'=' * 60}")
+            if session.vlan_1_detected:
+                lines.append("⚠️  VLAN 1 (Native VLAN) In Use")
+                lines.append(f"  - Frames on VLAN 1: {session.vlan_ids.get(1, 0):,}")
+                if 1 in session.vlan_to_ips:
+                    lines.append(f"  - IPs observed: {', '.join(sorted(session.vlan_to_ips[1])[:10])}")
+                lines.append("  • Production traffic on native VLAN may indicate misconfiguration")
+                lines.append("  • Verify against network design documentation")
+            if session.vlan_ids:
+                lines.append(f"\n  VLAN Distribution: {len(session.vlan_ids)} VLAN(s) detected")
+                total_tagged = sum(session.vlan_ids.values())
+                if total_tagged + session.untagged_frame_count > 0:
+                    untagged_pct = session.untagged_frame_count / (total_tagged + session.untagged_frame_count) * 100
+                    lines.append(f"  Tagged frames: {total_tagged:,}")
+                    lines.append(f"  Untagged frames: {session.untagged_frame_count:,} ({untagged_pct:.1f}%)")
+                lines.append(f"\n  Top VLANs by traffic:")
+                for vlan_id, count in session.vlan_ids.most_common(10):
+                    ips_on_vlan = len(session.vlan_to_ips.get(vlan_id, set()))
+                    marker = ""
+                    if vlan_id == 1:
+                        marker = "  ⚠️  Native"
+                    lines.append(f"    VLAN {vlan_id}: {count:,} frames, {ips_on_vlan} unique IP(s){marker}")
+            else:
+                lines.append("  No VLAN tags detected in capture")
+                lines.append(f"  Untagged frames: {session.untagged_frame_count:,}")
 
         return "\n".join(lines)
 

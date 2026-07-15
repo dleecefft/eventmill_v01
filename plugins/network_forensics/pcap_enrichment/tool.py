@@ -39,16 +39,54 @@ class ValidationResult:
 # Module-level cache for enrichment results (session-scoped singleton)
 _enrichment_cache: dict[str, dict[str, Any]] | None = None
 
+# Field-role mappings — tells downstream tools which column serves which purpose.
+# Keys are semantic roles, values are the actual column names from the BQ table.
+# Supported roles: "name", "zone", "purdue", "os", "role"
+_field_mappings: dict[str, str] = {}
+
 
 def get_enrichment_cache() -> dict[str, dict[str, Any]] | None:
     """Return the current enrichment cache (ip -> row dict), or None if empty."""
     return _enrichment_cache
 
 
+def get_field_mappings() -> dict[str, str]:
+    """Return the current field-role mappings (role -> column name)."""
+    return dict(_field_mappings)
+
+
+def get_field(ip: str, role: str) -> str | None:
+    """Look up a semantic field value for an IP.
+
+    Args:
+        ip: IP address to look up.
+        role: Semantic role — one of 'name', 'zone', 'purdue', 'os', 'role'.
+
+    Returns:
+        The field value as a string, or None if not available.
+    """
+    if not _enrichment_cache or ip not in _enrichment_cache:
+        return None
+    col = _field_mappings.get(role)
+    if not col:
+        return None
+    val = _enrichment_cache[ip].get(col)
+    if val is None or str(val).strip() in ("", "—"):
+        return None
+    return str(val).strip()
+
+
+def set_field_mappings(mappings: dict[str, str]) -> None:
+    """Set field-role mappings (role -> column name)."""
+    global _field_mappings
+    _field_mappings = {k: v for k, v in mappings.items() if v}
+
+
 def clear_enrichment_cache() -> None:
-    """Clear the enrichment cache."""
-    global _enrichment_cache
+    """Clear the enrichment cache and field mappings."""
+    global _enrichment_cache, _field_mappings
     _enrichment_cache = None
+    _field_mappings = {}
 
 
 def _validate_table_name(table: str) -> bool:
