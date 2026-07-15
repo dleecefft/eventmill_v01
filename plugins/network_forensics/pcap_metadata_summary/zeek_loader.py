@@ -41,6 +41,9 @@ _PROTO_MAP = {
 _OT_SERVICES = {
     "modbus", "dnp3", "bacnet", "enip", "cip", "s7comm",
     "opcua", "iec104", "goose", "mms",
+    "profinet", "ethercat", "hart_ip", "bsap",
+    "genisys", "ge_srtp", "c1222", "synchrophasor",
+    "omron_fins", "roc_plus",
 }
 
 # Modbus function code names (matches scapy/dpkt parser)
@@ -81,6 +84,16 @@ _OT_LOG_FILES = (
     "s7comm.log", "s7comm_plus.log", "s7comm_read_szl.log",
     "enip.log", "cip.log", "cip_identity.log",
     "opcua_binary.log",
+    "profinet_io_cm.log",
+    "ethercat.log",
+    "hart_ip.log",
+    "bsap_ip.log", "bsap_serial.log",
+    "genisys.log",
+    "ge_srtp.log",
+    "c1222.log",
+    "synchrophasor.log",
+    "omron_fins.log",
+    "roc_plus.log",
 )
 
 
@@ -159,6 +172,17 @@ def parse_zeek_logs(log_dir: str | Path) -> "PcapSession":
         "cip.log": _parse_cip_log,
         "cip_identity.log": _parse_cip_log,
         "opcua_binary.log": _parse_opcua_log,
+        "profinet_io_cm.log": _parse_profinet_log,
+        "ethercat.log": _parse_ethercat_log,
+        "hart_ip.log": _parse_hart_ip_log,
+        "bsap_ip.log": _parse_bsap_log,
+        "bsap_serial.log": _parse_bsap_log,
+        "genisys.log": _parse_genisys_log,
+        "ge_srtp.log": _parse_ge_srtp_log,
+        "c1222.log": _parse_c1222_log,
+        "synchrophasor.log": _parse_synchrophasor_log,
+        "omron_fins.log": _parse_omron_fins_log,
+        "roc_plus.log": _parse_roc_plus_log,
     }
     ot_files_parsed: List[str] = []
     for log_name, parser_fn in _ot_log_parsers.items():
@@ -432,6 +456,47 @@ def _parse_conn_log(path: Path, session) -> None:
         if proto_lower == "eigrp" or (service and service.lower() == "eigrp"):
             session.eigrp_total_count += 1
             session.eigrp_hello_count += 1  # best approximation
+
+        # -----------------------------------------------------------
+        # VLAN extraction from conn.log fields
+        # Zeek populates 'vlan' and 'inner_vlan' when 802.1Q tags are
+        # present in the capture.
+        # -----------------------------------------------------------
+        vlan_val = entry.get("vlan")
+        if vlan_val is not None:
+            try:
+                vlan_id = int(vlan_val)
+                # Count once per connection (not per packet, since conn.log
+                # aggregates); weight by packet count for proportional stats
+                weight = max(total_pkts, 1)
+                session.vlan_ids[vlan_id] += weight
+                if vlan_id == 1:
+                    session.vlan_1_detected = True
+                if src_ip:
+                    session.vlan_to_ips[vlan_id].add(src_ip)
+                if dst_ip:
+                    session.vlan_to_ips[vlan_id].add(dst_ip)
+            except (ValueError, TypeError):
+                pass
+        else:
+            # No VLAN field = untagged traffic
+            weight = max(total_pkts, 1)
+            session.untagged_frame_count += weight
+
+        inner_vlan_val = entry.get("inner_vlan")
+        if inner_vlan_val is not None:
+            try:
+                inner_vlan_id = int(inner_vlan_val)
+                weight = max(total_pkts, 1)
+                session.vlan_ids[inner_vlan_id] += weight
+                if inner_vlan_id == 1:
+                    session.vlan_1_detected = True
+                if src_ip:
+                    session.vlan_to_ips[inner_vlan_id].add(src_ip)
+                if dst_ip:
+                    session.vlan_to_ips[inner_vlan_id].add(dst_ip)
+            except (ValueError, TypeError):
+                pass
 
 
 def _parse_dns_log(path: Path, session) -> None:
@@ -1110,6 +1175,328 @@ def _parse_opcua_log(path: Path, session) -> None:
         session.ot_transactions.append(ot)
 
     logger.info("Parsed OPC-UA log: %s", path.name)
+
+
+def _parse_profinet_log(path: Path, session) -> None:
+    """Parse profinet_io_cm.log — icsnpp-profinet-io-cm Zeek package.
+
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    operation, block_type, slot_number, ...
+    """
+    for entry in _read_zeek_json(path):
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+
+        ot = _ot_entry_base(entry, "PROFINET", 34964)
+
+        operation = entry.get("operation", entry.get("pnio_operation", ""))
+        ot["function_name"] = str(operation) if operation else "Unknown"
+        ot["function_code"] = None
+
+        block_type = entry.get("block_type", "")
+        if block_type:
+            ot["description"] = f"Block: {block_type}"
+
+        ot["is_write"] = any(
+            w in str(operation).lower() for w in ("write", "control", "connect")
+        )
+        ot["is_control"] = any(
+            c in str(operation).lower()
+            for c in ("control", "release", "abort", "param_end")
+        )
+
+        session.ot_transactions.append(ot)
+
+    logger.info("Parsed PROFINET IO CM log: %s", path.name)
+
+
+def _parse_ethercat_log(path: Path, session) -> None:
+    """Parse ethercat.log — icsnpp-ethercat Zeek package.
+
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    cmd, slave_addr, ...
+    """
+    for entry in _read_zeek_json(path):
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+
+        ot = _ot_entry_base(entry, "EtherCAT", 34980)
+
+        cmd = entry.get("cmd", entry.get("command", ""))
+        ot["function_name"] = str(cmd) if cmd else "Unknown"
+        ot["function_code"] = None
+
+        slave_addr = entry.get("slave_addr", entry.get("slave_address", ""))
+        if slave_addr:
+            ot["description"] = f"Slave: {slave_addr}"
+
+        # EtherCAT write commands
+        ot["is_write"] = any(
+            w in str(cmd).upper() for w in ("BWR", "AWR", "LWR", "FPRW", "APRW", "FPWR", "APWR")
+        )
+        ot["is_control"] = any(
+            c in str(cmd).upper() for c in ("BWR", "LWR", "INIT", "PREOP", "SAFEOP", "OP")
+        )
+
+        session.ot_transactions.append(ot)
+
+    logger.info("Parsed EtherCAT log: %s", path.name)
+
+
+def _parse_hart_ip_log(path: Path, session) -> None:
+    """Parse hart_ip.log — icsnpp-hart-ip Zeek package.
+
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    command, device_status, ...
+    """
+    for entry in _read_zeek_json(path):
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+
+        ot = _ot_entry_base(entry, "HART-IP", 5094)
+
+        command = entry.get("command", entry.get("hart_command", ""))
+        ot["function_name"] = str(command) if command else "Unknown"
+        try:
+            ot["function_code"] = int(command)
+        except (ValueError, TypeError):
+            ot["function_code"] = None
+
+        device_status = entry.get("device_status", "")
+        if device_status:
+            ot["description"] = f"Status: {device_status}"
+
+        # HART write commands (command numbers for writes)
+        ot["is_write"] = any(
+            w in str(command).lower()
+            for w in ("write", "set", "configure", "trim")
+        )
+        ot["is_control"] = "reset" in str(command).lower()
+
+        session.ot_transactions.append(ot)
+
+    logger.info("Parsed HART-IP log: %s", path.name)
+
+
+def _parse_bsap_log(path: Path, session) -> None:
+    """Parse bsap_ip.log — icsnpp-bsap Zeek package.
+
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    func_code, type_name, ...
+    """
+    for entry in _read_zeek_json(path):
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+
+        ot = _ot_entry_base(entry, "BSAP", 1234)
+
+        func_code = entry.get("func_code", entry.get("app_func_code", ""))
+        type_name = entry.get("type_name", entry.get("msg_type", ""))
+        ot["function_name"] = str(type_name) if type_name else str(func_code)
+        try:
+            ot["function_code"] = int(func_code)
+        except (ValueError, TypeError):
+            ot["function_code"] = None
+
+        ot["is_write"] = any(
+            w in str(type_name).lower()
+            for w in ("write", "download", "transmit")
+        )
+        ot["is_control"] = any(
+            c in str(type_name).lower()
+            for c in ("control", "reset", "abort", "initialize")
+        )
+
+        session.ot_transactions.append(ot)
+
+    logger.info("Parsed BSAP log: %s", path.name)
+
+
+def _parse_genisys_log(path: Path, session) -> None:
+    """Parse genisys.log — icsnpp-genisys Zeek package.
+
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    header, server, direction, ...
+    """
+    for entry in _read_zeek_json(path):
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+
+        ot = _ot_entry_base(entry, "Genisys", 10001)
+
+        header = entry.get("header", "")
+        direction = entry.get("direction", "")
+        ot["function_name"] = str(header) if header else "Data"
+        ot["function_code"] = None
+
+        if direction:
+            ot["description"] = f"Direction: {direction}"
+
+        ot["is_write"] = "write" in str(header).lower()
+        ot["is_control"] = any(
+            c in str(header).lower() for c in ("control", "command")
+        )
+
+        session.ot_transactions.append(ot)
+
+    logger.info("Parsed Genisys log: %s", path.name)
+
+
+def _parse_ge_srtp_log(path: Path, session) -> None:
+    """Parse ge_srtp.log — icsnpp-ge-srtp Zeek package.
+
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    service_request_code, ...
+    """
+    for entry in _read_zeek_json(path):
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+
+        ot = _ot_entry_base(entry, "GE-SRTP", 18245)
+
+        svc_code = entry.get("service_request_code",
+                             entry.get("service_code", ""))
+        ot["function_name"] = str(svc_code) if svc_code else "Unknown"
+        try:
+            ot["function_code"] = int(svc_code)
+        except (ValueError, TypeError):
+            ot["function_code"] = None
+
+        ot["is_write"] = any(
+            w in str(svc_code).lower()
+            for w in ("write", "store", "download", "program")
+        )
+        ot["is_control"] = any(
+            c in str(svc_code).lower()
+            for c in ("start", "stop", "init", "reset", "run", "halt")
+        )
+        ot["is_diagnostic"] = "status" in str(svc_code).lower()
+
+        session.ot_transactions.append(ot)
+
+    logger.info("Parsed GE-SRTP log: %s", path.name)
+
+
+def _parse_c1222_log(path: Path, session) -> None:
+    """Parse c1222.log — icsnpp-c1222 Zeek package (ANSI C12.22 Smart Meter).
+
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    service, ...
+    """
+    for entry in _read_zeek_json(path):
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+
+        ot = _ot_entry_base(entry, "C12.22", 1153)
+
+        service = entry.get("service", entry.get("acse_service", ""))
+        ot["function_name"] = str(service) if service else "Unknown"
+        ot["function_code"] = None
+
+        ot["is_write"] = any(
+            w in str(service).lower()
+            for w in ("write", "program", "logon")
+        )
+        ot["is_control"] = any(
+            c in str(service).lower()
+            for c in ("disconnect", "terminate", "logoff")
+        )
+
+        session.ot_transactions.append(ot)
+
+    logger.info("Parsed C12.22 log: %s", path.name)
+
+
+def _parse_synchrophasor_log(path: Path, session) -> None:
+    """Parse synchrophasor.log — icsnpp-synchrophasor Zeek package (C37.118).
+
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    frame_type, ...
+    """
+    for entry in _read_zeek_json(path):
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+
+        ot = _ot_entry_base(entry, "Synchrophasor", 4712)
+
+        frame_type = entry.get("frame_type", entry.get("frameType", ""))
+        ot["function_name"] = str(frame_type) if frame_type else "Data"
+        ot["function_code"] = None
+
+        # Frame types: data, header, cfg1, cfg2, cfg3, cmd
+        ot["is_write"] = False
+        ot["is_control"] = "cmd" in str(frame_type).lower()
+
+        session.ot_transactions.append(ot)
+
+    logger.info("Parsed Synchrophasor log: %s", path.name)
+
+
+def _parse_omron_fins_log(path: Path, session) -> None:
+    """Parse omron_fins.log — icsnpp-omron-fins Zeek package.
+
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    command_code, ...
+    """
+    for entry in _read_zeek_json(path):
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+
+        ot = _ot_entry_base(entry, "Omron-FINS", 9600)
+
+        cmd_code = entry.get("command_code", entry.get("icf_command", ""))
+        ot["function_name"] = str(cmd_code) if cmd_code else "Unknown"
+        try:
+            ot["function_code"] = int(cmd_code, 16) if isinstance(cmd_code, str) else int(cmd_code)
+        except (ValueError, TypeError):
+            ot["function_code"] = None
+
+        # Omron FINS write/control command codes
+        ot["is_write"] = any(
+            w in str(cmd_code).lower()
+            for w in ("write", "0102", "transfer")
+        )
+        ot["is_control"] = any(
+            c in str(cmd_code).lower()
+            for c in ("run", "stop", "reset", "0401", "0402")
+        )
+
+        session.ot_transactions.append(ot)
+
+    logger.info("Parsed Omron FINS log: %s", path.name)
+
+
+def _parse_roc_plus_log(path: Path, session) -> None:
+    """Parse roc_plus.log — icsnpp-roc-plus Zeek package (Emerson ROC).
+
+    Fields: ts, uid, id.orig_h, id.orig_p, id.resp_h, id.resp_p,
+    opcode, ...
+    """
+    for entry in _read_zeek_json(path):
+        ts = _ts_to_epoch(entry.get("ts"))
+        _update_time_range(session, ts)
+
+        ot = _ot_entry_base(entry, "ROC-Plus", 4000)
+
+        opcode = entry.get("opcode", entry.get("type_code", ""))
+        ot["function_name"] = str(opcode) if opcode else "Unknown"
+        try:
+            ot["function_code"] = int(opcode)
+        except (ValueError, TypeError):
+            ot["function_code"] = None
+
+        ot["is_write"] = any(
+            w in str(opcode).lower()
+            for w in ("write", "set", "store", "download")
+        )
+        ot["is_control"] = any(
+            c in str(opcode).lower()
+            for c in ("reset", "restart", "cold_start")
+        )
+
+        session.ot_transactions.append(ot)
+
+    logger.info("Parsed ROC-Plus log: %s", path.name)
 
 
 # ---------------------------------------------------------------------------

@@ -1497,6 +1497,36 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
             except (dpkt.dpkt.NeedData, dpkt.dpkt.UnpackError):
                 continue
 
+            # --- 802.1Q VLAN tag extraction (L2) ---
+            # dpkt: if eth.type == 0x8100, the frame has a VLAN tag.
+            # dpkt auto-unwraps 802.1Q: eth.vlan_tags (list) or check via
+            # the raw bytes. In older dpkt, check eth.type and manual parse.
+            _vlan_extracted = False
+            _current_vlan_id: int | None = None
+            if hasattr(eth, 'vlan_tags') and eth.vlan_tags:
+                # Newer dpkt (>= 1.9.4) with vlan_tags attribute
+                for vtag in eth.vlan_tags:
+                    vlan_id = vtag.id if hasattr(vtag, 'id') else (vtag & 0x0FFF)
+                    session.vlan_ids[vlan_id] += 1
+                    if vlan_id == 1:
+                        session.vlan_1_detected = True
+                    _current_vlan_id = vlan_id
+                    _vlan_extracted = True
+            elif eth.type == 0x8100 or eth.type == 0x88a8:  # 802.1Q or QinQ
+                # Manual parse: first 2 bytes after EtherType are TCI (PCP+DEI+VID)
+                # dpkt already unwrapped it into eth.data as the inner frame,
+                # but we need the VID. Check the raw buffer.
+                if len(buf) >= 16:
+                    tci = (buf[14] << 8) | buf[15]
+                    vlan_id = tci & 0x0FFF
+                    session.vlan_ids[vlan_id] += 1
+                    if vlan_id == 1:
+                        session.vlan_1_detected = True
+                    _current_vlan_id = vlan_id
+                    _vlan_extracted = True
+            if not _vlan_extracted:
+                session.untagged_frame_count += 1
+
             # --- ARP extraction (L2, before IP check) ---
             if eth.type == dpkt.ethernet.ETH_TYPE_ARP:
                 try:
@@ -1755,13 +1785,32 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
                 pass
 
             # Only process IPv4
-            if not isinstance(eth.data, dpkt.ip.IP):
+            # Handle 802.1Q-wrapped frames: dpkt may or may not auto-unwrap
+            ip_payload = eth.data
+            if isinstance(ip_payload, dpkt.ip.IP):
+                pass  # normal
+            elif eth.type == 0x8100 or eth.type == 0x88a8:
+                # VLAN-tagged: inner payload after TCI+EtherType (4 bytes)
+                inner = buf[18:]  # skip 14 (eth hdr) + 4 (VLAN tag)
+                if len(inner) >= 20:
+                    try:
+                        ip_payload = dpkt.ip.IP(inner)
+                    except Exception:
+                        continue
+                else:
+                    continue
+            else:
                 continue
 
-            ip = eth.data
+            ip = ip_payload
             src_ip = _ip_to_str(ip.src)
             dst_ip = _ip_to_str(ip.dst)
             pkt_len = len(buf)
+
+            # Associate IPs with VLAN for this packet
+            if _current_vlan_id is not None:
+                session.vlan_to_ips[_current_vlan_id].add(src_ip)
+                session.vlan_to_ips[_current_vlan_id].add(dst_ip)
 
             session.src_ips[src_ip] += 1
             session.dst_ips[dst_ip] += 1
