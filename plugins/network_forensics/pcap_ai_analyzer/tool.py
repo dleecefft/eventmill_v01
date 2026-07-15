@@ -2729,92 +2729,10 @@ class PcapAiAnalyzer:
         header = PcapAiAnalyzer._build_pcap_header(session)
         lines.append(header)
 
-        # --- Asset Inventory & Device Classification (from enrichment) ---
-        try:
-            from plugins.network_forensics.pcap_enrichment.tool import (
-                get_enrichment_cache, get_field, get_field_mappings,
-            )
-            cache = get_enrichment_cache()
-            mappings = get_field_mappings()
-            if cache and mappings:
-                lines.append(f"\n{'=' * 60}")
-                lines.append("ASSET INVENTORY & DEVICE CLASSIFICATION")
-                lines.append(f"{'=' * 60}")
-                lines.append(f"  Source: BigQuery enrichment ({len(cache)} IPs matched)")
-                has_name = "name" in mappings
-                has_zone = "zone" in mappings
-                has_purdue = "purdue" in mappings
-                has_os = "os" in mappings
-                has_role = "role" in mappings
-                active_roles = [
-                    r for r in ("name", "zone", "purdue", "os", "role")
-                    if r in mappings
-                ]
-                lines.append(f"  Mapped fields: {', '.join(f'{r}={mappings[r]}' for r in active_roles)}")
-
-                # Build header row dynamically based on available mappings
-                hdr_parts = [f"{'IP':<18}"]
-                if has_name:
-                    hdr_parts.append(f"{'Name':<22}")
-                if has_zone:
-                    hdr_parts.append(f"{'Zone/Network':<20}")
-                if has_purdue:
-                    hdr_parts.append(f"{'Purdue':<10}")
-                if has_os:
-                    hdr_parts.append(f"{'OS':<18}")
-                if has_role:
-                    hdr_parts.append(f"{'Role':<18}")
-                lines.append(f"\n  {' '.join(hdr_parts)}")
-                lines.append(f"  {'-' * (len(' '.join(hdr_parts)) + 2)}")
-
-                # Sort by Purdue level (field devices first) then by IP
-                def _sort_key(ip_row):
-                    ip, row = ip_row
-                    purdue = get_field(ip, "purdue") or ""
-                    try:
-                        pval = float(purdue)
-                    except (ValueError, TypeError):
-                        pval = 99.0
-                    return (pval, ip)
-
-                for ip, row in sorted(cache.items(), key=_sort_key):
-                    if not is_internal(ip):
-                        continue
-                    row_parts = [f"{ip:<18}"]
-                    if has_name:
-                        name = get_field(ip, "name") or "—"
-                        row_parts.append(f"{name[:21]:<22}")
-                    if has_zone:
-                        zone = get_field(ip, "zone") or "—"
-                        row_parts.append(f"{zone[:19]:<20}")
-                    if has_purdue:
-                        purdue = get_field(ip, "purdue") or "—"
-                        row_parts.append(f"{purdue[:9]:<10}")
-                    if has_os:
-                        os_val = get_field(ip, "os") or "—"
-                        row_parts.append(f"{os_val[:17]:<18}")
-                    if has_role:
-                        role = get_field(ip, "role") or "—"
-                        row_parts.append(f"{role[:17]:<18}")
-                    lines.append(f"  {' '.join(row_parts)}")
-
-                # Flag any OT endpoints without enrichment data
-                ot_ips = set()
-                for t in (session.ot_transactions or []):
-                    ot_ips.add(t["src"])
-                    ot_ips.add(t["dst"])
-                unenriched_ot = sorted(
-                    ip for ip in ot_ips
-                    if ip not in cache and is_internal(ip)
-                )
-                if unenriched_ot:
-                    lines.append(f"\n  \u26a0\ufe0f  OT ENDPOINTS WITHOUT ASSET DATA: {len(unenriched_ot)}")
-                    for ip in unenriched_ot[:15]:
-                        lines.append(f"    {ip}  (unknown device \u2014 verify against asset register)")
-                    if len(unenriched_ot) > 15:
-                        lines.append(f"    ... +{len(unenriched_ot) - 15} more")
-        except ImportError:
-            pass  # enrichment module not available
+        # Note: Enrichment data (asset names, Purdue levels, OS, zones) is
+        # injected into the LLM prompt separately via get_enrichment_for_prompt()
+        # and used by the Purdue zone classifier. It is NOT rendered in the
+        # static report to keep it concise.
 
         # --- OT Protocol Summary ---
         ot = session.ot_transactions
