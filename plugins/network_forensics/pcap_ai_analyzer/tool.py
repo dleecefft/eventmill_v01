@@ -3371,9 +3371,33 @@ class PcapAiAnalyzer:
         """Analyze VLAN tagging configuration for OT/ICS security issues."""
         findings = []
 
-        # Check if any VLAN tags were detected
-        if not hasattr(session, "vlan_ids") or not session.vlan_ids:
+        has_802_1q = hasattr(session, "vlan_ids") and session.vlan_ids
+        has_stp_vlans = hasattr(session, "stp_vlans") and session.stp_vlans
+
+        # Check if any VLAN evidence was detected from either source
+        if not has_802_1q and not has_stp_vlans:
             findings.append("No 802.1Q VLAN tags detected (untagged network or traffic capture limitation).")
+            return "\n".join(findings)
+
+        # If we have STP VLANs but no 802.1Q tags, the capture is on an access port
+        if not has_802_1q and has_stp_vlans:
+            stp_vlan_list = sorted(session.stp_vlans.keys())
+            findings.append(f"No 802.1Q tagged frames detected (capture likely on an access/untagged port),")
+            findings.append(f"however STP/PVST+ BPDUs reveal {len(stp_vlan_list)} active VLAN(s) on this switch:")
+            findings.append("")
+            findings.append("  VLANs detected via STP System ID Extension:")
+            for vlan_id in stp_vlan_list[:20]:
+                cnt = session.stp_vlans[vlan_id]
+                marker = "⚠️  " if vlan_id == 1 else "    "
+                findings.append(f"  {marker}VLAN {vlan_id}: {cnt:,} BPDUs")
+            if len(stp_vlan_list) > 20:
+                findings.append(f"    ... and {len(stp_vlan_list) - 20} more")
+            if 1 in stp_vlan_list:
+                findings.append("")
+                findings.append("  ⚠️  VLAN 1 (Native VLAN) is active in STP topology")
+                findings.append("  Risk: VLAN 1 should not carry production traffic in OT networks")
+            findings.append("")
+            findings.append("  Note: To see per-VLAN IP assignments, capture on a trunk port (tagged).")
             return "\n".join(findings)
 
         # VLAN 1 Detection (Critical in OT environments)
@@ -4549,7 +4573,9 @@ class PcapAiAnalyzer:
                 lines.append(f"Patterns: {', '.join(pat_strs)}")
 
         # --- VLAN Configuration Analysis (Network Ops Focus) ---
-        if session.vlan_ids or session.untagged_frame_count > 0:
+        has_vlan_tags = bool(session.vlan_ids)
+        has_stp_vlans = hasattr(session, "stp_vlans") and bool(session.stp_vlans)
+        if has_vlan_tags or session.untagged_frame_count > 0 or has_stp_vlans:
             lines.append(f"\n{'=' * 60}")
             lines.append("VLAN CONFIGURATION")
             lines.append(f"{'=' * 60}")
@@ -4574,6 +4600,17 @@ class PcapAiAnalyzer:
                     if vlan_id == 1:
                         marker = "  ⚠️  Native"
                     lines.append(f"    VLAN {vlan_id}: {count:,} frames, {ips_on_vlan} unique IP(s){marker}")
+            elif has_stp_vlans:
+                # No 802.1Q tags but STP BPDUs reveal VLANs
+                stp_vlan_list = sorted(session.stp_vlans.keys())
+                lines.append("  No 802.1Q tagged frames (capture on access/untagged port)")
+                lines.append(f"  However, STP/PVST+ BPDUs reveal {len(stp_vlan_list)} active VLAN(s):")
+                for vlan_id in stp_vlan_list[:15]:
+                    cnt = session.stp_vlans[vlan_id]
+                    marker = "  ⚠️  Native" if vlan_id == 1 else ""
+                    lines.append(f"    VLAN {vlan_id}: {cnt:,} BPDUs{marker}")
+                if len(stp_vlan_list) > 15:
+                    lines.append(f"    ... and {len(stp_vlan_list) - 15} more")
             else:
                 lines.append("  No VLAN tags detected in capture")
                 lines.append(f"  Untagged frames: {session.untagged_frame_count:,}")
