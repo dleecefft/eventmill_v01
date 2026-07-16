@@ -1951,6 +1951,100 @@ def _export_pdf(
                                 _data_line(s)
                 continue
 
+            # --- External Communications section → render as tables ---
+            is_ext_comms_section = "EXTERNAL COMMUNICATIONS" in sec_title.upper()
+            if is_ext_comms_section:
+                # Split into sub-sections by sub-header keywords
+                ext_subs: list[tuple[str, list[str]]] = []
+                cur_ext_sub = ""
+                cur_ext_lines: list[str] = []
+                for ln in sec_lines:
+                    s = ln.strip()
+                    if s.startswith(("TOP EXTERNAL DESTINATIONS",
+                                     "TOP EXTERNAL SOURCES",
+                                     "INTERNAL HOSTS WITH MOST EXTERNAL")):
+                        if cur_ext_sub or cur_ext_lines:
+                            ext_subs.append((cur_ext_sub, cur_ext_lines))
+                        cur_ext_sub = s
+                        cur_ext_lines = []
+                        continue
+                    cur_ext_lines.append(ln)
+                if cur_ext_sub or cur_ext_lines:
+                    ext_subs.append((cur_ext_sub, cur_ext_lines))
+
+                for ext_sub_title, ext_sub_lines in ext_subs:
+                    if not ext_sub_title:
+                        # Summary lines at top
+                        for ln in ext_sub_lines:
+                            s = ln.strip()
+                            if s and not s.startswith("-"):
+                                _body_line(s, font_size=9,
+                                           bold=("Total" in s or "INT" in s or "EXT" in s or "Unique" in s))
+                        continue
+
+                    _sub_header(ext_sub_title)
+
+                    if "DESTINATIONS" in ext_sub_title.upper() or "SOURCES" in ext_sub_title.upper():
+                        ext_rows: list[list[str]] = []
+                        for ln in ext_sub_lines:
+                            s = ln.strip()
+                            if not s or s.startswith("-"):
+                                continue
+                            # Parse: "203.0.113.5      1.2 MB       flows=12     ports: 443, 80"
+                            tokens = s.split()
+                            if tokens and tokens[0][0].isdigit():
+                                ip = tokens[0]
+                                # Find bytes (contains B/KB/MB/GB)
+                                vol = ""
+                                flows = ""
+                                ports = ""
+                                for i, t in enumerate(tokens[1:], 1):
+                                    if any(u in t for u in ("B", "KB", "MB", "GB", "TB")):
+                                        vol = t if vol else tokens[i-1] + " " + t if not tokens[i-1][0].isdigit() else t
+                                        # Check if previous token is the number part
+                                        if i > 1 and tokens[i-1].replace(".", "").replace(",", "").isdigit():
+                                            vol = tokens[i-1] + " " + t
+                                    elif t.startswith("flows="):
+                                        flows = t.split("=")[1]
+                                    elif t == "ports:":
+                                        ports = " ".join(tokens[i+1:])
+                                        break
+                                ext_rows.append([ip, vol, flows, ports])
+                        if ext_rows:
+                            _table(
+                                ["IP Address", "Volume", "Flows", "Ports"],
+                                ext_rows[:15],
+                                col_widths=[42, 25, 18, eff_w - 85],
+                            )
+                    elif "INTERNAL HOSTS" in ext_sub_title.upper():
+                        int_rows: list[list[str]] = []
+                        for ln in ext_sub_lines:
+                            s = ln.strip()
+                            if not s or s.startswith("-"):
+                                continue
+                            tokens = s.split()
+                            if tokens and tokens[0][0].isdigit():
+                                ip = tokens[0]
+                                vol = ""
+                                peers = ""
+                                for i, t in enumerate(tokens[1:], 1):
+                                    if any(u in t for u in ("B", "KB", "MB", "GB", "TB")):
+                                        if i > 1 and tokens[i-1].replace(".", "").replace(",", "").isdigit():
+                                            vol = tokens[i-1] + " " + t
+                                        else:
+                                            vol = t
+                                    elif t == "peers:":
+                                        peers = " ".join(tokens[i+1:])
+                                        break
+                                int_rows.append([ip, vol, peers])
+                        if int_rows:
+                            _table(
+                                ["Internal IP", "Volume", "External Peers"],
+                                int_rows[:10],
+                                col_widths=[45, 30, eff_w - 75],
+                            )
+                continue
+
             # --- Port Analysis section → render as tables ---
             is_port_section = "PORT ANALYSIS" in sec_title.upper()
             if is_port_section:
@@ -2956,6 +3050,122 @@ class PcapAiAnalyzer:
                 lines.append(f"{'=' * 60}")
                 lines.append(lateral_text)
 
+        # --- External Communications Summary ---
+        ext_flows: list[dict] = []
+        for (src, dst, dport, proto), stats in session.conversations.items():
+            src_int = is_internal(src)
+            dst_int = is_internal(dst)
+            if src_int and not dst_int:
+                ext_flows.append({
+                    "src": src, "dst": dst, "dport": dport, "proto": proto,
+                    "direction": "INT->EXT",
+                    "bytes": stats["bytes_out"], "packets": stats["packets"],
+                })
+            elif not src_int and dst_int:
+                ext_flows.append({
+                    "src": src, "dst": dst, "dport": dport, "proto": proto,
+                    "direction": "EXT->INT",
+                    "bytes": stats["bytes_out"], "packets": stats["packets"],
+                })
+
+        if ext_flows:
+            lines.append(f"\n{'=' * 60}")
+            lines.append("External Communications")
+            lines.append(f"{'=' * 60}")
+
+            total_ext_bytes = sum(f["bytes"] for f in ext_flows)
+            int_to_ext = [f for f in ext_flows if f["direction"] == "INT->EXT"]
+            ext_to_int = [f for f in ext_flows if f["direction"] == "EXT->INT"]
+            unique_ext_ips = set()
+            for f in ext_flows:
+                if f["direction"] == "INT->EXT":
+                    unique_ext_ips.add(f["dst"])
+                else:
+                    unique_ext_ips.add(f["src"])
+            unique_int_ips = set()
+            for f in ext_flows:
+                if f["direction"] == "INT->EXT":
+                    unique_int_ips.add(f["src"])
+                else:
+                    unique_int_ips.add(f["dst"])
+
+            lines.append(f"\nTotal external flows: {len(ext_flows):,} "
+                         f"({_format_bytes(total_ext_bytes)})")
+            lines.append(f"  INT -> EXT: {len(int_to_ext):,} flows "
+                         f"({_format_bytes(sum(f['bytes'] for f in int_to_ext))})")
+            lines.append(f"  EXT -> INT: {len(ext_to_int):,} flows "
+                         f"({_format_bytes(sum(f['bytes'] for f in ext_to_int))})")
+            lines.append(f"  Unique external IPs: {len(unique_ext_ips)}")
+            lines.append(f"  Internal hosts with external comms: {len(unique_int_ips)}")
+
+            # Top external destinations by bytes
+            ext_dst_bytes: dict[str, int] = defaultdict(int)
+            ext_dst_flows: dict[str, int] = defaultdict(int)
+            ext_dst_ports: dict[str, set] = defaultdict(set)
+            for f in int_to_ext:
+                ext_dst_bytes[f["dst"]] += f["bytes"]
+                ext_dst_flows[f["dst"]] += 1
+                ext_dst_ports[f["dst"]].add(f["dport"])
+
+            if ext_dst_bytes:
+                lines.append(f"\n🌐 TOP EXTERNAL DESTINATIONS (by bytes) — {len(ext_dst_bytes)} total")
+                lines.append("-" * 70)
+                sorted_ext = sorted(ext_dst_bytes.items(), key=lambda x: x[1], reverse=True)
+                for ip, total in sorted_ext[:15]:
+                    ports = sorted(ext_dst_ports[ip])
+                    port_str = ", ".join(str(p) for p in ports[:5])
+                    if len(ports) > 5:
+                        port_str += f" (+{len(ports)-5})"
+                    lines.append(
+                        f"  {ip:<18} {_format_bytes(total):<12} "
+                        f"flows={ext_dst_flows[ip]:<6} ports: {port_str}"
+                    )
+
+            # Top external sources (EXT→INT)
+            ext_src_bytes: dict[str, int] = defaultdict(int)
+            ext_src_flows: dict[str, int] = defaultdict(int)
+            ext_src_ports: dict[str, set] = defaultdict(set)
+            for f in ext_to_int:
+                ext_src_bytes[f["src"]] += f["bytes"]
+                ext_src_flows[f["src"]] += 1
+                ext_src_ports[f["src"]].add(f["dport"])
+
+            if ext_src_bytes:
+                lines.append(f"\n🌐 TOP EXTERNAL SOURCES (inbound) — {len(ext_src_bytes)} total")
+                lines.append("-" * 70)
+                sorted_src = sorted(ext_src_bytes.items(), key=lambda x: x[1], reverse=True)
+                for ip, total in sorted_src[:15]:
+                    ports = sorted(ext_src_ports[ip])
+                    port_str = ", ".join(str(p) for p in ports[:5])
+                    if len(ports) > 5:
+                        port_str += f" (+{len(ports)-5})"
+                    lines.append(
+                        f"  {ip:<18} {_format_bytes(total):<12} "
+                        f"flows={ext_src_flows[ip]:<6} ports: {port_str}"
+                    )
+
+            # Internal hosts with most external communication
+            int_ext_bytes: dict[str, int] = defaultdict(int)
+            int_ext_peers: dict[str, set] = defaultdict(set)
+            for f in ext_flows:
+                if f["direction"] == "INT->EXT":
+                    int_ext_bytes[f["src"]] += f["bytes"]
+                    int_ext_peers[f["src"]].add(f["dst"])
+                else:
+                    int_ext_bytes[f["dst"]] += f["bytes"]
+                    int_ext_peers[f["dst"]].add(f["src"])
+
+            if int_ext_bytes:
+                lines.append(f"\n🏢 INTERNAL HOSTS WITH MOST EXTERNAL TRAFFIC")
+                lines.append("-" * 70)
+                sorted_int = sorted(int_ext_bytes.items(), key=lambda x: x[1], reverse=True)
+                for ip, total in sorted_int[:10]:
+                    peer_count = len(int_ext_peers[ip])
+                    lines.append(
+                        f"  {ip:<18} {_format_bytes(total):<12} "
+                        f"external peers: {peer_count}"
+                    )
+
         ports_result = hunter.execute({"hunt": "ports"}, None)
         if ports_result.ok and ports_result.result:
             port_text = ports_result.result.get("summary_text", "")
@@ -2971,51 +3181,81 @@ class PcapAiAnalyzer:
     def _analyze_protocol_security(session: Any) -> str:
         """Detect weak and deprecated protocol versions (SMBv1, TLS 1.0, etc.)."""
         from collections import Counter, defaultdict
+        from plugins.network_forensics.pcap_metadata_summary.tool import (
+            is_internal, _format_bytes,
+        )
         findings = []
 
         # --- SMB Protocol Detection ---
         if hasattr(session, "smb_mappings") and session.smb_mappings:
             smb_count = len(session.smb_mappings)
-            # Flag SMBv1 (we don't parse SMB version in detail, but SMB on port 445 pre-2016 is likely v1)
             findings.append(f"\n⚠️  SMB Traffic Detected: {smb_count} SMB operations")
             findings.append(f"  Risk: Verify SMB protocol version (SMBv1 is DEPRECATED and HIGH RISK)")
-            # Show unique SMB servers
+            # Top SMB communication pairs by volume
+            smb_pairs: Counter = Counter()
+            for s in session.smb_mappings:
+                smb_pairs[(s["src"], s["dst"])] += 1
+            findings.append(f"\n  Top SMB Communications (src -> dst):")
+            for (src, dst), cnt in smb_pairs.most_common(10):
+                src_loc = "INT" if is_internal(src) else "EXT"
+                dst_loc = "INT" if is_internal(dst) else "EXT"
+                findings.append(f"    {src} ({src_loc}) -> {dst} ({dst_loc})  [{cnt} ops]")
+            # Unique SMB servers
             smb_servers = set(s["dst"] for s in session.smb_mappings)
-            findings.append(f"  SMB Servers: {', '.join(sorted(smb_servers)[:5])}")
-            if len(smb_servers) > 5:
-                findings.append(f"  ... and {len(smb_servers) - 5} more")
+            findings.append(f"  SMB Servers ({len(smb_servers)}): {', '.join(sorted(smb_servers)[:10])}")
+            # Unique SMB clients
+            smb_clients = set(s["src"] for s in session.smb_mappings)
+            findings.append(f"  SMB Clients ({len(smb_clients)}): {', '.join(sorted(smb_clients)[:10])}")
 
         # --- TLS/SSL Protocol Version Detection ---
         if hasattr(session, "tls_handshakes") and session.tls_handshakes:
             tls_count = len(session.tls_handshakes)
             findings.append(f"\n🔒 TLS/SSL Handshakes Detected: {tls_count} sessions")
             findings.append(f"  Note: Verify protocol versions (TLS 1.0/1.1 are DEPRECATED, use TLS 1.2+)")
-            # Extract unique destinations
-            tls_dests = set()
+            # Top TLS communication pairs
+            tls_pairs: Counter = Counter()
             for th in session.tls_handshakes:
-                if th.get("dport") in (443, 8443, 636):
-                    tls_dests.add((th.get("dst"), th.get("dport")))
-            if tls_dests:
-                findings.append(f"  HTTPS/TLS Services: {len(tls_dests)} servers detected")
-                for dst, port in sorted(tls_dests)[:5]:
-                    findings.append(f"    {dst}:{port}")
+                tls_pairs[(th.get("src", "?"), th.get("dst", "?"), th.get("dport", 0))] += 1
+            findings.append(f"\n  Top TLS Communications (src -> dst:port):")
+            for (src, dst, dport), cnt in tls_pairs.most_common(10):
+                src_loc = "INT" if is_internal(src) else "EXT"
+                dst_loc = "INT" if is_internal(dst) else "EXT"
+                sni_list = [th.get("sni", "") for th in session.tls_handshakes
+                            if th.get("src") == src and th.get("dst") == dst and th.get("dport") == dport]
+                sni = next((s for s in sni_list if s), "")
+                sni_str = f" [{sni}]" if sni else ""
+                findings.append(f"    {src} ({src_loc}) -> {dst}:{dport} ({dst_loc})  [{cnt} sessions]{sni_str}")
 
         # --- RDP Detection (port 3389) ---
-        rdp_ports = set()
-        for conv in session.conversations:
-            if conv[1] == 3389 or conv[2] == 3389:
-                rdp_ports.add(conv[1] if conv[1] == 3389 else conv[2])
-        if rdp_ports:
-            findings.append(f"\n⚠️  RDP (Remote Desktop) Traffic Detected")
+        rdp_flows = []
+        for (src, dst, dport, proto), stats in session.conversations.items():
+            if dport == 3389:
+                rdp_flows.append((src, dst, stats["packets"], stats["bytes_out"]))
+        if rdp_flows:
+            findings.append(f"\n⚠️  RDP (Remote Desktop) Traffic Detected: {len(rdp_flows)} flows")
             findings.append(f"  Risk: RDP port 3389 should be restricted; verify encryption levels")
+            rdp_flows.sort(key=lambda x: x[3], reverse=True)
+            findings.append(f"\n  Top RDP Communications (src -> dst):")
+            for src, dst, pkts, bytes_out in rdp_flows[:10]:
+                src_loc = "INT" if is_internal(src) else "EXT"
+                dst_loc = "INT" if is_internal(dst) else "EXT"
+                findings.append(
+                    f"    {src} ({src_loc}) -> {dst}:3389 ({dst_loc})  "
+                    f"[{pkts} pkts, {_format_bytes(bytes_out)}]"
+                )
 
         # --- HTTP (Cleartext) Detection ---
         if hasattr(session, "http_requests") and session.http_requests:
             findings.append(f"\n⚠️  Cleartext HTTP Traffic: {len(session.http_requests)} requests")
             findings.append(f"  Risk: Credentials and sensitive data may be visible in cleartext")
-            hosts = set(r.get("host", "") for r in session.http_requests if r.get("host"))
-            if hosts:
-                findings.append(f"  HTTP Hosts: {', '.join(sorted(hosts)[:5])}")
+            # Top HTTP communication pairs
+            http_pairs: Counter = Counter()
+            for r in session.http_requests:
+                http_pairs[(r.get("src", "?"), r.get("host", "?"))] += 1
+            findings.append(f"\n  Top HTTP Communications (src -> host):")
+            for (src, host), cnt in http_pairs.most_common(10):
+                src_loc = "INT" if is_internal(src) else "EXT"
+                findings.append(f"    {src} ({src_loc}) -> {host}  [{cnt} requests]")
 
         if not findings:
             return ""
@@ -3024,14 +3264,28 @@ class PcapAiAnalyzer:
     @staticmethod
     def _analyze_cryptographic_weaknesses(session: Any) -> str:
         """Detect weak ciphers, deprecated algorithms, and crypto risks."""
+        from collections import Counter, defaultdict
+        from plugins.network_forensics.pcap_metadata_summary.tool import is_internal
         findings = []
 
         # --- TLS Cipher Analysis ---
         if hasattr(session, "tls_handshakes") and session.tls_handshakes:
-            # Note: Full cipher suite extraction requires deep PCAP parsing (TLSServerHello inspection)
-            # For now, we flag the presence of TLS and recommend cipher audit
             findings.append(f"\n🔍 TLS Cipher Suite Analysis (Requires Deep Packet Inspection):")
             findings.append(f"  {len(session.tls_handshakes)} TLS handshakes detected")
+            # Top TLS servers that should be audited
+            tls_servers: Counter = Counter()
+            for th in session.tls_handshakes:
+                dst = th.get("dst", "?")
+                dport = th.get("dport", 0)
+                tls_servers[(dst, dport)] += 1
+            findings.append(f"\n  Top TLS Servers to Audit for Cipher Strength:")
+            for (dst, dport), cnt in tls_servers.most_common(10):
+                loc = "INT" if is_internal(dst) else "EXT"
+                sni_list = [th.get("sni", "") for th in session.tls_handshakes
+                            if th.get("dst") == dst and th.get("dport") == dport]
+                sni = next((s for s in sni_list if s), "")
+                sni_str = f" [{sni}]" if sni else ""
+                findings.append(f"    {dst}:{dport} ({loc})  [{cnt} sessions]{sni_str}")
             findings.append(f"\n  ⚠️  RECOMMENDATIONS:")
             findings.append(f"  • Verify NO weak ciphers: RC4, DES, MD5-based, NULL ciphers, ANON ciphers")
             findings.append(f"  • Enforce TLS 1.2+ (deprecated: TLS 1.0, 1.1, SSL 3.0)")
@@ -3044,6 +3298,22 @@ class PcapAiAnalyzer:
             findings.append(f"  {len(session.snmp_communities)} unique communities detected")
             findings.append(f"  Communities: {', '.join(list(session.snmp_communities.keys())[:5])}")
             findings.append(f"  Risk: SNMPv1/v2c transmit credentials in CLEARTEXT")
+            # Show SNMP hosts
+            if hasattr(session, "snmp_sources") and session.snmp_sources:
+                findings.append(f"\n  Top SNMP Sources (hosts using cleartext SNMP):")
+                for ip, cnt in session.snmp_sources.most_common(10):
+                    loc = "INT" if is_internal(ip) else "EXT"
+                    findings.append(f"    {ip} ({loc})  [{cnt} packets]")
+            # Show SNMP destinations from conversations
+            snmp_dsts: Counter = Counter()
+            for (src, dst, dport, proto), stats in session.conversations.items():
+                if dport == 161 or dport == 162:
+                    snmp_dsts[dst] += stats["packets"]
+            if snmp_dsts:
+                findings.append(f"\n  Top SNMP Destinations (managed devices):")
+                for ip, cnt in snmp_dsts.most_common(10):
+                    loc = "INT" if is_internal(ip) else "EXT"
+                    findings.append(f"    {ip} ({loc})  [{cnt} packets]")
             findings.append(f"  Recommendation: Migrate to SNMPv3 with authentication and encryption")
 
         # --- Kerberos Cipher Detection ---
@@ -3059,11 +3329,35 @@ class PcapAiAnalyzer:
                 if weak_ciphers:
                     findings.append(f"  ⚠️  WEAK KERBEROS CIPHERS DETECTED: {', '.join(weak_ciphers)}")
                     findings.append(f"  Recommendation: Disable weak ciphers; prefer AES-SHA256")
+                # Show Kerberos hosts
+                kerb_pairs: Counter = Counter()
+                for kt in session.kerberos_tickets:
+                    kerb_pairs[(kt.get("src", "?"), kt.get("dst", "?"))] += 1
+                findings.append(f"\n  Top Kerberos Communications (client -> KDC):")
+                for (src, dst), cnt in kerb_pairs.most_common(10):
+                    src_loc = "INT" if is_internal(src) else "EXT"
+                    dst_loc = "INT" if is_internal(dst) else "EXT"
+                    findings.append(f"    {src} ({src_loc}) -> {dst} ({dst_loc})  [{cnt} tickets]")
 
         # --- Cleartext Credentials Risk ---
         if hasattr(session, "cleartext_creds") and session.cleartext_creds:
             findings.append(f"\n🔓 CLEARTEXT CREDENTIALS: {len(session.cleartext_creds)} detections")
             findings.append(f"  Crypto Risk: Credentials visible in plaintext protocol traffic")
+            # Show which hosts are exposed
+            cred_pairs: Counter = Counter()
+            cred_protos: dict[tuple, set] = defaultdict(set)
+            for c in session.cleartext_creds:
+                pair = (c.get("src", "?"), c.get("dst", "?"))
+                cred_pairs[pair] += 1
+                cred_protos[pair].add(c.get("protocol", "?"))
+            findings.append(f"\n  Top Cleartext Credential Exposures (src -> dst):")
+            for (src, dst), cnt in cred_pairs.most_common(10):
+                src_loc = "INT" if is_internal(src) else "EXT"
+                dst_loc = "INT" if is_internal(dst) else "EXT"
+                protos = ", ".join(sorted(cred_protos[(src, dst)]))
+                findings.append(
+                    f"    {src} ({src_loc}) -> {dst} ({dst_loc})  [{cnt} creds] ({protos})"
+                )
             findings.append(f"  Recommendation: Enforce encrypted protocols (SSH, HTTPS, TLS)")
 
         if not findings:
