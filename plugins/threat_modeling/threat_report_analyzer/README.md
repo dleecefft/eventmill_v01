@@ -6,7 +6,7 @@
 
 Reads threat intelligence reports (MITRE ATT&CK, CAPEC, CISA advisories, vendor bulletins, vendor PDFs) from the common bucket and generates 1500-2000 word markdown summaries for use as context in other analysis tools.
 
-Handles large files (up to 50 MB / ~1,000 pages) using a chunked processing approach — content is split into segments, each summarized independently, then merged into a single coherent output.
+Handles large files (up to 100 MB / ~1,000 pages) using a chunked processing approach — content is split into segments, each summarized independently, then merged into a single coherent output.
 
 Three actions:
 
@@ -68,6 +68,9 @@ The framework additionally registers the final summary as a `text` session artif
 ```
 
 ### Summarize a Report
+
+`report_path` is the relative path within the common bucket. Use `list_reports` first to discover available paths.
+
 ```json
 {"action": "summarize", "report_path": "mitre/enterprise-attack.json", "max_word_count": 2000}
 ```

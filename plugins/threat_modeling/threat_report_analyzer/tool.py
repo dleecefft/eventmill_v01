@@ -165,7 +165,7 @@ class ThreatReportAnalyzer:
     GENERATED_BASE = "generated"
 
     # Intake and chunking limits
-    MAX_PDF_SIZE_BYTES = 50 * 1024 * 1024
+    MAX_PDF_SIZE_BYTES = 100 * 1024 * 1024
     MAX_PDF_PAGES = 1000
     MAX_PAGES_PER_CHUNK = 100
     MAX_TOKENS_PER_CHUNK = 100_000

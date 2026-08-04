@@ -1808,6 +1808,8 @@ class EventMillShell(cmd.Cmd):
         },
         "threat_report_analyzer": {
             "action": ["list_reports", "summarize", "search_reports"],
+            "report_path": ["mitre/", "capec/", "cisa/", "vendor_advisories/",
+                            "threat_actors/", "campaigns/", "vulnerabilities/"],
         },
         "threat_model_analyzer": {
             "action": ["analyze_document", "create_scenario", "add_control",
