@@ -231,13 +231,6 @@ class PcapSession:
         self.stp_bpdu_gaps: List[tuple] = []                 # (src_mac, gap_start_ts, gap_seconds) gaps > max_age
         self.stp_mac_mismatches: List[tuple] = []            # (ts, eth_src_mac, bpdu_bridge_mac) spoofing indicator
 
-        # Control plane — CDP / LLDP (switch identity from PCAP)
-        # Key = source MAC, Value = dict with device details
-        self.cdp_neighbors: Dict[str, Dict[str, Any]] = {}   # mac -> {device_id, platform, mgmt_ip, port_id, software_version, capabilities, native_vlan, vtp_domain, duplex}
-        self.lldp_neighbors: Dict[str, Dict[str, Any]] = {}  # mac -> {system_name, system_desc, mgmt_ip, port_id, port_desc, chassis_id, capabilities}
-        self.cdp_frame_count: int = 0
-        self.lldp_frame_count: int = 0
-
         # Control plane — HSRP
         self.hsrp_hello_count: int = 0
         self.hsrp_events: List[Dict] = []
@@ -271,23 +264,6 @@ class PcapSession:
         # IP fragmentation & TTL
         self.ip_fragment_count: int = 0
         self.ttl_distribution: Counter = Counter()
-
-        # VLAN 802.1Q tagging analysis
-        self.vlan_ids: Counter = Counter()              # vlan_id -> count of tagged frames
-        self.vlan_to_ips: Dict[int, set] = defaultdict(set)  # vlan_id -> {ips in that vlan}
-        self.vlan_to_ports: Dict[int, set] = defaultdict(set)  # vlan_id -> {(src_mac, dst_mac) pairs}
-        self.untagged_frame_count: int = 0              # frames without 802.1Q tag
-        self.vlan_1_detected: bool = False              # flag if native VLAN 1 in use (config issue)
-
-        # Network discovery — passive evidence collected during parsing
-        # Each entry: {network: str, mask: int, source: str, evidence: str, confidence: str}
-        # source: "arp", "dhcp", "ospf", "eigrp", "broadcast", "assumed"
-        # confidence: "high" (OSPF/DHCP explicit mask), "medium" (ARP boundary), "low" (assumed)
-        self.network_evidence: List[Dict[str, Any]] = []
-        # BQ enrichment overlay (populated by `networks enrich` command)
-        self.network_enrichment: List[Dict[str, Any]] = []
-        # Default subnet assumption
-        self.network_default_mask: int = 24
 
     @property
     def unique_ips(self) -> set:
@@ -462,19 +438,6 @@ class PcapSession:
         self.ip_fragment_count += other.ip_fragment_count
         self.ttl_distribution += other.ttl_distribution
 
-        # VLAN tagging analysis
-        self.vlan_ids += other.vlan_ids
-        self.untagged_frame_count += other.untagged_frame_count
-        self.vlan_1_detected = self.vlan_1_detected or other.vlan_1_detected
-        for vlan_id, ips in other.vlan_to_ips.items():
-            self.vlan_to_ips[vlan_id].update(ips)
-        for vlan_id, pairs in other.vlan_to_ports.items():
-            self.vlan_to_ports[vlan_id].update(pairs)
-
-        # Network discovery evidence
-        self.network_evidence.extend(other.network_evidence)
-        self.network_enrichment.extend(other.network_enrichment)
-
         # --- New protocol fields ---
 
         # SCADA tags — merge dicts (add counts, extend samples)
@@ -497,19 +460,34 @@ class PcapSession:
         self.syslog_patterns += other.syslog_patterns
         self.syslog_total += other.syslog_total
 
-        # SSH sessions
-        self.ssh_sessions.extend(other.ssh_sessions)
+        # SSH sessions (cap at 500)
+        remaining = max(0, 500 - len(self.ssh_sessions))
+        self.ssh_sessions.extend(other.ssh_sessions[:remaining])
 
         # SNMP
         self.snmp_communities += other.snmp_communities
         self.snmp_sources += other.snmp_sources
 
-        # AD / Windows protocols
-        for attr in ("kerberos_tickets", "smb_mappings", "smb_files",
-                     "dce_rpc_calls", "ldap_operations", "ntlm_auths"):
-            getattr(self, attr).extend(getattr(other, attr))
+        # AD / Windows protocols (cap at 1000 each)
+        for attr, cap in (
+            ("kerberos_tickets", 1000),
+            ("smb_mappings", 1000),
+            ("smb_files", 1000),
+            ("dce_rpc_calls", 1000),
+            ("ldap_operations", 1000),
+            ("ntlm_auths", 1000),
+        ):
+            mine = getattr(self, attr)
+            remaining = max(0, cap - len(mine))
+            mine.extend(getattr(other, attr)[:remaining])
 
-        # No caps — 32GB RAM available on Cloud Run
+        # Cap unbounded lists accumulated across files
+        _LIST_CAP = 50_000
+        for attr in ("dns_queries", "dns_responses", "http_requests",
+                      "tls_handshakes", "ot_transactions", "icmp_errors"):
+            lst = getattr(self, attr)
+            if len(lst) > _LIST_CAP:
+                setattr(self, attr, lst[:_LIST_CAP])
 
 
 # ---------------------------------------------------------------------------
@@ -598,29 +576,6 @@ try:
     from scapy.layers.vrrp import VRRP as ScapyVRRP
     from scapy.packet import Raw
     SCAPY_AVAILABLE = True
-
-    # CDP/LLDP contrib layers for switch identity extraction
-    try:
-        from scapy.contrib.cdp import (CDPv2_HDR, CDPMsgDeviceID, CDPMsgAddr,
-                                        CDPMsgPlatform, CDPMsgPortID,
-                                        CDPMsgSoftwareVersion, CDPMsgCapabilities,
-                                        CDPMsgNativeVLAN, CDPMsgVTPMgmtDomain,
-                                        CDPMsgDuplex)
-        SCAPY_CDP_AVAILABLE = True
-    except ImportError:
-        SCAPY_CDP_AVAILABLE = False
-
-    try:
-        from scapy.contrib.lldp import (LLDPDU, LLDPDUChassisID,
-                                         LLDPDUPortID, LLDPDUTimeToLive,
-                                         LLDPDUSystemName,
-                                         LLDPDUSystemDescription,
-                                         LLDPDUSystemCapabilities,
-                                         LLDPDUManagementAddress,
-                                         LLDPDUPortDescription)
-        SCAPY_LLDP_AVAILABLE = True
-    except ImportError:
-        SCAPY_LLDP_AVAILABLE = False
 
     try:
         from scapy.layers.tls.record import TLS
@@ -807,144 +762,6 @@ def parse_pcap_file(file_path: str) -> PcapSession:
                         session.stp_port_states['Blocking/Discarding'] += 1
                 except Exception:
                     pass
-
-            # --- CDP extraction (Cisco Discovery Protocol, L2) ---
-            # CDP dst MAC: 01:00:0c:cc:cc:cc, sent as SNAP with OUI 0x00000c, type 0x2000
-            if SCAPY_CDP_AVAILABLE and pkt.haslayer(CDPv2_HDR):
-                try:
-                    session.cdp_frame_count += 1
-                    eth_src = pkt.src if hasattr(pkt, 'src') else ''
-                    if eth_src:
-                        info: Dict[str, Any] = session.cdp_neighbors.get(eth_src, {})
-                        cdp = pkt[CDPv2_HDR]
-                        if cdp.haslayer(CDPMsgDeviceID):
-                            info['device_id'] = cdp[CDPMsgDeviceID].val.decode('utf-8', errors='replace').strip('\x00')
-                        if cdp.haslayer(CDPMsgPlatform):
-                            info['platform'] = cdp[CDPMsgPlatform].val.decode('utf-8', errors='replace').strip('\x00')
-                        if cdp.haslayer(CDPMsgPortID):
-                            info['port_id'] = cdp[CDPMsgPortID].iface.decode('utf-8', errors='replace').strip('\x00')
-                        if cdp.haslayer(CDPMsgSoftwareVersion):
-                            raw_ver = cdp[CDPMsgSoftwareVersion].val.decode('utf-8', errors='replace').strip('\x00')
-                            # Condense multi-line IOS version to first meaningful line
-                            info['software_version'] = raw_ver.split('\n')[0].strip() if raw_ver else ''
-                        if cdp.haslayer(CDPMsgAddr):
-                            # Extract first IP address from address list
-                            addr_layer = cdp[CDPMsgAddr]
-                            if hasattr(addr_layer, 'addr') and addr_layer.addr:
-                                try:
-                                    first_addr = addr_layer.addr[0]
-                                    if hasattr(first_addr, 'addr'):
-                                        ip_bytes = bytes(first_addr.addr)
-                                        if len(ip_bytes) == 4:
-                                            import socket as _sock
-                                            info['mgmt_ip'] = _sock.inet_ntoa(ip_bytes)
-                                except (IndexError, Exception):
-                                    pass
-                        if cdp.haslayer(CDPMsgCapabilities):
-                            cap_val = cdp[CDPMsgCapabilities].cap
-                            caps = []
-                            if cap_val & 0x01: caps.append('Router')
-                            if cap_val & 0x02: caps.append('TB-Bridge')
-                            if cap_val & 0x04: caps.append('SR-Bridge')
-                            if cap_val & 0x08: caps.append('Switch')
-                            if cap_val & 0x10: caps.append('Host')
-                            if cap_val & 0x20: caps.append('IGMP')
-                            if cap_val & 0x40: caps.append('Repeater')
-                            info['capabilities'] = ', '.join(caps) if caps else ''
-                        if cdp.haslayer(CDPMsgNativeVLAN):
-                            info['native_vlan'] = cdp[CDPMsgNativeVLAN].vlan
-                        if cdp.haslayer(CDPMsgVTPMgmtDomain):
-                            info['vtp_domain'] = cdp[CDPMsgVTPMgmtDomain].val.decode('utf-8', errors='replace').strip('\x00')
-                        if cdp.haslayer(CDPMsgDuplex):
-                            info['duplex'] = 'Full' if cdp[CDPMsgDuplex].duplex else 'Half'
-                        session.cdp_neighbors[eth_src] = info
-                except Exception:
-                    pass
-
-            # --- LLDP extraction (Link Layer Discovery Protocol, L2) ---
-            # LLDP dst MAC: 01:80:c2:00:00:0e, EtherType 0x88cc
-            if SCAPY_LLDP_AVAILABLE and pkt.haslayer(LLDPDU):
-                try:
-                    session.lldp_frame_count += 1
-                    eth_src = pkt.src if hasattr(pkt, 'src') else ''
-                    if eth_src:
-                        info = session.lldp_neighbors.get(eth_src, {})
-                        if pkt.haslayer(LLDPDUSystemName):
-                            info['system_name'] = pkt[LLDPDUSystemName].system_name.decode('utf-8', errors='replace') if isinstance(pkt[LLDPDUSystemName].system_name, bytes) else str(pkt[LLDPDUSystemName].system_name)
-                        if pkt.haslayer(LLDPDUSystemDescription):
-                            raw_desc = pkt[LLDPDUSystemDescription].description.decode('utf-8', errors='replace') if isinstance(pkt[LLDPDUSystemDescription].description, bytes) else str(pkt[LLDPDUSystemDescription].description)
-                            info['system_desc'] = raw_desc.split('\n')[0].strip()
-                        if pkt.haslayer(LLDPDUChassisID):
-                            chassis = pkt[LLDPDUChassisID]
-                            if hasattr(chassis, 'id') and chassis.id:
-                                cid = chassis.id
-                                if isinstance(cid, bytes):
-                                    if len(cid) == 6:
-                                        info['chassis_id'] = ':'.join(f'{b:02x}' for b in cid)
-                                    else:
-                                        info['chassis_id'] = cid.decode('utf-8', errors='replace')
-                                else:
-                                    info['chassis_id'] = str(cid)
-                        if pkt.haslayer(LLDPDUPortID):
-                            port = pkt[LLDPDUPortID]
-                            if hasattr(port, 'id') and port.id:
-                                pid = port.id
-                                info['port_id'] = pid.decode('utf-8', errors='replace') if isinstance(pid, bytes) else str(pid)
-                        if pkt.haslayer(LLDPDUPortDescription):
-                            pd = pkt[LLDPDUPortDescription].description
-                            info['port_desc'] = pd.decode('utf-8', errors='replace') if isinstance(pd, bytes) else str(pd)
-                        if pkt.haslayer(LLDPDUManagementAddress):
-                            mgmt = pkt[LLDPDUManagementAddress]
-                            if hasattr(mgmt, 'management_address'):
-                                addr_bytes = bytes(mgmt.management_address)
-                                if len(addr_bytes) == 4:
-                                    import socket as _sock
-                                    info['mgmt_ip'] = _sock.inet_ntoa(addr_bytes)
-                                elif len(addr_bytes) == 5 and addr_bytes[0] == 1:
-                                    # Subtype 1 (IPv4) prefix
-                                    import socket as _sock
-                                    info['mgmt_ip'] = _sock.inet_ntoa(addr_bytes[1:5])
-                        if pkt.haslayer(LLDPDUSystemCapabilities):
-                            cap_layer = pkt[LLDPDUSystemCapabilities]
-                            if hasattr(cap_layer, 'system_capabilities'):
-                                cap_val = cap_layer.system_capabilities
-                                caps = []
-                                if cap_val & 0x0002: caps.append('Repeater')
-                                if cap_val & 0x0004: caps.append('Bridge')
-                                if cap_val & 0x0010: caps.append('Router')
-                                if cap_val & 0x0040: caps.append('Station')
-                                info['capabilities'] = ', '.join(caps) if caps else ''
-                        session.lldp_neighbors[eth_src] = info
-                except Exception:
-                    pass
-
-            # --- 802.1Q VLAN tag extraction (L2) ---
-            vlan_id = None
-            if pkt.haslayer(Dot1Q):
-                try:
-                    dot1q = pkt[Dot1Q]
-                    vlan_id = dot1q.vlan
-                    session.vlan_ids[vlan_id] += 1
-                    
-                    # Flag if VLAN 1 is in use (native VLAN, potential misconfiguration in OT)
-                    if vlan_id == 1:
-                        session.vlan_1_detected = True
-                    
-                    # Track which IPs appear on which VLANs
-                    if pkt.haslayer(IP):
-                        ip_layer_vlan = pkt[IP]
-                        session.vlan_to_ips[vlan_id].add(ip_layer_vlan.src)
-                        session.vlan_to_ips[vlan_id].add(ip_layer_vlan.dst)
-                    
-                    # Track MAC pairs on VLANs
-                    if hasattr(pkt, 'src') and hasattr(pkt, 'dst'):
-                        mac_pair = (pkt.src, pkt.dst)
-                        session.vlan_to_ports[vlan_id].add(mac_pair)
-                except Exception:
-                    pass
-            else:
-                # No VLAN tag detected
-                session.untagged_frame_count += 1
 
             if not pkt.haslayer(IP):
                 continue
@@ -1175,55 +992,6 @@ def parse_pcap_file(file_path: str) -> PcapSession:
             # ---------------------------------------------------------------
             # Netops: HSRP extraction (UDP port 1985)
             # ---------------------------------------------------------------
-            # --- Network discovery: DHCP subnet mask (UDP 67/68) ---
-            if proto == "UDP" and dport in (67, 68):
-                try:
-                    from scapy.layers.dhcp import DHCP as ScapyDHCP, BOOTP
-                    if pkt.haslayer(ScapyDHCP):
-                        opts = pkt[ScapyDHCP].options
-                        subnet_mask = None
-                        msg_type = None
-                        for opt in opts:
-                            if isinstance(opt, tuple):
-                                if opt[0] == 'subnet_mask':
-                                    subnet_mask = opt[1]
-                                elif opt[0] == 'message-type':
-                                    msg_type = opt[1]
-                        if subnet_mask and msg_type in (2, 5):  # Offer or ACK
-                            bootp = pkt[BOOTP] if pkt.haslayer(BOOTP) else None
-                            assigned_ip = bootp.yiaddr if bootp else None
-                            if assigned_ip and assigned_ip != "0.0.0.0":
-                                import ipaddress as _ipaddress
-                                mask_int = int(_ipaddress.IPv4Address(subnet_mask))
-                                prefix_len = bin(mask_int).count('1')
-                                iface = _ipaddress.IPv4Interface(f"{assigned_ip}/{prefix_len}")
-                                net_str = str(iface.network.network_address)
-                                session.network_evidence.append({
-                                    "network": net_str,
-                                    "mask": prefix_len,
-                                    "source": "dhcp",
-                                    "evidence": f"DHCP {'Offer' if msg_type == 2 else 'ACK'} mask={subnet_mask} for {assigned_ip}",
-                                    "confidence": "high",
-                                })
-                except Exception:
-                    pass
-
-            # --- Network discovery: directed broadcast detection ---
-            if dst_ip.endswith(".255") and not dst_ip == "255.255.255.255":
-                # x.x.x.255 implies a /24 broadcast
-                import ipaddress as _ipaddress
-                try:
-                    net_str = str(_ipaddress.IPv4Interface(f"{dst_ip}/24").network.network_address)
-                    session.network_evidence.append({
-                        "network": net_str,
-                        "mask": 24,
-                        "source": "broadcast",
-                        "evidence": f"Directed broadcast to {dst_ip}",
-                        "confidence": "medium",
-                    })
-                except Exception:
-                    pass
-
             if pkt.haslayer(ScapyHSRP):
                 try:
                     hsrp = pkt[ScapyHSRP]
@@ -1277,26 +1045,6 @@ def parse_pcap_file(file_path: str) -> PcapSession:
                             session.ospf_hello_count += 1
                             neighbor_key = (src_ip, dst_ip)
                             session.ospf_neighbor_hellos[neighbor_key].append(ts)
-                            # Extract network mask from OSPF Hello (bytes 24-27)
-                            if len(ospf_data) >= 28:
-                                mask_bytes = ospf_data[24:28]
-                                mask_int = int.from_bytes(mask_bytes, 'big')
-                                if mask_int > 0:
-                                    prefix_len = bin(mask_int).count('1')
-                                    # Derive network from src_ip + mask
-                                    import ipaddress as _ipaddress
-                                    try:
-                                        iface = _ipaddress.IPv4Interface(f"{src_ip}/{prefix_len}")
-                                        net_str = str(iface.network.network_address)
-                                        session.network_evidence.append({
-                                            "network": net_str,
-                                            "mask": prefix_len,
-                                            "source": "ospf",
-                                            "evidence": f"OSPF Hello from {router_id} on {src_ip}",
-                                            "confidence": "high",
-                                        })
-                                    except Exception:
-                                        pass
                         elif ospf_type == 2:  # DB Description
                             session.ospf_dbd_count += 1
                         elif ospf_type == 3:  # LS Request
@@ -1336,9 +1084,6 @@ def parse_pcap_file(file_path: str) -> PcapSession:
     # --- Post-process: detect BPDU starvation (gaps > max_age per source port) ---
     _compute_stp_bpdu_gaps(session)
 
-    # --- Post-process: infer networks from collected evidence ---
-    _infer_networks_from_evidence(session)
-
     return session
 
 
@@ -1362,80 +1107,6 @@ def _compute_stp_bpdu_gaps(session) -> None:
             gap = ts_sorted[i] - ts_sorted[i - 1]
             if gap > max_age:
                 session.stp_bpdu_gaps.append((src_mac, ts_sorted[i - 1], round(gap, 1)))
-
-
-def _infer_networks_from_evidence(session) -> None:
-    """Deduplicate network evidence and infer /24 for uncovered IPs.
-
-    Processes raw evidence (from OSPF, DHCP, broadcasts) into a deduplicated
-    set. Then for any IP in session.unique_ips not covered by discovered
-    networks, assumes the configured default mask (/24 by default).
-    """
-    import ipaddress
-
-    if not session.network_evidence and not session.unique_ips:
-        return
-
-    # Deduplicate: keep highest-confidence evidence per network
-    confidence_rank = {"high": 3, "medium": 2, "low": 1}
-    seen: dict[str, dict] = {}  # "network/mask" → best evidence entry
-
-    for entry in session.network_evidence:
-        key = f"{entry['network']}/{entry['mask']}"
-        existing = seen.get(key)
-        if not existing or confidence_rank.get(entry.get("confidence", "low"), 0) > confidence_rank.get(existing.get("confidence", "low"), 0):
-            seen[key] = entry
-
-    # Replace with deduplicated list
-    session.network_evidence = list(seen.values())
-
-    # Build set of discovered networks for coverage check
-    discovered_nets = []
-    for entry in session.network_evidence:
-        try:
-            net = ipaddress.IPv4Network(f"{entry['network']}/{entry['mask']}", strict=False)
-            discovered_nets.append(net)
-        except Exception:
-            pass
-
-    # Find IPs not covered by any discovered network → assume default mask
-    default_mask = session.network_default_mask
-    assumed_nets: set[str] = set()
-
-    for ip_str in session.unique_ips:
-        try:
-            ip_obj = ipaddress.IPv4Address(ip_str)
-        except Exception:
-            continue
-        # Skip non-routable / special addresses
-        if (
-            ip_obj.is_multicast          # 224.0.0.0/4, 239.x.x.x
-            or ip_obj.is_unspecified     # 0.0.0.0
-            or ip_obj.is_loopback        # 127.x.x.x
-            or ip_obj.is_link_local      # 169.254.x.x
-            or ip_str == "255.255.255.255"
-            or ip_str.endswith(".255")   # broadcast addresses
-        ):
-            continue
-        # Skip if already covered
-        covered = any(ip_obj in net for net in discovered_nets)
-        if not covered:
-            # Assume default mask
-            try:
-                iface = ipaddress.IPv4Interface(f"{ip_str}/{default_mask}")
-                net_key = str(iface.network)
-                if net_key not in assumed_nets:
-                    assumed_nets.add(net_key)
-                    net_addr = str(iface.network.network_address)
-                    session.network_evidence.append({
-                        "network": net_addr,
-                        "mask": default_mask,
-                        "source": "assumed",
-                        "evidence": f"Default /{default_mask} assumption",
-                        "confidence": "low",
-                    })
-            except Exception:
-                pass
 
 
 DPKT_AVAILABLE = False
@@ -1496,36 +1167,6 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
                 eth = dpkt.ethernet.Ethernet(buf)
             except (dpkt.dpkt.NeedData, dpkt.dpkt.UnpackError):
                 continue
-
-            # --- 802.1Q VLAN tag extraction (L2) ---
-            # dpkt: if eth.type == 0x8100, the frame has a VLAN tag.
-            # dpkt auto-unwraps 802.1Q: eth.vlan_tags (list) or check via
-            # the raw bytes. In older dpkt, check eth.type and manual parse.
-            _vlan_extracted = False
-            _current_vlan_id: int | None = None
-            if hasattr(eth, 'vlan_tags') and eth.vlan_tags:
-                # Newer dpkt (>= 1.9.4) with vlan_tags attribute
-                for vtag in eth.vlan_tags:
-                    vlan_id = vtag.id if hasattr(vtag, 'id') else (vtag & 0x0FFF)
-                    session.vlan_ids[vlan_id] += 1
-                    if vlan_id == 1:
-                        session.vlan_1_detected = True
-                    _current_vlan_id = vlan_id
-                    _vlan_extracted = True
-            elif eth.type == 0x8100 or eth.type == 0x88a8:  # 802.1Q or QinQ
-                # Manual parse: first 2 bytes after EtherType are TCI (PCP+DEI+VID)
-                # dpkt already unwrapped it into eth.data as the inner frame,
-                # but we need the VID. Check the raw buffer.
-                if len(buf) >= 16:
-                    tci = (buf[14] << 8) | buf[15]
-                    vlan_id = tci & 0x0FFF
-                    session.vlan_ids[vlan_id] += 1
-                    if vlan_id == 1:
-                        session.vlan_1_detected = True
-                    _current_vlan_id = vlan_id
-                    _vlan_extracted = True
-            if not _vlan_extracted:
-                session.untagged_frame_count += 1
 
             # --- ARP extraction (L2, before IP check) ---
             if eth.type == dpkt.ethernet.ETH_TYPE_ARP:
@@ -1663,154 +1304,14 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
             except Exception:
                 pass
 
-            # --- CDP extraction (dpkt, L2) ---
-            # CDP: 802.3 frame with SNAP, OUI 0x00000c, type 0x2000
-            # Destination MAC: 01:00:0c:cc:cc:cc
-            try:
-                raw = bytes(eth.data) if not isinstance(eth.data, bytes) else eth.data
-                dst_mac_bytes = eth.dst if isinstance(eth.dst, bytes) else b''
-                _cdp_dst = b'\x01\x00\x0c\xcc\xcc\xcc'
-                if dst_mac_bytes == _cdp_dst and len(raw) >= 12 and eth.type <= 1500:
-                    # SNAP header: AA-AA-03 OUI(3) Type(2)
-                    if raw[0:3] == b'\xaa\xaa\x03' and raw[3:6] == b'\x00\x00\x0c' and raw[6:8] == b'\x20\x00':
-                        cdp_data = raw[8:]  # Skip SNAP header
-                        if len(cdp_data) >= 4:
-                            session.cdp_frame_count += 1
-                            src_mac = ':'.join(f'{b:02x}' for b in eth.src)
-                            info: Dict[str, Any] = session.cdp_neighbors.get(src_mac, {})
-                            # CDP format: version(1) + ttl(1) + checksum(2) + TLVs
-                            offset = 4  # skip version, ttl, checksum
-                            while offset + 4 <= len(cdp_data):
-                                tlv_type = int.from_bytes(cdp_data[offset:offset+2], 'big')
-                                tlv_len = int.from_bytes(cdp_data[offset+2:offset+4], 'big')
-                                if tlv_len < 4:
-                                    break
-                                tlv_val = cdp_data[offset+4:offset+tlv_len]
-                                if tlv_type == 0x0001:  # Device ID
-                                    info['device_id'] = tlv_val.decode('utf-8', errors='replace').strip('\x00')
-                                elif tlv_type == 0x0002:  # Addresses
-                                    # Parse first address: num_addrs(4) + proto_type(1) + proto_len(1) + proto(n) + addr_len(2) + addr(4)
-                                    if len(tlv_val) >= 13:
-                                        try:
-                                            proto_len = tlv_val[5]
-                                            addr_offset = 6 + proto_len
-                                            if addr_offset + 2 <= len(tlv_val):
-                                                addr_len = int.from_bytes(tlv_val[addr_offset:addr_offset+2], 'big')
-                                                if addr_len == 4 and addr_offset + 2 + 4 <= len(tlv_val):
-                                                    info['mgmt_ip'] = socket.inet_ntoa(tlv_val[addr_offset+2:addr_offset+6])
-                                        except Exception:
-                                            pass
-                                elif tlv_type == 0x0003:  # Port ID
-                                    info['port_id'] = tlv_val.decode('utf-8', errors='replace').strip('\x00')
-                                elif tlv_type == 0x0004:  # Capabilities
-                                    if len(tlv_val) >= 4:
-                                        cap_val = int.from_bytes(tlv_val[:4], 'big')
-                                        caps = []
-                                        if cap_val & 0x01: caps.append('Router')
-                                        if cap_val & 0x02: caps.append('TB-Bridge')
-                                        if cap_val & 0x04: caps.append('SR-Bridge')
-                                        if cap_val & 0x08: caps.append('Switch')
-                                        if cap_val & 0x10: caps.append('Host')
-                                        if cap_val & 0x20: caps.append('IGMP')
-                                        if cap_val & 0x40: caps.append('Repeater')
-                                        info['capabilities'] = ', '.join(caps) if caps else ''
-                                elif tlv_type == 0x0005:  # Software Version
-                                    raw_ver = tlv_val.decode('utf-8', errors='replace').strip('\x00')
-                                    info['software_version'] = raw_ver.split('\n')[0].strip()
-                                elif tlv_type == 0x0006:  # Platform
-                                    info['platform'] = tlv_val.decode('utf-8', errors='replace').strip('\x00')
-                                elif tlv_type == 0x0009:  # VTP Management Domain
-                                    info['vtp_domain'] = tlv_val.decode('utf-8', errors='replace').strip('\x00')
-                                elif tlv_type == 0x000a:  # Native VLAN
-                                    if len(tlv_val) >= 2:
-                                        info['native_vlan'] = int.from_bytes(tlv_val[:2], 'big')
-                                elif tlv_type == 0x000b:  # Duplex
-                                    info['duplex'] = 'Full' if (tlv_val and tlv_val[0]) else 'Half'
-                                offset += tlv_len
-                            session.cdp_neighbors[src_mac] = info
-            except Exception:
-                pass
-
-            # --- LLDP extraction (dpkt, L2) ---
-            # LLDP: EtherType 0x88cc, dst MAC 01:80:c2:00:00:0e
-            try:
-                if eth.type == 0x88cc:
-                    lldp_data = bytes(eth.data) if not isinstance(eth.data, bytes) else eth.data
-                    if len(lldp_data) >= 2:
-                        session.lldp_frame_count += 1
-                        src_mac = ':'.join(f'{b:02x}' for b in eth.src)
-                        info = session.lldp_neighbors.get(src_mac, {})
-                        # Parse LLDP TLVs: 7-bit type + 9-bit length in first 2 bytes
-                        offset = 0
-                        while offset + 2 <= len(lldp_data):
-                            type_len = int.from_bytes(lldp_data[offset:offset+2], 'big')
-                            tlv_type = type_len >> 9
-                            tlv_len = type_len & 0x01FF
-                            if tlv_type == 0:  # End of LLDPDU
-                                break
-                            tlv_val = lldp_data[offset+2:offset+2+tlv_len]
-                            if tlv_type == 1 and tlv_len > 1:  # Chassis ID
-                                subtype = tlv_val[0]
-                                cid = tlv_val[1:]
-                                if subtype == 4 and len(cid) == 6:  # MAC address
-                                    info['chassis_id'] = ':'.join(f'{b:02x}' for b in cid)
-                                else:
-                                    info['chassis_id'] = cid.decode('utf-8', errors='replace')
-                            elif tlv_type == 2 and tlv_len > 1:  # Port ID
-                                info['port_id'] = tlv_val[1:].decode('utf-8', errors='replace')
-                            elif tlv_type == 4:  # Port Description
-                                info['port_desc'] = tlv_val.decode('utf-8', errors='replace')
-                            elif tlv_type == 5:  # System Name
-                                info['system_name'] = tlv_val.decode('utf-8', errors='replace')
-                            elif tlv_type == 6:  # System Description
-                                raw_desc = tlv_val.decode('utf-8', errors='replace')
-                                info['system_desc'] = raw_desc.split('\n')[0].strip()
-                            elif tlv_type == 7 and tlv_len >= 4:  # System Capabilities
-                                cap_val = int.from_bytes(tlv_val[0:2], 'big')
-                                caps = []
-                                if cap_val & 0x0002: caps.append('Repeater')
-                                if cap_val & 0x0004: caps.append('Bridge')
-                                if cap_val & 0x0010: caps.append('Router')
-                                if cap_val & 0x0040: caps.append('Station')
-                                info['capabilities'] = ', '.join(caps) if caps else ''
-                            elif tlv_type == 8 and tlv_len >= 2:  # Management Address
-                                # Format: addr_len(1) + subtype(1) + addr(n) + ...
-                                addr_str_len = tlv_val[0]
-                                if addr_str_len >= 5 and tlv_val[1] == 1:  # IPv4 subtype
-                                    if len(tlv_val) >= 6:
-                                        info['mgmt_ip'] = socket.inet_ntoa(tlv_val[2:6])
-                            offset += 2 + tlv_len
-                        session.lldp_neighbors[src_mac] = info
-            except Exception:
-                pass
-
             # Only process IPv4
-            # Handle 802.1Q-wrapped frames: dpkt may or may not auto-unwrap
-            ip_payload = eth.data
-            if isinstance(ip_payload, dpkt.ip.IP):
-                pass  # normal
-            elif eth.type == 0x8100 or eth.type == 0x88a8:
-                # VLAN-tagged: inner payload after TCI+EtherType (4 bytes)
-                inner = buf[18:]  # skip 14 (eth hdr) + 4 (VLAN tag)
-                if len(inner) >= 20:
-                    try:
-                        ip_payload = dpkt.ip.IP(inner)
-                    except Exception:
-                        continue
-                else:
-                    continue
-            else:
+            if not isinstance(eth.data, dpkt.ip.IP):
                 continue
 
-            ip = ip_payload
+            ip = eth.data
             src_ip = _ip_to_str(ip.src)
             dst_ip = _ip_to_str(ip.dst)
             pkt_len = len(buf)
-
-            # Associate IPs with VLAN for this packet
-            if _current_vlan_id is not None:
-                session.vlan_to_ips[_current_vlan_id].add(src_ip)
-                session.vlan_to_ips[_current_vlan_id].add(dst_ip)
 
             session.src_ips[src_ip] += 1
             session.dst_ips[dst_ip] += 1
@@ -2021,69 +1522,6 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
                     })
 
             # ---------------------------------------------------------------
-            # Network discovery: DHCP subnet mask (UDP 67/68) — dpkt
-            # ---------------------------------------------------------------
-            if proto == "UDP" and dport in (67, 68):
-                try:
-                    dhcp_data = bytes(ip.data.data) if hasattr(ip.data, 'data') else b''
-                    # BOOTP header is 236 bytes, then magic cookie (4), then options
-                    if len(dhcp_data) >= 240:
-                        # Check magic cookie
-                        if dhcp_data[236:240] == b'\x63\x82\x53\x63':
-                            yiaddr = socket.inet_ntoa(dhcp_data[16:20])
-                            # Parse DHCP options
-                            opts_data = dhcp_data[240:]
-                            subnet_mask = None
-                            msg_type = None
-                            i = 0
-                            while i < len(opts_data):
-                                opt_code = opts_data[i]
-                                if opt_code == 255:  # End
-                                    break
-                                if opt_code == 0:  # Pad
-                                    i += 1
-                                    continue
-                                if i + 1 >= len(opts_data):
-                                    break
-                                opt_len = opts_data[i + 1]
-                                opt_val = opts_data[i + 2:i + 2 + opt_len]
-                                if opt_code == 1 and opt_len == 4:  # Subnet mask
-                                    subnet_mask = socket.inet_ntoa(opt_val)
-                                elif opt_code == 53 and opt_len == 1:  # Message type
-                                    msg_type = opt_val[0]
-                                i += 2 + opt_len
-                            if subnet_mask and msg_type in (2, 5) and yiaddr != "0.0.0.0":
-                                import ipaddress as _ipaddress
-                                mask_int = int(_ipaddress.IPv4Address(subnet_mask))
-                                prefix_len = bin(mask_int).count('1')
-                                iface = _ipaddress.IPv4Interface(f"{yiaddr}/{prefix_len}")
-                                net_str = str(iface.network.network_address)
-                                session.network_evidence.append({
-                                    "network": net_str,
-                                    "mask": prefix_len,
-                                    "source": "dhcp",
-                                    "evidence": f"DHCP {'Offer' if msg_type == 2 else 'ACK'} mask={subnet_mask} for {yiaddr}",
-                                    "confidence": "high",
-                                })
-                except Exception:
-                    pass
-
-            # --- Network discovery: directed broadcast detection (dpkt) ---
-            if dst_ip.endswith(".255") and dst_ip != "255.255.255.255":
-                import ipaddress as _ipaddress
-                try:
-                    net_str = str(_ipaddress.IPv4Interface(f"{dst_ip}/24").network.network_address)
-                    session.network_evidence.append({
-                        "network": net_str,
-                        "mask": 24,
-                        "source": "broadcast",
-                        "evidence": f"Directed broadcast to {dst_ip}",
-                        "confidence": "medium",
-                    })
-                except Exception:
-                    pass
-
-            # ---------------------------------------------------------------
             # Netops: HSRP extraction (UDP port 1985)
             # ---------------------------------------------------------------
             if proto == "UDP" and dport == 1985:
@@ -2141,25 +1579,6 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
                             session.ospf_hello_count += 1
                             neighbor_key = (src_ip, dst_ip)
                             session.ospf_neighbor_hellos[neighbor_key].append(ts)
-                            # Extract network mask from OSPF Hello (bytes 24-27)
-                            if len(ospf_data) >= 28:
-                                mask_bytes = ospf_data[24:28]
-                                mask_int = int.from_bytes(mask_bytes, 'big')
-                                if mask_int > 0:
-                                    prefix_len = bin(mask_int).count('1')
-                                    import ipaddress as _ipaddress
-                                    try:
-                                        iface = _ipaddress.IPv4Interface(f"{src_ip}/{prefix_len}")
-                                        net_str = str(iface.network.network_address)
-                                        session.network_evidence.append({
-                                            "network": net_str,
-                                            "mask": prefix_len,
-                                            "source": "ospf",
-                                            "evidence": f"OSPF Hello from {router_id} on {src_ip}",
-                                            "confidence": "high",
-                                        })
-                                    except Exception:
-                                        pass
                         elif ospf_type == 2:  # DB Description
                             session.ospf_dbd_count += 1
                         elif ospf_type == 3:  # LS Request
@@ -2197,9 +1616,6 @@ def parse_pcap_file_dpkt(file_path: str) -> PcapSession:
 
     # --- Post-process: detect BPDU starvation (gaps > max_age per source port) ---
     _compute_stp_bpdu_gaps(session)
-
-    # --- Post-process: infer networks from collected evidence ---
-    _infer_networks_from_evidence(session)
 
     return session
 

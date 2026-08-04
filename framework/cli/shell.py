@@ -135,17 +135,6 @@ class EventMillShell(cmd.Cmd):
             plugins_path: Path to plugins directory.
         """
         super().__init__()
-
-        # Enable tab completion (readline on Linux/Mac, pyreadline3 on Windows)
-        try:
-            import readline
-            readline.set_completer_delims(" \t\n")
-            if "libedit" in readline.__doc__:
-                readline.parse_and_bind("bind ^I rl_complete")
-            else:
-                readline.parse_and_bind("tab: complete")
-        except (ImportError, AttributeError):
-            pass  # No readline available — completion disabled
         
         # Determine paths
         self.project_root = Path(__file__).resolve().parent.parent.parent
@@ -1097,10 +1086,6 @@ class EventMillShell(cmd.Cmd):
 
     # Persistent state for tracking Zeek jobs across commands
     _zeek_jobs: dict[str, dict] = {}
-    # Parallel batch tracking: batch_id → list of build_ids
-    _zeek_batches: dict[str, list[str]] = {}
-    # Zeek list cache: numbered ID → folder path (populated by zeek list)
-    _zeek_list_cache: list[str] = []
 
     def do_zeek(self, arg: str) -> None:
         """Process a large PCAP with Zeek via Cloud Build.
@@ -1120,11 +1105,8 @@ class EventMillShell(cmd.Cmd):
         Usage:
           zeek <filename_or_gs_uri>                Submit Zeek job and wait
           zeek <filename_or_gs_uri> --async        Submit and return immediately
-          zeek <folder> --parallel                 Submit one job per PCAP in folder (all run at once)
           zeek status [build_id]                   Check job status
-          zeek status --batch [batch_id]           Check all jobs in a parallel batch
           zeek load [folder_name]                  Load Zeek logs (from bucket or gs://)
-          zeek load --merge                        Load and merge all Zeek outputs from latest batch
           zeek jobs                                List submitted jobs
           zeek list                                List available Zeek outputs
 
@@ -1132,19 +1114,15 @@ class EventMillShell(cmd.Cmd):
           zeek massive.pcap                        Resolve from network forensics bucket
           zeek gs://my-bucket/captures/big.pcap    Explicit URI
           zeek massive.pcap --async
-          zeek Dragos_report/ --parallel           Submit all PCAPs in parallel
-          zeek status --batch                      Check parallel batch progress
-          zeek load --merge                        Load all parallel outputs merged
           zeek status
           zeek load massive-20260514-abc12345      Load from zeek-output/ in bucket
           zeek load                                Load most recent Zeek output
           zeek list                                Show available Zeek output folders
         """
         if not arg.strip():
-            print("  Usage: zeek <filename_or_gs_uri> [--async] [--parallel]")
-            print("         zeek <folder> --parallel")
-            print("         zeek status [build_id | --batch]")
-            print("         zeek load [folder_name | --merge]")
+            print("  Usage: zeek <filename_or_gs_uri> [--async]")
+            print("         zeek status [build_id]")
+            print("         zeek load [folder_name]")
             print("         zeek list")
             print("         zeek jobs")
             return
@@ -1153,32 +1131,9 @@ class EventMillShell(cmd.Cmd):
         subcommand = parts[0]
 
         if subcommand == "status":
-            if "--batch" in parts:
-                batch_id = None
-                for p in parts[1:]:
-                    if p != "--batch":
-                        batch_id = p
-                        break
-                self._zeek_batch_status(batch_id)
-            else:
-                self._zeek_status(parts[1] if len(parts) > 1 else None)
+            self._zeek_status(parts[1] if len(parts) > 1 else None)
         elif subcommand == "load":
-            if "--merge" in parts:
-                # Collect the selector (IDs or "latest") — everything after "load" that isn't --merge
-                selector_parts = [p for p in parts[1:] if p != "--merge"]
-                selector = selector_parts[0] if selector_parts else None
-                self._zeek_load_merge(selector)
-            else:
-                ref = parts[1] if len(parts) > 1 else None
-                # Support numeric ID from zeek list
-                if ref and ref.isdigit():
-                    idx = int(ref)
-                    if self._zeek_list_cache and 1 <= idx <= len(self._zeek_list_cache):
-                        ref = self._zeek_list_cache[idx - 1]
-                    else:
-                        print(f"  ID #{idx} not in cache. Run 'zeek list' first.")
-                        return
-                self._zeek_load(ref)
+            self._zeek_load(parts[1] if len(parts) > 1 else None)
         elif subcommand == "list":
             self._zeek_list_outputs()
         elif subcommand == "jobs":
@@ -1186,21 +1141,10 @@ class EventMillShell(cmd.Cmd):
         else:
             # It's a PCAP reference — resolve it
             async_mode = "--async" in parts
-            parallel_mode = "--parallel" in parts
-            # Extract the actual file/folder reference (skip flags)
-            non_flag_parts = [p for p in parts if not p.startswith("--")]
-            pcap_ref = non_flag_parts[0] if non_flag_parts else ""
-
-            if not pcap_ref:
-                print("  Usage: zeek <filename_or_folder> [--parallel] [--async]")
-                return
-
-            if parallel_mode:
-                self._zeek_submit_parallel(pcap_ref)
-            else:
-                pcap_uri = self._zeek_resolve_pcap(pcap_ref)
-                if pcap_uri:
-                    self._zeek_submit(pcap_uri, async_mode=async_mode)
+            pcap_ref = subcommand
+            pcap_uri = self._zeek_resolve_pcap(pcap_ref)
+            if pcap_uri:
+                self._zeek_submit(pcap_uri, async_mode=async_mode)
 
     def _zeek_get_nf_bucket(self) -> str | None:
         """Get the network forensics bucket name from the storage resolver."""
@@ -1334,483 +1278,6 @@ class EventMillShell(cmd.Cmd):
         except Exception as e:
             print(f"  ✗ Failed to submit Zeek job: {e}")
             logger.exception("Zeek submit failed")
-
-    def _zeek_submit_parallel(self, folder_ref: str) -> None:
-        """Submit parallel Zeek jobs — one per PCAP in a folder.
-
-        Each PCAP gets its own Cloud Build machine (E2_HIGHCPU_32),
-        all running simultaneously. GCP quota limits concurrent builds
-        (default 10).
-        """
-        if not os.environ.get("K_SERVICE"):
-            print("  ⚠  Zeek Cloud Build integration requires Cloud Run (GCP).")
-            return
-
-        session = self.session_manager.get_current_session()
-        if not session:
-            print("  No active session. Use 'new' to create one first.")
-            return
-
-        try:
-            from google.cloud import storage as gcs_storage
-            from ..cloud.gcp.zeek import ZeekCloudBuildClient
-
-            gcs_client = gcs_storage.Client()
-            nf_bucket = self._zeek_get_nf_bucket()
-
-            # Resolve folder to a GCS prefix
-            if folder_ref.startswith("gs://"):
-                prefix_clean = folder_ref.replace("gs://", "").rstrip("/")
-                parts = prefix_clean.split("/", 1)
-                bucket_name = parts[0]
-                folder_prefix = (parts[1] + "/") if len(parts) > 1 else ""
-            else:
-                if not nf_bucket:
-                    print("  ✗ No network forensics bucket configured.")
-                    return
-                bucket_name = nf_bucket
-                # Check workspace folder first
-                ws = session.workspace_folder
-                if ws:
-                    folder_prefix = f"{ws}/{folder_ref.rstrip('/')}/"
-                else:
-                    folder_prefix = f"{folder_ref.rstrip('/')}/"
-
-            # List PCAPs in the folder
-            bucket_obj = gcs_client.bucket(bucket_name)
-            blobs = list(bucket_obj.list_blobs(prefix=folder_prefix))
-            pcap_blobs = [
-                b for b in blobs
-                if b.name.lower().endswith((".pcap", ".pcapng", ".cap"))
-                and not b.name.endswith("/")
-            ]
-
-            if not pcap_blobs:
-                print(f"  No PCAP files found in gs://{bucket_name}/{folder_prefix}")
-                if nf_bucket:
-                    print(f"  Check: gsutil ls gs://{nf_bucket}/{folder_prefix}")
-                return
-
-            print(f"  Found {len(pcap_blobs)} PCAPs in gs://{bucket_name}/{folder_prefix}")
-            print()
-
-            # Show what will be submitted
-            total_size = 0
-            for blob in pcap_blobs:
-                size_mb = blob.size / (1024 * 1024) if blob.size else 0
-                total_size += size_mb
-                name = blob.name.rsplit("/", 1)[-1]
-                print(f"    • {name} ({size_mb:.1f} MB)")
-            print(f"\n  Total: {total_size:.1f} MB across {len(pcap_blobs)} files")
-            print(f"  Each gets its own E2_HIGHCPU_32 machine (32 vCPU, 32 GB RAM)")
-            print()
-
-            # Submit all jobs
-            import uuid as _uuid
-            batch_id = _uuid.uuid4().hex[:8]
-            build_ids = []
-
-            zeek_client = ZeekCloudBuildClient()
-
-            for blob in pcap_blobs:
-                pcap_uri = f"gs://{bucket_name}/{blob.name}"
-                pcap_name = blob.name.rsplit("/", 1)[-1]
-
-                try:
-                    job = zeek_client.submit_zeek_job(pcap_uri=pcap_uri)
-                    build_id = job["build_id"]
-                    build_ids.append(build_id)
-                    self._zeek_jobs[build_id] = {**job, "batch_id": batch_id}
-                    print(f"  ✓ Submitted: {pcap_name} → {build_id[:12]}...")
-                except Exception as e:
-                    print(f"  ✗ Failed: {pcap_name} — {e}")
-
-            if build_ids:
-                self._zeek_batches[batch_id] = build_ids
-                print()
-                print(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-                print(f"  ✓ Batch {batch_id}: {len(build_ids)}/{len(pcap_blobs)} jobs submitted")
-                print(f"  All running in parallel on separate machines.")
-                print(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-                print()
-                print(f"  ⏳ Waiting for all {len(build_ids)} jobs to finish (polling every 30s)...")
-                print(f"  Press Ctrl+C to stop waiting (jobs continue in background).")
-                print()
-
-                log_user_activity("zeek_parallel_submit", {
-                    "batch_id": batch_id,
-                    "job_count": len(build_ids),
-                    "total_size_mb": round(total_size, 1),
-                    "folder": f"gs://{bucket_name}/{folder_prefix}",
-                })
-
-                # Wait for all jobs to complete, then auto-merge
-                try:
-                    self._zeek_wait_and_merge(batch_id, zeek_client)
-                except KeyboardInterrupt:
-                    print()
-                    print(f"  Stopped waiting. Jobs continue in background.")
-                    print(f"  Check progress:  zeek status --batch")
-                    print(f"  Merge later:     zeek load --merge")
-            else:
-                print("  ✗ No jobs submitted successfully.")
-
-        except ImportError as e:
-            print(f"  ✗ Missing dependency: {e}")
-        except Exception as e:
-            print(f"  ✗ Failed to submit parallel jobs: {e}")
-            logger.exception("Zeek parallel submit failed")
-
-    def _zeek_wait_and_merge(self, batch_id: str, zeek_client) -> None:
-        """Poll all jobs in a batch until complete, then auto-merge.
-
-        Raises KeyboardInterrupt if user presses Ctrl+C (caller handles).
-        """
-        import time as _time
-
-        build_ids = self._zeek_batches[batch_id]
-        pending = set(build_ids)
-        completed = set()
-        failed = set()
-        poll_interval = 30
-
-        while pending:
-            _time.sleep(poll_interval)
-
-            for bid in list(pending):
-                try:
-                    status = zeek_client.get_build_status(bid)
-                    s = status.get("status", "UNKNOWN")
-                    self._zeek_jobs[bid] = {**self._zeek_jobs.get(bid, {}), **status}
-
-                    if s == "SUCCESS":
-                        pending.discard(bid)
-                        completed.add(bid)
-                        pcap = self._zeek_jobs[bid].get("pcap_uri", "?").rsplit("/", 1)[-1]
-                        duration = status.get("duration", "?")
-                        print(f"  ✓ Done: {pcap} ({duration})")
-                    elif s in ("FAILURE", "TIMEOUT", "CANCELLED"):
-                        pending.discard(bid)
-                        failed.add(bid)
-                        pcap = self._zeek_jobs[bid].get("pcap_uri", "?").rsplit("/", 1)[-1]
-                        print(f"  ✗ Failed: {pcap} — {s}")
-                except Exception:
-                    pass  # retry next poll cycle
-
-            # Progress line
-            total = len(build_ids)
-            done = len(completed)
-            fail = len(failed)
-            active = len(pending)
-            print(
-                f"\r  Progress: {done}/{total} complete, "
-                f"{active} running, {fail} failed   ",
-                end="", flush=True,
-            )
-
-        print()  # newline after progress
-        print()
-
-        if completed:
-            print(f"  ✓ {len(completed)}/{len(build_ids)} jobs finished successfully.")
-            if failed:
-                print(f"  ⚠  {len(failed)} jobs failed.")
-            print(f"  Merging results...")
-            print()
-            self._zeek_load_merge(batch_id)
-        else:
-            print(f"  ✗ All {len(build_ids)} jobs failed. Check logs:")
-            for bid in failed:
-                log_url = self._zeek_jobs.get(bid, {}).get("log_url", "")
-                if log_url:
-                    print(f"    {bid[:12]}: {log_url}")
-
-    def _zeek_batch_status(self, batch_id: str | None = None) -> None:
-        """Show status of all jobs in a parallel batch."""
-        if not batch_id:
-            if not self._zeek_batches:
-                print("  No parallel batches submitted this session.")
-                return
-            batch_id = list(self._zeek_batches.keys())[-1]
-
-        if batch_id not in self._zeek_batches:
-            print(f"  Batch '{batch_id}' not found.")
-            if self._zeek_batches:
-                print(f"  Available: {', '.join(self._zeek_batches.keys())}")
-            return
-
-        build_ids = self._zeek_batches[batch_id]
-        print(f"  Batch {batch_id}: {len(build_ids)} jobs")
-        print(f"  {'PCAP':35s} {'Status':12s} {'Duration':10s} {'Build ID':15s}")
-        print(f"  {'─' * 35} {'─' * 12} {'─' * 10} {'─' * 15}")
-
-        try:
-            from ..cloud.gcp.zeek import ZeekCloudBuildClient
-
-            client = ZeekCloudBuildClient()
-            completed = 0
-            failed = 0
-
-            for bid in build_ids:
-                job = self._zeek_jobs.get(bid, {})
-                pcap = job.get("pcap_uri", "?").rsplit("/", 1)[-1]
-                if len(pcap) > 35:
-                    pcap = pcap[:32] + "..."
-
-                try:
-                    status = client.get_build_status(bid)
-                    s = status.get("status", "UNKNOWN")
-                    d = status.get("duration", "—")
-                    self._zeek_jobs[bid] = {**job, **status}
-
-                    if s == "SUCCESS":
-                        completed += 1
-                    elif s in ("FAILURE", "TIMEOUT", "CANCELLED"):
-                        failed += 1
-                except Exception:
-                    s = "ERROR"
-                    d = "—"
-
-                print(f"  {pcap:35s} {s:12s} {d:10s} {bid[:15]}")
-
-            print()
-            active = len(build_ids) - completed - failed
-            print(f"  Summary: {completed} done, {active} running, {failed} failed")
-
-            if completed == len(build_ids):
-                print()
-                print(f"  ✓ All jobs complete! Merge results with:")
-                print(f"    zeek load --merge")
-            elif completed + failed == len(build_ids) and failed > 0:
-                print()
-                print(f"  ⚠  Batch finished with {failed} failures.")
-                print(f"  Load successful results: zeek load --merge")
-
-        except ImportError:
-            print("  ✗ google-cloud-build not installed.")
-        except Exception as e:
-            print(f"  ✗ Failed to check batch status: {e}")
-
-    def _zeek_load_merge(self, selector: str | None = None) -> None:
-        """Load and merge Zeek logs from selected outputs.
-
-        Selector can be:
-          - None / "latest": auto-pick the most recent set (same timestamp)
-          - "1,2,3,4": comma-separated IDs from 'zeek list'
-          - "1-4": range of IDs
-          - A batch_id (from parallel submission, in-memory)
-        """
-        if not self.session_manager.get_current_session():
-            print("  No active session. Use 'new' to create one first.")
-            return
-
-        # Resolve output prefixes from selector
-        output_prefixes = []
-        nf_bucket = self._zeek_get_nf_bucket()
-
-        # Case 1: In-memory batch state (from parallel submission this session)
-        if selector and selector in self._zeek_batches:
-            build_ids = self._zeek_batches[selector]
-            for bid in build_ids:
-                job = self._zeek_jobs.get(bid, {})
-                if job.get("status") == "SUCCESS" and job.get("output_prefix"):
-                    output_prefixes.append(job["output_prefix"])
-            if not output_prefixes:
-                print(f"  No completed jobs in batch {selector}.")
-                return
-
-        # Case 2: IDs from zeek list cache
-        elif selector and selector not in ("latest", None):
-            # Parse IDs: "1,2,3,4" or "1-4"
-            ids = self._parse_id_selector(selector)
-            if not ids:
-                print(f"  Invalid selector: {selector}")
-                print(f"  Use: zeek load --merge 1,2,3,4  or  zeek load --merge 1-4  or  zeek load --merge latest")
-                return
-
-            # Ensure cache is populated
-            if not self._zeek_list_cache:
-                print("  Run 'zeek list' first to populate the output list.")
-                return
-
-            for idx in ids:
-                if idx < 1 or idx > len(self._zeek_list_cache):
-                    print(f"  Invalid ID #{idx}. Valid range: 1-{len(self._zeek_list_cache)}")
-                    return
-
-            for idx in ids:
-                folder = self._zeek_list_cache[idx - 1]
-                output_prefixes.append(f"gs://{nf_bucket}/zeek-output/{folder}")
-
-        # Case 3: "latest" or no selector — auto-pick most recent set
-        else:
-            if not self._zeek_list_cache:
-                # Try to populate cache
-                self._zeek_list_outputs_silent()
-            if not self._zeek_list_cache:
-                print("  No Zeek outputs found. Run 'zeek list' or submit jobs first.")
-                return
-
-            # Group by timestamp (YYYYMMDD-HHMMSS portion) and pick newest group
-            from collections import defaultdict
-            ts_groups: dict[str, list[str]] = defaultdict(list)
-            for folder in self._zeek_list_cache:
-                parts = folder.rsplit("-", 3)
-                if len(parts) >= 4:
-                    ts_key = f"{parts[1]}-{parts[2]}"  # YYYYMMDD-HHMMSS
-                    ts_groups[ts_key].append(folder)
-                else:
-                    ts_groups["unknown"].append(folder)
-
-            # Pick the group with the most recent timestamp
-            latest_ts = sorted(ts_groups.keys(), reverse=True)[0]
-            latest_folders = ts_groups[latest_ts]
-            for folder in latest_folders:
-                output_prefixes.append(f"gs://{nf_bucket}/zeek-output/{folder}")
-
-            print(f"  Auto-selected latest batch ({latest_ts}): {len(latest_folders)} outputs")
-
-        if not output_prefixes:
-            print("  No outputs to merge.")
-            return
-
-        print(f"  Merging Zeek logs from {len(output_prefixes)} outputs...")
-        print()
-
-        try:
-            from google.cloud import storage as gcs_storage
-            from plugins.network_forensics.pcap_metadata_summary.zeek_loader import parse_zeek_logs
-            from plugins.network_forensics.pcap_metadata_summary.tool import (
-                set_pcap_session, get_pcap_session, is_internal, _format_duration,
-            )
-            import tempfile
-            from pathlib import Path
-
-            gcs_client = gcs_storage.Client()
-            merged_session = None
-
-            for i, output_prefix in enumerate(output_prefixes, 1):
-                prefix_clean = output_prefix.rstrip("/").replace("gs://", "")
-                parts = prefix_clean.split("/", 1)
-                bucket_name = parts[0]
-                prefix_path = (parts[1] + "/") if len(parts) > 1 else ""
-
-                bucket_obj = gcs_client.bucket(bucket_name)
-                blobs = list(bucket_obj.list_blobs(prefix=prefix_path))
-                log_files = [b for b in blobs if b.name.endswith(".log")]
-
-                if not log_files:
-                    print(f"  [{i}/{len(output_prefixes)}] No logs at {output_prefix} — skipping")
-                    continue
-
-                # Download to temp dir
-                local_dir = Path(tempfile.mkdtemp(prefix="eventmill_zeek_merge_"))
-                for blob in log_files:
-                    filename = blob.name.rsplit("/", 1)[-1]
-                    blob.download_to_filename(str(local_dir / filename))
-
-                # Parse this set
-                session = parse_zeek_logs(local_dir)
-
-                # Extract PCAP name from folder
-                folder_name = prefix_path.replace("zeek-output/", "").rstrip("/")
-                folder_parts = folder_name.rsplit("-", 3)
-                pcap_name = folder_parts[0] if len(folder_parts) >= 4 else folder_name
-
-                conns = len(session.conversations)
-                ips = len(session.unique_ips)
-                print(f"  [{i}/{len(output_prefixes)}] {pcap_name}: {conns:,} connections, {ips} IPs")
-
-                # Merge into cumulative session
-                if merged_session is None:
-                    merged_session = session
-                else:
-                    merged_session.merge_into(session)
-
-            if not merged_session:
-                print("  ✗ No Zeek logs could be loaded.")
-                return
-
-            merged_session.filename = f"zeek-merge ({len(output_prefixes)} PCAPs)"
-            set_pcap_session(merged_session)
-
-            # Print merged summary
-            internal = sum(1 for ip in merged_session.unique_ips if is_internal(ip))
-            external = len(merged_session.unique_ips) - internal
-            duration = merged_session.duration_seconds
-
-            print()
-            print(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            print(
-                f"  ✓ Merged: {len(merged_session.conversations):,} connections, "
-                f"{len(merged_session.unique_ips)} IPs ({internal} internal, {external} external)"
-            )
-            print(f"  Duration span: {_format_duration(duration)}")
-            if merged_session.dns_queries:
-                print(f"  DNS queries: {len(merged_session.dns_queries):,}")
-            if merged_session.tls_handshakes:
-                print(f"  TLS handshakes: {len(merged_session.tls_handshakes):,}")
-            if merged_session.ot_transactions:
-                from collections import Counter as _Counter
-                ot_protos = _Counter(t["protocol"] for t in merged_session.ot_transactions)
-                ot_summary = ", ".join(f"{p}:{c}" for p, c in ot_protos.most_common(5))
-                print(f"  OT/ICS protocols: {ot_summary}")
-            print(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            print()
-            print(f"  PCAP session ready — use any pcap tool:")
-            print(f"    run pcap_threat_hunter")
-            print(f"    run pcap_ai_analyzer {{\"mode\": \"threat_hunt\"}}")
-
-            log_user_activity("zeek_load_merge", {
-                "outputs_merged": len(output_prefixes),
-                "total_connections": len(merged_session.conversations),
-                "unique_ips": len(merged_session.unique_ips),
-            })
-
-        except ImportError as e:
-            print(f"  ✗ Missing dependency: {e}")
-        except Exception as e:
-            import traceback as _tb
-            print(f"  ✗ Failed to merge Zeek outputs: {e}")
-            logger.error("Zeek load merge failed: %s", _tb.format_exc())
-
-    def _parse_id_selector(self, selector: str) -> list[int]:
-        """Parse '1,2,3,4' or '1-4' or '1,3-5' into a list of ints."""
-        ids = []
-        for part in selector.split(","):
-            part = part.strip()
-            if "-" in part:
-                try:
-                    start, end = part.split("-", 1)
-                    ids.extend(range(int(start), int(end) + 1))
-                except ValueError:
-                    return []
-            else:
-                try:
-                    ids.append(int(part))
-                except ValueError:
-                    return []
-        return ids
-
-    def _zeek_list_outputs_silent(self) -> None:
-        """Populate _zeek_list_cache without printing (for auto-merge)."""
-        nf_bucket = self._zeek_get_nf_bucket()
-        if not nf_bucket:
-            return
-        try:
-            from google.cloud import storage as gcs_storage
-            client = gcs_storage.Client()
-            bucket = client.bucket(nf_bucket)
-            iterator = bucket.list_blobs(prefix="zeek-output/", delimiter="/")
-            _ = list(iterator)
-            prefixes = sorted(iterator.prefixes, reverse=True)
-            self._zeek_list_cache = []
-            for p in prefixes:
-                folder = p.replace("zeek-output/", "").rstrip("/")
-                if folder:
-                    self._zeek_list_cache.append(folder)
-        except Exception:
-            pass
 
     def _zeek_status(self, build_id: str | None = None) -> None:
         """Check Zeek job status."""
@@ -2051,7 +1518,7 @@ class EventMillShell(cmd.Cmd):
             print(f"  {build_id:40s} {status:12s} {pcap:40s}")
 
     def _zeek_list_outputs(self) -> None:
-        """List available Zeek output folders in the network forensics bucket with IDs."""
+        """List available Zeek output folders in the network forensics bucket."""
         nf_bucket = self._zeek_get_nf_bucket()
         if not nf_bucket:
             print("  ✗ No network forensics bucket configured.")
@@ -2067,588 +1534,25 @@ class EventMillShell(cmd.Cmd):
             iterator = bucket.list_blobs(prefix="zeek-output/", delimiter="/")
             # Consume iterator to populate prefixes
             _ = list(iterator)
-            prefixes = sorted(iterator.prefixes, reverse=True)  # newest first
+            prefixes = sorted(iterator.prefixes)
 
             if not prefixes:
                 print(f"  No Zeek outputs in gs://{nf_bucket}/zeek-output/")
                 print(f"  Submit a job: zeek <filename.pcap>")
                 return
 
-            # Cache for merge by ID
-            self._zeek_list_cache = []
+            print(f"  Zeek outputs in gs://{nf_bucket}/zeek-output/:")
+            print(f"  {'Folder':50s} Load command")
+            print(f"  {'─' * 50} {'─' * 40}")
             for p in prefixes:
                 folder = p.replace("zeek-output/", "").rstrip("/")
                 if folder:
-                    self._zeek_list_cache.append(folder)
-
-            print(f"  Zeek outputs in gs://{nf_bucket}/zeek-output/ ({len(self._zeek_list_cache)} total):")
-            print(f"  {'#':>3s}  {'PCAP Name':40s} {'Timestamp':18s} Folder")
-            print(f"  {'─' * 3}  {'─' * 40} {'─' * 18} {'─' * 30}")
-
-            for idx, folder in enumerate(self._zeek_list_cache, 1):
-                # Parse folder name: <pcap_name>-<YYYYMMDD>-<HHMMSS>-<hash>
-                parts = folder.rsplit("-", 3)
-                if len(parts) >= 4:
-                    pcap_name = parts[0]
-                    date_str = parts[1]
-                    time_str = parts[2]
-                    ts_display = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]} {time_str[:2]}:{time_str[2:4]}"
-                else:
-                    pcap_name = folder
-                    ts_display = "?"
-
-                if len(pcap_name) > 40:
-                    pcap_name = pcap_name[:37] + "..."
-
-                print(f"  {idx:>3}  {pcap_name:40s} {ts_display:18s} {folder[:30]}")
-
-            print()
-            print(f"  Load single:  zeek load <#>           e.g. zeek load 1")
-            print(f"  Merge multi:  zeek load --merge 1,2,3,4")
-            print(f"  Merge range:  zeek load --merge 1-4")
-            print(f"  Merge latest: zeek load --merge latest")
+                    print(f"  {folder:50s} zeek load {folder}")
 
         except ImportError:
             print("  ✗ google-cloud-storage not installed.")
         except Exception as e:
             print(f"  ✗ Failed to list Zeek outputs: {e}")
-
-    # -------------------------------------------------------------------
-    # Networks Command — Subnet Discovery & Inventory
-    # -------------------------------------------------------------------
-
-    def do_networks(self, arg: str) -> None:
-        """Show discovered networks (subnets) from loaded PCAP data.
-
-        Networks are automatically discovered during PCAP parsing from:
-          - OSPF Hello packets (explicit network mask — high confidence)
-          - DHCP Offer/ACK (explicit subnet mask — high confidence)
-          - Directed broadcasts (x.x.x.255 → /24 — medium confidence)
-          - ARP activity (broadcast domain — medium confidence)
-          - Default assumption (/24 for uncovered IPs — low confidence)
-
-        Usage:
-          networks                      Show all discovered networks
-          networks enrich --table <project.dataset.table> --network-column <col> --fields <f1,f2,...>
-          networks assume /<mask>       Change default mask assumption (default: /24)
-          networks export [json|csv]    Export network list
-          networks clear                Clear BQ enrichment overlay
-
-        Examples:
-          networks
-          networks enrich --table ot-asset-inventory.nets.subnets --network-column subnet_cidr --fields site,zone,vlan_id
-          networks assume /22
-          networks export json
-        """
-        from plugins.network_forensics.pcap_metadata_summary.tool import get_pcap_session
-
-        arg = arg.strip()
-        session = get_pcap_session()
-
-        if not session:
-            print("  No PCAP loaded. Use 'load <file>' first.")
-            return
-
-        if not arg:
-            self._networks_show(session)
-            return
-
-        parts = shlex.split(arg)
-        subcmd = parts[0]
-
-        if subcmd == "enrich":
-            self._networks_enrich(session, parts[1:])
-        elif subcmd == "assume":
-            if len(parts) < 2:
-                print(f"  Current default: /{session.network_default_mask}")
-                print(f"  Usage: networks assume /24")
-                return
-            mask_str = parts[1].lstrip("/")
-            try:
-                mask = int(mask_str)
-                if mask < 8 or mask > 30:
-                    print(f"  Invalid mask: /{mask} (must be 8-30)")
-                    return
-                session.network_default_mask = mask
-                # Re-run inference with new assumption
-                from plugins.network_forensics.pcap_metadata_summary.tool import _infer_networks_from_evidence
-                # Clear old assumed entries and re-infer
-                session.network_evidence = [
-                    e for e in session.network_evidence if e.get("source") != "assumed"
-                ]
-                _infer_networks_from_evidence(session)
-                print(f"  ✓ Default mask set to /{mask}. Networks re-inferred.")
-                self._networks_show(session)
-            except ValueError:
-                print(f"  Invalid mask: {parts[1]}")
-        elif subcmd == "export":
-            fmt = parts[1] if len(parts) > 1 else "json"
-            self._networks_export(session, fmt)
-        elif subcmd == "clear":
-            session.network_enrichment = []
-            print("  ✓ Network enrichment cleared.")
-        else:
-            print(f"  Unknown subcommand: {subcmd}")
-            print(f"  Usage: networks [enrich|assume|export|clear]")
-
-    def _networks_show(self, session) -> None:
-        """Display discovered networks in a table."""
-        evidence = session.network_evidence
-        enrichment = session.network_enrichment
-
-        if not evidence:
-            print("  No networks discovered. Load a PCAP first.")
-            return
-
-        # Build enrichment lookup: network/mask → enrichment fields
-        enrich_map: dict[str, dict] = {}
-        if enrichment:
-            import ipaddress
-            for entry in enrichment:
-                cidr = entry.get("cidr", "")
-                if cidr:
-                    enrich_map[cidr] = entry
-
-        # Sort: high confidence first, then medium, then low
-        confidence_order = {"high": 0, "medium": 1, "low": 2}
-        sorted_evidence = sorted(
-            evidence,
-            key=lambda e: (confidence_order.get(e.get("confidence", "low"), 3), e.get("network", "")),
-        )
-
-        # Count by source
-        from collections import Counter
-        source_counts = Counter(e["source"] for e in sorted_evidence)
-
-        print(f"  Discovered {len(sorted_evidence)} networks:")
-        print(f"  Sources: {', '.join(f'{s}:{c}' for s, c in source_counts.most_common())}")
-        print()
-        print(f"  {'Network':20s} {'Mask':5s} {'Source':10s} {'Confidence':10s} Evidence / Enrichment")
-        print(f"  {'─' * 20} {'─' * 5} {'─' * 10} {'─' * 10} {'─' * 45}")
-
-        for entry in sorted_evidence:
-            net = entry.get("network", "?")
-            mask = f"/{entry.get('mask', '?')}"
-            source = entry.get("source", "?")
-            conf = entry.get("confidence", "?")
-            ev = entry.get("evidence", "")
-
-            # Check for enrichment
-            cidr_key = f"{net}{mask}"
-            enrich_info = enrich_map.get(cidr_key, {})
-            if enrich_info:
-                enrich_fields = [f"{k}={v}" for k, v in enrich_info.items() if k != "cidr"]
-                ev = "; ".join(enrich_fields) + f" | {ev}"
-
-            # Truncate evidence for display
-            if len(ev) > 45:
-                ev = ev[:42] + "..."
-
-            print(f"  {net:20s} {mask:5s} {source:10s} {conf:10s} {ev}")
-
-        # Coverage summary
-        import ipaddress
-        all_ips = session.unique_ips
-        covered = 0
-        for ip_str in all_ips:
-            try:
-                ip_obj = ipaddress.IPv4Address(ip_str)
-                for entry in sorted_evidence:
-                    net = ipaddress.IPv4Network(f"{entry['network']}/{entry['mask']}", strict=False)
-                    if ip_obj in net:
-                        covered += 1
-                        break
-            except Exception:
-                pass
-
-        print()
-        print(f"  Coverage: {covered}/{len(all_ips)} IPs mapped to a network")
-
-        # Hint if all networks are assumed (no protocol evidence)
-        if all(e.get("source") == "assumed" for e in sorted_evidence):
-            print()
-            print(f"  ⚠  All networks inferred by default /{session.network_default_mask} assumption.")
-            print(f"  No ARP/DHCP/OSPF/broadcast evidence found in this capture.")
-            print(f"  Possible reasons:")
-            print(f"    - Zeek doesn't produce arp.log by default (L2 protocols not captured)")
-            print(f"    - PCAP captured at L3 (routed SPAN, no L2 headers)")
-            print(f"    - No DHCP/OSPF traffic in the capture window")
-            print(f"  To add your known subnets:")
-            print(f"    networks enrich --table <bq_table> --network-column <col> --fields <fields>")
-
-    def _networks_enrich(self, session, args: list) -> None:
-        """Enrich networks from a BigQuery table containing subnet info."""
-        import shlex as _shlex
-
-        # Parse flags
-        table_name = None
-        network_column = None
-        fields = []
-
-        i = 0
-        while i < len(args):
-            if args[i] == "--table" and i + 1 < len(args):
-                table_name = args[i + 1]
-                i += 2
-            elif args[i] == "--network-column" and i + 1 < len(args):
-                network_column = args[i + 1]
-                i += 2
-            elif args[i] == "--fields" and i + 1 < len(args):
-                fields = [f.strip() for f in args[i + 1].split(",")]
-                i += 2
-            else:
-                i += 1
-
-        if not table_name:
-            print("  Usage: networks enrich --table <project.dataset.table> --network-column <col> --fields <f1,f2>")
-            return
-        if not network_column:
-            print("  --network-column is required (the column containing CIDR like '10.1.5.0/24')")
-            return
-        if not fields:
-            print("  --fields is required (columns to fetch, e.g. site,zone,vlan_id)")
-            return
-
-        try:
-            from google.cloud import bigquery
-
-            client = bigquery.Client()
-
-            # Build query — select network column + requested fields
-            all_columns = [network_column] + fields
-            columns_str = ", ".join(f"`{c}`" for c in all_columns)
-            query = f"SELECT {columns_str} FROM `{table_name}` LIMIT 10000"
-
-            print(f"  Querying BQ: {table_name}...")
-            results = client.query(query).result()
-
-            import ipaddress
-            enrichment_entries = []
-            for row in results:
-                cidr_val = getattr(row, network_column, None) or row[0]
-                if not cidr_val:
-                    continue
-                # Normalize CIDR
-                try:
-                    net = ipaddress.IPv4Network(cidr_val, strict=False)
-                    entry = {"cidr": str(net)}
-                    for field_name in fields:
-                        val = getattr(row, field_name, None)
-                        if val is not None:
-                            entry[field_name] = str(val)
-                    enrichment_entries.append(entry)
-                except Exception:
-                    pass
-
-            session.network_enrichment = enrichment_entries
-            print(f"  ✓ Loaded {len(enrichment_entries)} network entries from BQ")
-            print(f"  Run 'networks' to see enriched view.")
-
-        except ImportError:
-            print("  ✗ google-cloud-bigquery not installed.")
-        except Exception as e:
-            print(f"  ✗ BQ enrichment failed: {e}")
-
-    def _networks_export(self, session, fmt: str) -> None:
-        """Export discovered networks as JSON or CSV."""
-        import json
-
-        evidence = session.network_evidence
-        enrichment = session.network_enrichment
-
-        if not evidence:
-            print("  No networks to export.")
-            return
-
-        # Build enrichment map
-        enrich_map = {}
-        if enrichment:
-            for entry in enrichment:
-                cidr = entry.get("cidr", "")
-                if cidr:
-                    enrich_map[cidr] = entry
-
-        # Merge evidence + enrichment
-        export_data = []
-        for entry in evidence:
-            row = {**entry}
-            cidr_key = f"{entry['network']}/{entry['mask']}"
-            enrich = enrich_map.get(cidr_key, {})
-            if enrich:
-                row["enrichment"] = {k: v for k, v in enrich.items() if k != "cidr"}
-            export_data.append(row)
-
-        if fmt == "json":
-            output = json.dumps(export_data, indent=2)
-            print(output)
-        elif fmt == "csv":
-            # Header
-            base_fields = ["network", "mask", "source", "confidence", "evidence"]
-            # Collect all enrichment fields
-            enrich_fields = set()
-            for row in export_data:
-                if "enrichment" in row:
-                    enrich_fields.update(row["enrichment"].keys())
-            enrich_fields_sorted = sorted(enrich_fields)
-            all_fields = base_fields + enrich_fields_sorted
-
-            print(",".join(all_fields))
-            for row in export_data:
-                values = []
-                for f in base_fields:
-                    v = str(row.get(f, "")).replace(",", ";")
-                    values.append(v)
-                for f in enrich_fields_sorted:
-                    v = str(row.get("enrichment", {}).get(f, "")).replace(",", ";")
-                    values.append(v)
-                print(",".join(values))
-        else:
-            print(f"  Unknown format: {fmt}. Use 'json' or 'csv'.")
-
-    # -------------------------------------------------------------------
-    # Enrich Command — BigQuery IP Enrichment
-    # -------------------------------------------------------------------
-
-    def do_enrich(self, arg: str) -> None:
-        """Enrich loaded PCAP IPs with BigQuery table data.
-
-        Usage (enrich all IPs from loaded PCAP):
-          enrich --table <project.dataset.table> --fields <col1,col2,...> [--ip-column <col>]
-
-        Usage (enrich single IP):
-          enrich --table <project.dataset.table> --fields <col1,col2,...> --ip <address>
-
-        Field mapping (optional — tells the analyzer which column serves which purpose):
-          --name-field <col>     Device hostname/name column (e.g. host_name)
-          --zone-field <col>     Network zone/segment column (e.g. ot_network)
-          --purdue-field <col>   Purdue Model level column  (e.g. purdue_level)
-          --os-field <col>       OS / firmware version column (e.g. os_version)
-          --role-field <col>     Device role/function column (e.g. device_role)
-
-        Subcommands:
-          enrich show                    Show cached enrichment results
-          enrich clear                   Clear enrichment cache
-
-        Notes:
-          - --ip-column (default: 'ip') specifies the IP column name in BigQuery table
-          - --ip provides a single IP to enrich (one-off lookups)
-          - Field mappings are optional — without them the LLM still sees all data,
-            but with them the static report sections can annotate IPs with device context
-
-        Examples:
-          enrich --table proj.dataset.assets --fields hostname,zone --ip-column ip_addr
-          enrich --table proj.dataset.assets --fields ot_network,host_name,os_version,purdue_level \
-                 --ip-column ip_address --name-field host_name --zone-field ot_network \
-                 --purdue-field purdue_level --os-field os_version
-          enrich --table proj.dataset.assets --fields hostname --ip 10.1.5.20
-          enrich show
-          enrich clear
-        """
-        import shlex as _shlex
-
-        arg = arg.strip()
-        if not arg:
-            print("  Usage (all IPs):  enrich --table <table> --fields <fields> [--ip-column <col>]")
-            print("         (single IP): enrich --table <table> --fields <fields> --ip <address>")
-            print("         (cache):    enrich show | enrich clear")
-            return
-
-        # Handle show/clear subcommands
-        if arg == "show":
-            payload = {"mode": "show"}
-        elif arg == "clear":
-            payload = {"mode": "clear"}
-        else:
-            # Parse flags
-            try:
-                parts = _shlex.split(arg)
-            except ValueError:
-                parts = arg.split()
-
-            payload: dict = {}
-            field_mappings: dict = {}
-            i = 0
-            while i < len(parts):
-                token = parts[i]
-                if token == "--table" and i + 1 < len(parts):
-                    payload["table"] = parts[i + 1]
-                    i += 2
-                elif token == "--fields" and i + 1 < len(parts):
-                    payload["fields"] = parts[i + 1]
-                    i += 2
-                elif token == "--ip-column" and i + 1 < len(parts):
-                    payload["ip_column"] = parts[i + 1]
-                    i += 2
-                elif token == "--ip" and i + 1 < len(parts):
-                    payload["ip"] = parts[i + 1]
-                    i += 2
-                elif token == "--name-field" and i + 1 < len(parts):
-                    field_mappings["name"] = parts[i + 1]
-                    i += 2
-                elif token == "--zone-field" and i + 1 < len(parts):
-                    field_mappings["zone"] = parts[i + 1]
-                    i += 2
-                elif token == "--purdue-field" and i + 1 < len(parts):
-                    field_mappings["purdue"] = parts[i + 1]
-                    i += 2
-                elif token == "--os-field" and i + 1 < len(parts):
-                    field_mappings["os"] = parts[i + 1]
-                    i += 2
-                elif token == "--role-field" and i + 1 < len(parts):
-                    field_mappings["role"] = parts[i + 1]
-                    i += 2
-                else:
-                    print(f"  Unknown flag: {token}")
-                    return
-
-            # Determine mode
-            if "ip" in payload:
-                payload["mode"] = "run_single"
-            else:
-                payload["mode"] = "run"
-
-        # Execute via the pcap_enrichment tool
-        try:
-            from plugins.network_forensics.pcap_enrichment.tool import PcapEnrichment
-
-            tool = PcapEnrichment()
-            validation = tool.validate_inputs(payload)
-            if not validation.ok:
-                for err in (validation.errors or []):
-                    print(f"  ✗ {err}")
-                return
-
-            result = tool.execute(payload, context=None)
-
-            if not result.ok:
-                print(f"  ✗ {result.message}")
-                return
-
-            # Store field mappings if enrichment succeeded
-            if field_mappings and payload.get("mode") in ("run", "run_single", None):
-                from plugins.network_forensics.pcap_enrichment.tool import set_field_mappings
-                set_field_mappings(field_mappings)
-
-            data = result.result or {}
-            mode = data.get("mode", "")
-
-            if mode == "clear":
-                print(f"  ✓ {data.get('message', 'Enrichment cache cleared.')}")
-            elif mode == "show":
-                if "message" in data:
-                    print(f"  {data['message']}")
-                else:
-                    print(data.get("formatted_output", "  No data."))
-                # Show active field mappings
-                from plugins.network_forensics.pcap_enrichment.tool import get_field_mappings
-                fm = get_field_mappings()
-                if fm:
-                    print(f"\n  Field mappings:")
-                    for role, col in sorted(fm.items()):
-                        print(f"    --{role}-field → {col}")
-            else:
-                total = data.get("total_ips", 0)
-                matched = data.get("matched_ips", 0)
-                unmatched_list = data.get("unmatched_ips", [])
-                print(f"  ✓ Enriched {total} IPs ({matched} matched, {len(unmatched_list)} unknown)")
-                print(f"    Table: {data.get('table', '?')}")
-                print(f"    Fields: {', '.join(data.get('fields', []))}")
-                if field_mappings:
-                    parts_fm = [f"{r}={c}" for r, c in sorted(field_mappings.items())]
-                    print(f"    Mappings: {', '.join(parts_fm)}")
-                print()
-                print(data.get("formatted_output", ""))
-
-        except ImportError as e:
-            print(f"  ✗ Missing dependency: {e}")
-            print("    Install with: pip install google-cloud-bigquery")
-        except Exception as e:
-            print(f"  ✗ Enrichment failed: {e}")
-
-    def complete_networks(self, text: str, line: str, begidx: int, endidx: int):
-        """Tab completion for networks command."""
-        parts = line.split()
-
-        if len(parts) <= 1 or (len(parts) == 2 and not line.endswith(" ")):
-            options = ["enrich", "assume", "export", "clear"]
-            return [o for o in options if o.startswith(text)]
-
-        subcmd = parts[1] if len(parts) > 1 else ""
-
-        if subcmd == "enrich":
-            used_flags = {p for p in parts if p.startswith("--")}
-            all_flags = ["--table", "--ip-column", "--ip", "--fields"]
-            available = [f for f in all_flags if f not in used_flags]
-            if line.endswith(" ") and parts[-1].startswith("--"):
-                return []
-            return [f for f in available if f.startswith(text)]
-
-        if subcmd == "assume":
-            if len(parts) == 2 and line.endswith(" "):
-                return ["/24", "/22", "/16", "/25"]
-            return [m for m in ["/24", "/22", "/16", "/25"] if m.startswith(text)]
-
-        if subcmd == "export":
-            if len(parts) == 2 and line.endswith(" "):
-                return ["json", "csv"]
-            return [f for f in ["json", "csv"] if f.startswith(text)]
-
-        return []
-
-    def complete_zeek(self, text: str, line: str, begidx: int, endidx: int):
-        """Tab completion for zeek command."""
-        parts = line.split()
-
-        if len(parts) <= 1 or (len(parts) == 2 and not line.endswith(" ")):
-            options = ["status", "load", "list", "jobs", "--async", "--parallel"]
-            return [o for o in options if o.startswith(text)]
-
-        subcmd = parts[1] if len(parts) > 1 else ""
-
-        if subcmd == "status" and "--batch" not in parts:
-            return [f for f in ["--batch"] if f.startswith(text)]
-
-        if subcmd == "load" and "--merge" not in parts:
-            return [f for f in ["--merge"] if f.startswith(text)]
-
-        return []
-
-    def complete_enrich(self, text: str, line: str, begidx: int, endidx: int):
-        """Tab completion for enrich command."""
-        parts = line.split()
-
-        # First argument: suggest subcommands or flags
-        if len(parts) <= 1 or (len(parts) == 2 and not line.endswith(" ")):
-            options = [
-                "--table", "--fields", "--ip-column", "--ip",
-                "--name-field", "--zone-field", "--purdue-field",
-                "--os-field", "--role-field",
-                "show", "clear",
-            ]
-            return [o for o in options if o.startswith(text)]
-
-        # If 'show' or 'clear' already typed, no further completion
-        if "show" in parts or "clear" in parts:
-            return []
-
-        # Don't suggest already-used flags
-        used_flags = {p for p in parts if p.startswith("--")}
-        all_flags = [
-            "--table", "--fields", "--ip-column", "--ip",
-            "--name-field", "--zone-field", "--purdue-field",
-            "--os-field", "--role-field",
-        ]
-        available = [f for f in all_flags if f not in used_flags]
-
-        # If previous token is a flag, don't suggest more flags (user needs to type value)
-        if line.endswith(" ") and parts[-1].startswith("--"):
-            return []
-
-        # Suggest remaining flags
-        if line.endswith(" ") or text.startswith("--"):
-            return [f for f in available if f.startswith(text)]
-
-        return []
 
     def do_artifacts(self, arg: str) -> None:
         """List loaded artifacts in the current session.
@@ -2725,81 +1629,7 @@ class EventMillShell(cmd.Cmd):
             if plugin:
                 self._print_tool_help(plugin)
                 return
-            # Fall through to cmd.Cmd help for shell commands
-            super().do_help(arg)
-            return
-
-        # No argument — show grouped command overview
-        print()
-        print("  ═══════════════════════════════════════════════════════════")
-        print("  EVENT MILL — Command Reference")
-        print("  ═══════════════════════════════════════════════════════════")
-        print()
-        print("  SESSION MANAGEMENT")
-        print("    new [desc]              Create new investigation session")
-        print("    sessions                List all sessions")
-        print("    load_session <id>       Switch to existing session")
-        print("    delete_session <id>     Delete a session")
-        print("    status                  Show current session details")
-        print()
-        print("  PILLAR & WORKSPACE")
-        print("    pillar [name]           Set/show investigation pillar")
-        print("    workspace [folder|clear] Set/show workspace folder")
-        print("    files                   List files in pillar bucket")
-        print("    buckets                 Show configured buckets")
-        print()
-        print("  LOADING & ARTIFACTS")
-        print("    load <file> [--fast] [--merge]  Load PCAP/log file")
-        print("    load <folder> --merge --fast    Merge all PCAPs in folder")
-        print("    artifacts               List loaded artifacts")
-        print("    export <id>             Export artifact to common bucket")
-        print()
-        print("  ZEEK (Cloud Build)")
-        print("    zeek <file>             Submit PCAP to Zeek")
-        print("    zeek <folder> --parallel Submit all PCAPs in parallel")
-        print("    zeek status [--batch]   Check job status")
-        print("    zeek list               List Zeek outputs in bucket")
-        print("    zeek load <folder>      Load Zeek output")
-        print("    zeek load --merge       Merge parallel batch outputs")
-        print("    zeek jobs               List submitted jobs")
-        print()
-        print("  NETWORK DISCOVERY")
-        print("    networks                Show discovered subnets")
-        print("    networks enrich --table <t> --network-column <c> --fields <f>")
-        print("    networks assume /22     Change default mask")
-        print("    networks export json|csv")
-        print("    networks clear          Clear BQ enrichment")
-        print()
-        print("  IP ENRICHMENT (BigQuery)")
-        print("    enrich --table <t> --fields <f> [--ip-column <c>]")
-        print("    enrich --table <t> --fields <f> --ip <addr>")
-        print("    enrich show | enrich clear")
-        print()
-        print("  AI ANALYSIS (run <tool> --flag value)")
-        print("    run pcap_ai_analyzer --mode <mode> [--focus-ips <ips>] [--export-type pdf]")
-        print("      Modes: triage_summary, hunt_beacons, hunt_dns, hunt_tls,")
-        print("             hunt_lateral, hunt_exfil, report, ot_triage,")
-        print("             ot_threat_hunt, ot_report, netops_triage,")
-        print("             netops_health, netops_report")
-        print("    run pcap_threat_hunter --hunt <type>")
-        print("      Types: talkers, ports, beacons, dns, tls, lateral, exfil")
-        print("    run pcap_metadata_summary --mode <mode>")
-        print("    run pcap_flow_analyzer --mode <mode>")
-        print("    run pcap_ip_search --query <ip>")
-        print("    run firewall_log_aggregator --mode <mode>")
-        print()
-        print("  LLM")
-        print("    models                  List available models")
-        print("    connect [model_id]      Connect to LLM")
-        print("    ask: <question>         Query LLM with context")
-        print("    route <query>           Show routing decision")
-        print()
-        print("  UTILITY")
-        print("    tools [pillar]          List available tools")
-        print("    help <command|tool>     Detailed help for a command/tool")
-        print("    history [clear]         LLM conversation history")
-        print("    exit                    Exit Event Mill")
-        print()
+        super().do_help(arg)
 
     def _print_tool_help(self, plugin: LoadedPlugin) -> None:
         """Print help for a tool by rendering its README.md."""
@@ -2930,7 +1760,6 @@ class EventMillShell(cmd.Cmd):
             ],
             "export_type": ["pdf"],
             "condition_orange": ["true", "false"],
-            "focus_ips": [],
         },
         "pcap_metadata_summary": {
             "mode": ["load", "summary", "conversations", "dns", "http", "tls", "timeline", "ioc", "networks"],
@@ -2977,12 +1806,20 @@ class EventMillShell(cmd.Cmd):
                           "url", "email", "cve", "mitre_technique"],
             "confidence_threshold": ["low", "medium", "high"],
         },
-        "pcap_enrichment": {
-            "mode": ["run", "run_single", "show", "clear"],
-            "table": [],
-            "fields": [],
-            "ip_column": [],
-            "ip": [],
+        "threat_report_analyzer": {
+            "action": ["list_reports", "summarize", "search_reports"],
+        },
+        "threat_model_analyzer": {
+            "action": ["analyze_document", "create_scenario", "add_control",
+                       "add_event", "list_scenarios", "gap_analysis", "export"],
+        },
+        "risk_assessment_analyzer": {
+            "action": ["analyze", "list_attack_types", "validate_stages"],
+            "attack_type": ["ransomware", "apt", "data_theft", "ddos",
+                            "insider_threat", "web_attack", "generic"],
+        },
+        "attack_path_visualizer": {
+            "format": ["ascii", "mermaid", "compact", "both"],
         },
     }
 
