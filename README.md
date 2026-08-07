@@ -178,10 +178,24 @@ run pcap_flow_analyzer --mode protocol_breakdown  # Protocol distribution
 
 #### pcap_ip_search
 
+Search PCAP data for IPs, domains, ports, or build a filtered timeline for a host:
+
 ```bash
-run pcap_ip_search --query 10.1.5.22             # Search for specific IP
-run pcap_ip_search --mode ioc                    # IOC-focused search
+# IOC search — find all activity involving an IP, domain, or port
+run pcap_ip_search --query 10.1.5.22
+run pcap_ip_search --query evil.example.com
+run pcap_ip_search --query 4444
+
+# Timeline — chronological activity for a host
+run pcap_ip_search --mode timeline --ip 10.1.5.22
+
+# Filtered timeline — narrow by peer, port, or protocol
+run pcap_ip_search --mode timeline --ip 10.1.5.22 --dst_ip 192.168.1.1
+run pcap_ip_search --mode timeline --ip 10.1.5.22 --dst_port 443 --proto TCP
+run pcap_ip_search --mode timeline --ip 10.1.5.22 --src_ip 10.1.5.22 --dst_ip 10.0.0.1 --dst_port 4444
 ```
+
+**Flags:** `--mode ioc|timeline`, `--query <ip|domain|port>`, `--ip <addr>`, `--src_ip`, `--dst_ip`, `--src_port`, `--dst_port`, `--proto TCP|UDP`
 
 #### firewall_log_aggregator
 

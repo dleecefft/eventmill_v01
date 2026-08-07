@@ -1775,6 +1775,13 @@ class EventMillShell(cmd.Cmd):
         },
         "pcap_ip_search": {
             "mode": ["ioc", "timeline"],
+            "query": ["<ip|domain|port>"],
+            "ip": ["<target_ip>"],
+            "src_ip": ["<source_ip>"],
+            "dst_ip": ["<destination_ip>"],
+            "src_port": ["<1-65535>"],
+            "dst_port": ["<1-65535>"],
+            "proto": ["TCP", "UDP"],
         },
         "pcap_flow_analyzer": {
             "mode": ["bidirectional", "long_connections", "protocol_breakdown"],
