@@ -92,9 +92,9 @@ Process large PCAPs (multi-GB) on dedicated Cloud Build machines:
 | `zeek <folder> --parallel` | `zeek Dragos_report/ --parallel` | Submit all PCAPs in parallel (one machine each) |
 | `zeek <file> --async` | `zeek big.pcap --async` | Submit and return immediately |
 | `zeek status` | `zeek status [--batch]` | Check job status |
-| `zeek list` | `zeek list` | List available Zeek outputs |
-| `zeek load` | `zeek load <folder>` | Load Zeek output into session |
-| `zeek load --merge` | `zeek load --merge` | Merge all parallel batch outputs |
+| `zeek list` | `zeek list` | List available Zeek outputs (numbered) |
+| `zeek load` | `zeek load <folder\|#>` | Load Zeek output by name or index |
+| `zeek load --merge` | `zeek load --merge #,#,#` | Merge multiple outputs by index |
 | `zeek jobs` | `zeek jobs` | List submitted jobs |
 
 **Parallel processing** submits one Cloud Build job per PCAP (E2_HIGHCPU_32: 32 vCPU, 32 GB RAM, 500 GB disk). All run simultaneously, auto-merge when complete.

@@ -1108,8 +1108,11 @@ class EventMillShell(cmd.Cmd):
           zeek <filename_or_gs_uri> --async        Submit and return immediately
           zeek status [build_id]                   Check job status
           zeek load [folder_name]                  Load Zeek logs (from bucket or gs://)
+          zeek load [#]                            Load by index from 'zeek list'
+          zeek load --merge #,#,#                  Merge multiple outputs by index
+          zeek load --merge # # #                  Merge multiple (space-separated)
           zeek jobs                                List submitted jobs
-          zeek list                                List available Zeek outputs
+          zeek list                                List available Zeek outputs (numbered)
 
         Examples:
           zeek massive.pcap                        Resolve from network forensics bucket
@@ -1118,12 +1121,16 @@ class EventMillShell(cmd.Cmd):
           zeek status
           zeek load massive-20260514-abc12345      Load from zeek-output/ in bucket
           zeek load                                Load most recent Zeek output
+          zeek load 5                              Load output #5 from zeek list
+          zeek load --merge 19,27,35,11            Merge outputs by index
+          zeek load --merge 19 27 35 11            Same, space-separated
           zeek list                                Show available Zeek output folders
         """
         if not arg.strip():
             print("  Usage: zeek <filename_or_gs_uri> [--async]")
             print("         zeek status [build_id]")
-            print("         zeek load [folder_name]")
+            print("         zeek load [folder_name | #]")
+            print("         zeek load --merge #,#,# or --merge # # #")
             print("         zeek list")
             print("         zeek jobs")
             return
@@ -1134,13 +1141,21 @@ class EventMillShell(cmd.Cmd):
         if subcommand == "status":
             self._zeek_status(parts[1] if len(parts) > 1 else None)
         elif subcommand == "load":
-            merge = "--merge" in parts
-            refs = [p for p in parts[1:] if p != "--merge"]
-            if merge and len(refs) > 1:
+            # --merge must come before indices: zeek load --merge 1,2,3
+            rest = parts[1:]
+            if rest and rest[0] == "--merge":
+                raw_refs = rest[1:]
+                refs: list[str] = []
+                for r in raw_refs:
+                    refs.extend(r.split(","))
+                refs = [r.strip() for r in refs if r.strip()]
+                if len(refs) < 2:
+                    print("  Usage: zeek load --merge #,#,# or --merge # # #")
+                    print("  Run 'zeek list' first to see numbered outputs.")
+                    return
                 self._zeek_load_merge(refs)
             else:
-                folder_ref = refs[0] if refs else None
-                # Resolve numeric index from last zeek list
+                folder_ref = rest[0] if rest else None
                 folder_ref = self._zeek_resolve_index(folder_ref)
                 self._zeek_load(folder_ref)
         elif subcommand == "list":

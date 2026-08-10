@@ -265,6 +265,21 @@ class PcapSession:
         self.ip_fragment_count: int = 0
         self.ttl_distribution: Counter = Counter()
 
+        # VLAN tracking
+        self.vlan_ids: Counter = Counter()
+        self.vlan_to_ips: Dict[int, set] = defaultdict(set)
+        self.vlan_1_detected: bool = False
+        self.untagged_frame_count: int = 0
+
+        # CDP / LLDP neighbor discovery
+        self.cdp_frame_count: int = 0
+        self.cdp_neighbors: Dict[str, Dict] = {}
+        self.lldp_frame_count: int = 0
+        self.lldp_neighbors: Dict[str, Dict] = {}
+
+        # Network discovery evidence (OSPF, DHCP, ARP, broadcast-inferred)
+        self.network_evidence: List[Dict] = []
+
     @property
     def unique_ips(self) -> set:
         """All unique IPs seen (src + dst)."""
@@ -437,6 +452,27 @@ class PcapSession:
         # IP fragmentation & TTL
         self.ip_fragment_count += other.ip_fragment_count
         self.ttl_distribution += other.ttl_distribution
+
+        # VLAN tracking
+        self.vlan_ids += other.vlan_ids
+        for vid, ips in other.vlan_to_ips.items():
+            self.vlan_to_ips[vid].update(ips)
+        if other.vlan_1_detected:
+            self.vlan_1_detected = True
+        self.untagged_frame_count += other.untagged_frame_count
+
+        # CDP / LLDP
+        self.cdp_frame_count += other.cdp_frame_count
+        for mac, info in other.cdp_neighbors.items():
+            if mac not in self.cdp_neighbors:
+                self.cdp_neighbors[mac] = dict(info)
+        self.lldp_frame_count += other.lldp_frame_count
+        for mac, info in other.lldp_neighbors.items():
+            if mac not in self.lldp_neighbors:
+                self.lldp_neighbors[mac] = dict(info)
+
+        # Network discovery evidence
+        self.network_evidence.extend(other.network_evidence)
 
         # --- New protocol fields ---
 
