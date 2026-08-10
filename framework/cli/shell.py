@@ -1165,10 +1165,20 @@ class EventMillShell(cmd.Cmd):
         else:
             # It's a PCAP reference — resolve it
             async_mode = "--async" in parts
-            pcap_ref = subcommand
-            pcap_uri = self._zeek_resolve_pcap(pcap_ref)
-            if pcap_uri:
-                self._zeek_submit(pcap_uri, async_mode=async_mode)
+            parallel_mode = "--parallel" in parts
+            pcap_ref = parts[0]
+            # Strip trailing flags from pcap_ref if it got mixed in
+            flags_to_strip = {"--async", "--parallel"}
+            clean_parts = [p for p in parts if p not in flags_to_strip]
+            pcap_ref = clean_parts[0] if clean_parts else subcommand
+
+            if parallel_mode or pcap_ref.endswith("/"):
+                # Folder submission — list PCAPs in folder, submit each
+                self._zeek_submit_folder(pcap_ref, async_mode=True)
+            else:
+                pcap_uri = self._zeek_resolve_pcap(pcap_ref)
+                if pcap_uri:
+                    self._zeek_submit(pcap_uri, async_mode=async_mode)
 
     def _zeek_get_nf_bucket(self) -> str | None:
         """Get the network forensics bucket name from the storage resolver."""
@@ -1302,6 +1312,43 @@ class EventMillShell(cmd.Cmd):
         except Exception as e:
             print(f"  ✗ Failed to submit Zeek job: {e}")
             logger.exception("Zeek submit failed")
+
+    def _zeek_submit_folder(self, folder_ref: str, async_mode: bool = True) -> None:
+        """Submit all PCAPs in a folder as parallel Zeek jobs."""
+        nf_bucket = self._zeek_get_nf_bucket()
+        if not nf_bucket:
+            print("  ✗ No network forensics bucket configured.")
+            return
+
+        # List PCAPs in the folder
+        prefix = folder_ref.rstrip("/") + "/"
+        try:
+            from google.cloud import storage as gcs_storage
+            client = gcs_storage.Client()
+            bucket = client.bucket(nf_bucket)
+            blobs = list(bucket.list_blobs(prefix=prefix))
+            pcap_exts = (".pcap", ".pcapng", ".cap")
+            pcap_blobs = [b for b in blobs if any(b.name.lower().endswith(ext) for ext in pcap_exts)]
+        except Exception as e:
+            print(f"  ✗ Failed to list folder: {e}")
+            return
+
+        if not pcap_blobs:
+            print(f"  No PCAP files found in gs://{nf_bucket}/{prefix}")
+            return
+
+        print(f"  Found {len(pcap_blobs)} PCAPs in {folder_ref}:")
+        for b in pcap_blobs:
+            size_mb = b.size / (1024 * 1024) if b.size else 0
+            print(f"    {b.name.split('/')[-1]} ({size_mb:.1f} MB)")
+
+        print(f"\n  Submitting {len(pcap_blobs)} parallel Zeek jobs...")
+        for b in pcap_blobs:
+            pcap_uri = f"gs://{nf_bucket}/{b.name}"
+            self._zeek_submit(pcap_uri, async_mode=True)
+
+        print(f"\n  All {len(pcap_blobs)} jobs submitted. Check with: zeek jobs")
+        print(f"  When complete, use 'zeek list' then 'zeek load --merge #,#,...'")
 
     def _zeek_status(self, build_id: str | None = None) -> None:
         """Check Zeek job status."""
@@ -1546,10 +1593,13 @@ class EventMillShell(cmd.Cmd):
         if ref is None:
             return None
         if ref.isdigit():
+            if not self._zeek_listed_folders:
+                print(f"  ✗ No folder list cached. Run 'zeek list' first.")
+                return None
             idx = int(ref) - 1
             if 0 <= idx < len(self._zeek_listed_folders):
                 return self._zeek_listed_folders[idx]
-            print(f"  ✗ Index {ref} out of range. Run 'zeek list' first.")
+            print(f"  ✗ Index {ref} out of range (valid: 1-{len(self._zeek_listed_folders)}). Run 'zeek list' to refresh.")
             return None
         return ref
 
@@ -1948,6 +1998,26 @@ class EventMillShell(cmd.Cmd):
 
     def complete_workspace(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
         return [c for c in ["clear"] if c.startswith(text)]
+
+    def complete_zeek(self, text: str, line: str, begidx: int, endidx: int) -> list[str]:
+        parts = line.split()
+        subcmds = ["list", "load", "status", "jobs"]
+        # First arg: subcommand or filename
+        if len(parts) <= 1 or (len(parts) == 2 and not line.endswith(" ")):
+            return [s for s in subcmds if s.startswith(text)]
+        # After 'load': suggest --merge or indices
+        if len(parts) >= 2 and parts[1] == "load":
+            opts = ["--merge"]
+            if self._zeek_listed_folders:
+                # Suggest first few folder indices
+                opts.extend(str(i) for i in range(1, min(len(self._zeek_listed_folders) + 1, 10)))
+            return [o for o in opts if o.startswith(text)]
+        # After filename: suggest --async, --parallel
+        if len(parts) >= 2 and parts[1] not in subcmds:
+            flags = ["--async", "--parallel"]
+            used = set(parts)
+            return [f for f in flags if f.startswith(text) and f not in used]
+        return []
 
     def do_run(self, arg: str) -> None:
         """Run a tool on the current session.
