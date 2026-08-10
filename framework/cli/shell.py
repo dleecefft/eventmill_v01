@@ -1086,6 +1086,7 @@ class EventMillShell(cmd.Cmd):
 
     # Persistent state for tracking Zeek jobs across commands
     _zeek_jobs: dict[str, dict] = {}
+    _zeek_listed_folders: list[str] = []
 
     def do_zeek(self, arg: str) -> None:
         """Process a large PCAP with Zeek via Cloud Build.
@@ -1133,7 +1134,15 @@ class EventMillShell(cmd.Cmd):
         if subcommand == "status":
             self._zeek_status(parts[1] if len(parts) > 1 else None)
         elif subcommand == "load":
-            self._zeek_load(parts[1] if len(parts) > 1 else None)
+            merge = "--merge" in parts
+            refs = [p for p in parts[1:] if p != "--merge"]
+            if merge and len(refs) > 1:
+                self._zeek_load_merge(refs)
+            else:
+                folder_ref = refs[0] if refs else None
+                # Resolve numeric index from last zeek list
+                folder_ref = self._zeek_resolve_index(folder_ref)
+                self._zeek_load(folder_ref)
         elif subcommand == "list":
             self._zeek_list_outputs()
         elif subcommand == "jobs":
@@ -1517,6 +1526,33 @@ class EventMillShell(cmd.Cmd):
                 pcap = "..." + pcap[-37:]
             print(f"  {build_id:40s} {status:12s} {pcap:40s}")
 
+    def _zeek_resolve_index(self, ref: str | None) -> str | None:
+        """Resolve a numeric index from the last zeek list to a folder name."""
+        if ref is None:
+            return None
+        if ref.isdigit():
+            idx = int(ref) - 1
+            if 0 <= idx < len(self._zeek_listed_folders):
+                return self._zeek_listed_folders[idx]
+            print(f"  ✗ Index {ref} out of range. Run 'zeek list' first.")
+            return None
+        return ref
+
+    def _zeek_load_merge(self, refs: list[str]) -> None:
+        """Load and merge multiple Zeek outputs by folder name or index."""
+        folders = []
+        for ref in refs:
+            resolved = self._zeek_resolve_index(ref)
+            if resolved is None:
+                return
+            folders.append(resolved)
+
+        print(f"  Merging {len(folders)} Zeek outputs...")
+        for i, folder in enumerate(folders):
+            print(f"    [{i + 1}/{len(folders)}] {folder}")
+            # First load creates session, subsequent ones merge
+            self._zeek_load(folder)
+
     def _zeek_list_outputs(self) -> None:
         """List available Zeek output folders in the network forensics bucket."""
         nf_bucket = self._zeek_get_nf_bucket()
@@ -1542,12 +1578,12 @@ class EventMillShell(cmd.Cmd):
                 return
 
             print(f"  Zeek outputs in gs://{nf_bucket}/zeek-output/:")
-            print(f"  {'Folder':50s} Load command")
-            print(f"  {'─' * 50} {'─' * 40}")
-            for p in prefixes:
-                folder = p.replace("zeek-output/", "").rstrip("/")
-                if folder:
-                    print(f"  {folder:50s} zeek load {folder}")
+            print(f"  {'#':4s} {'Folder':50s} Load command")
+            print(f"  {'─' * 4} {'─' * 50} {'─' * 40}")
+            folders = [p.replace("zeek-output/", "").rstrip("/") for p in prefixes if p.replace("zeek-output/", "").rstrip("/")]
+            self._zeek_listed_folders = folders
+            for i, folder in enumerate(folders, 1):
+                print(f"  {i:<4d} {folder:50s} zeek load {folder}")
 
         except ImportError:
             print("  ✗ google-cloud-storage not installed.")
