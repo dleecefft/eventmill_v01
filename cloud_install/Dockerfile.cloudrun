@@ -23,7 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # plugins-log-analysis: pdfplumber, beautifulsoup4, python-docx, stix2 (for threat_intel_ingester)
 COPY pyproject.toml README.md ./
 RUN pip install --no-cache-dir build && \
-    pip install --no-cache-dir ".[gcp,plugins-threat-modeling,plugins-log-analysis,plugins-network-forensics]"
+    pip install --no-cache-dir ".[gcp,api,plugins-threat-modeling,plugins-log-analysis,plugins-network-forensics]"
 
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime
